@@ -12,9 +12,10 @@ struct _PaintApplication {
 G_DEFINE_FINAL_TYPE (PaintApplication, paint_application, ADW_TYPE_APPLICATION)
 
 static void
-on_preferences_changed (const PaintPreferences *prefs G_GNUC_UNUSED, gpointer user_data)
+on_preferences_changed (const PaintPreferences *prefs, gpointer user_data)
 {
   GtkApplication *app = GTK_APPLICATION (user_data);
+  paint_preferences_apply_accelerators (prefs, app);
   for (GList *l = gtk_application_get_windows (app); l != NULL; l = l->next) {
     if (PAINT_IS_WINDOW (l->data))
       paint_window_apply_preferences (PAINT_WINDOW (l->data));
@@ -66,60 +67,39 @@ act_shortcuts (GSimpleAction *action G_GNUC_UNUSED,
                GVariant *param G_GNUC_UNUSED,
                gpointer user_data)
 {
-  static const struct {
-    const char *section;
-    const char *title;
-    const char *accel;
-  } items[] = {
-    { "Files & Tabs", "New Canvas Tab", "<Control>n" },
-    { "Files & Tabs", "New Window", "<Control><Shift>n" },
-    { "Files & Tabs", "Open Image", "<Control>o" },
-    { "Files & Tabs", "Save", "<Control>s" },
-    { "Files & Tabs", "Save As", "<Control><Shift>s" },
-    { "Files & Tabs", "Close Tab", "<Control>w" },
-    { "Files & Tabs", "Tab Overview", "<Control><Shift>o" },
-    { "Selection & Clipboard", "Select All", "<Control>a" },
-    { "Selection & Clipboard", "Copy", "<Control>c" },
-    { "Selection & Clipboard", "Cut", "<Control>x" },
-    { "Selection & Clipboard", "Paste", "<Control>v" },
-    { "Selection & Clipboard", "Paste as New Canvas", "<Control><Shift>v" },
-    { "Selection & Clipboard", "Crop to Selection", "<Control><Shift>x" },
-    { "Selection & Clipboard", "Delete Selection", "Delete" },
-    { "Canvas & Tools", "Undo", "<Control>z" },
-    { "Canvas & Tools", "Redo", "<Control><Shift>z" },
-    { "Canvas & Tools", "Selection Tool", "m" },
-    { "Canvas & Tools", "Brush Tool", "b" },
-    { "Canvas & Tools", "Line Tool", "l" },
-    { "Canvas & Tools", "Text Tool", "x" },
-    { "Canvas & Tools", "Eraser Tool", "e" },
-    { "Canvas & Tools", "Fill Tool", "f" },
-    { "Canvas & Tools", "Color Picker (or Alt+Click)", "i" },
-    { "Canvas & Tools", "Transparency Tool", "t" },
-    { "Canvas & Tools", "Shapes Tool", "s" },
-    { "Canvas & Tools", "Decrease / Increase Brush Size", "bracketleft bracketright" },
-    { "Canvas & Tools", "Zoom In / Out / Fit / Reset", "<Control>plus <Control>minus <Control>9 <Control>0" },
-    { "Canvas & Tools", "Toggle Layers Panel", "<Control>l" },
-    { "Canvas & Tools", "New Layer", "<Control><Shift>l" },
-    { "Canvas & Tools", "Fullscreen", "F11" },
-    { "Canvas & Tools", "Toggle Floating Toolbar", "F9" },
-    { "Canvas & Tools", "Preferences", "<Control>comma" },
-  };
-
+  PaintApplication *paint_app = PAINT_APPLICATION (user_data);
   GtkApplication *app = GTK_APPLICATION (user_data);
   GtkWidget *parent = GTK_WIDGET (gtk_application_get_active_window (app));
+
+  gsize n_specs = 0;
+  const PaintKeybindSpec *specs = paint_preferences_get_keybind_specs (&n_specs);
 
 #if ADW_CHECK_VERSION (1, 8, 0)
   AdwDialog *dlg = adw_shortcuts_dialog_new ();
   AdwShortcutsSection *cur_sec = NULL;
   const char *cur_name = NULL;
 
-  for (gsize i = 0; i < G_N_ELEMENTS (items); i++) {
-    if (!cur_sec || g_strcmp0 (cur_name, items[i].section) != 0) {
-      cur_name = items[i].section;
-      cur_sec = adw_shortcuts_section_new (cur_name);
-      adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), cur_sec);
+  for (gsize i = 0; i < n_specs; i++) {
+    const PaintKeybindSpec *spec = &specs[i];
+    const char *accel = paint_preferences_get_keybind (paint_app->preferences, spec->id);
+    if (accel && *accel) {
+      if (!cur_sec || g_strcmp0 (cur_name, spec->section) != 0) {
+        cur_name = spec->section;
+        cur_sec = adw_shortcuts_section_new (cur_name);
+        adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), cur_sec);
+      }
+      adw_shortcuts_section_add (cur_sec, adw_shortcuts_item_new (spec->label, accel));
     }
-    adw_shortcuts_section_add (cur_sec, adw_shortcuts_item_new (items[i].title, items[i].accel));
+
+    if (g_strcmp0 (spec->section, "Selection & Clipboard") == 0 &&
+        (i + 1 == n_specs || g_strcmp0 (specs[i + 1].section, "Selection & Clipboard") != 0)) {
+      if (!cur_sec || g_strcmp0 (cur_name, "Selection & Clipboard") != 0) {
+        cur_name = "Selection & Clipboard";
+        cur_sec = adw_shortcuts_section_new (cur_name);
+        adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), cur_sec);
+      }
+      adw_shortcuts_section_add (cur_sec, adw_shortcuts_item_new ("Delete Selection", "Delete"));
+    }
   }
   adw_dialog_present (dlg, parent);
 #else
@@ -129,19 +109,40 @@ act_shortcuts (GSimpleAction *action G_GNUC_UNUSED,
   GtkWidget *cur_grp = NULL;
   const char *cur_name = NULL;
 
-  for (gsize i = 0; i < G_N_ELEMENTS (items); i++) {
-    if (!cur_grp || g_strcmp0 (cur_name, items[i].section) != 0) {
-      cur_name = items[i].section;
-      cur_grp = adw_preferences_group_new ();
-      adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), cur_name);
-      adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (cur_grp));
+  for (gsize i = 0; i < n_specs; i++) {
+    const PaintKeybindSpec *spec = &specs[i];
+    const char *accel = paint_preferences_get_keybind (paint_app->preferences, spec->id);
+    if (accel && *accel) {
+      if (!cur_grp || g_strcmp0 (cur_name, spec->section) != 0) {
+        cur_name = spec->section;
+        cur_grp = adw_preferences_group_new ();
+        adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), cur_name);
+        adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (cur_grp));
+      }
+      GtkWidget *row = adw_action_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), spec->label);
+      g_autofree char *pretty = paint_preferences_format_accel_label (accel);
+      GtkWidget *lbl = gtk_label_new (pretty);
+      gtk_widget_add_css_class (lbl, "dim-label");
+      adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
+      adw_preferences_group_add (ADW_PREFERENCES_GROUP (cur_grp), row);
     }
-    GtkWidget *row = adw_action_row_new ();
-    adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), items[i].title);
-    GtkWidget *lbl = gtk_label_new (items[i].accel);
-    gtk_widget_add_css_class (lbl, "dim-label");
-    adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
-    adw_preferences_group_add (ADW_PREFERENCES_GROUP (cur_grp), row);
+
+    if (g_strcmp0 (spec->section, "Selection & Clipboard") == 0 &&
+        (i + 1 == n_specs || g_strcmp0 (specs[i + 1].section, "Selection & Clipboard") != 0)) {
+      if (!cur_grp || g_strcmp0 (cur_name, "Selection & Clipboard") != 0) {
+        cur_name = "Selection & Clipboard";
+        cur_grp = adw_preferences_group_new ();
+        adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), cur_name);
+        adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (cur_grp));
+      }
+      GtkWidget *row = adw_action_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), "Delete Selection");
+      GtkWidget *lbl = gtk_label_new ("Delete");
+      gtk_widget_add_css_class (lbl, "dim-label");
+      adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
+      adw_preferences_group_add (ADW_PREFERENCES_GROUP (cur_grp), row);
+    }
   }
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg), ADW_PREFERENCES_PAGE (page));
   adw_dialog_present (dlg, parent);
@@ -197,42 +198,7 @@ paint_application_startup (GApplication *app)
                                    G_N_ELEMENTS (app_actions),
                                    app);
 
-  struct {
-    const char *action;
-    const char *accels[4];
-  } accel_map[] = {
-    { "app.new-window", { "<Primary><Shift>n", NULL } },
-    { "app.preferences", { "<Primary>comma", NULL } },
-    { "app.shortcuts", { "<Primary>question", NULL } },
-    { "app.quit", { "<Primary>q", NULL } },
-    { "win.new-tab", { "<Primary>n", "<Primary>t", NULL } },
-    { "win.close-tab", { "<Primary>w", NULL } },
-    { "win.open", { "<Primary>o", NULL } },
-    { "win.save", { "<Primary>s", NULL } },
-    { "win.save-as", { "<Primary><Shift>s", NULL } },
-    { "win.undo", { "<Primary>z", NULL } },
-    { "win.redo", { "<Primary><Shift>z", "<Primary>y", NULL } },
-    { "win.copy", { "<Primary>c", NULL } },
-    { "win.cut", { "<Primary>x", NULL } },
-    { "win.paste", { "<Primary>v", NULL } },
-    { "win.paste-new-tab", { "<Primary><Shift>v", NULL } },
-    { "win.select-all", { "<Primary>a", NULL } },
-    { "win.crop-selection", { "<Primary><Shift>x", NULL } },
-    { "win.zoom-in", { "<Primary>plus", "<Primary>equal", "<Primary>KP_Add", NULL } },
-    { "win.zoom-out", { "<Primary>minus", "<Primary>KP_Subtract", NULL } },
-    { "win.zoom-fit", { "<Primary>9", "<Primary>KP_9", NULL } },
-    { "win.zoom-reset", { "<Primary>0", "<Primary>KP_0", NULL } },
-    { "win.tab-overview", { "<Primary><Shift>o", NULL } },
-    { "win.toggle-layers", { "<Primary>l", NULL } },
-    { "win.new-layer", { "<Primary><Shift>l", NULL } },
-    { "win.toggle-toolbar", { "F9", NULL } },
-    { "win.toggle-fullscreen", { "F11", NULL } },
-  };
-
-  for (gsize i = 0; i < G_N_ELEMENTS (accel_map); i++)
-    gtk_application_set_accels_for_action (GTK_APPLICATION (app),
-                                           accel_map[i].action,
-                                           accel_map[i].accels);
+  paint_preferences_apply_accelerators (self->preferences, GTK_APPLICATION (app));
 }
 
 static void

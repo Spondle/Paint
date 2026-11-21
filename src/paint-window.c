@@ -1728,51 +1728,16 @@ on_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
     }
   }
 
-  if ((state & GDK_SHIFT_MASK) != 0)
-    return FALSE;
-
-  if (keyval == GDK_KEY_m || keyval == GDK_KEY_M) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-select", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_b || keyval == GDK_KEY_B) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-brush", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_l || keyval == GDK_KEY_L) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-line", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_e || keyval == GDK_KEY_E) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-eraser", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_f || keyval == GDK_KEY_F) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-fill", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_x || keyval == GDK_KEY_X) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-text", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_i || keyval == GDK_KEY_I) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-eyedropper", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_t || keyval == GDK_KEY_T) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-transparent", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_s || keyval == GDK_KEY_S) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.tool-shape", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_bracketleft) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.brush-smaller", NULL);
-    return TRUE;
-  }
-  if (keyval == GDK_KEY_bracketright) {
-    gtk_widget_activate_action (GTK_WIDGET (self), "win.brush-larger", NULL);
+  PaintPreferences *prefs = get_app_preferences (self);
+  const char *matched_action = paint_preferences_match_local_keybind (prefs, keyval, state);
+  if (matched_action) {
+    if (g_str_has_prefix (matched_action, "app.")) {
+      GtkApplication *app = gtk_window_get_application (GTK_WINDOW (self));
+      if (app)
+        g_action_group_activate_action (G_ACTION_GROUP (app), matched_action + 4, NULL);
+    } else {
+      gtk_widget_activate_action (GTK_WIDGET (self), matched_action, NULL);
+    }
     return TRUE;
   }
   return FALSE;

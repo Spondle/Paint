@@ -62,3 +62,11 @@ test_canvas = executable('test-canvas',
 )
 
 test('canvas-core', test_canvas)
+
+test_keybinds = executable('test-keybinds',
+  files('src/paint-preferences.c', 'tests/test-keybinds.c'),
+  dependencies: [gtk4_dep, adw_dep, cairo_dep, math_dep],
+  include_directories: include_directories('src'),
+)
+
+test('keybinds', test_keybinds)

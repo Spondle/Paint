@@ -206,3 +206,22 @@
 .paint-layer-hidden {
     opacity: 0.55;
 }
+
+.paint-keycap-label {
+    background-color: color-mix(in srgb, var(--window-fg-color) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--window-fg-color) 16%, transparent);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 0.9em;
+    font-variant-numeric: tabular-nums;
+}
+
+.paint-keycap-preview {
+    background-color: color-mix(in srgb, var(--window-fg-color) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--window-fg-color) 18%, transparent);
+    border-radius: 10px;
+    padding: 12px 20px;
+    font-size: 1.2em;
+    font-weight: 600;
+    min-width: 140px;
+}

@@ -20,7 +20,7 @@
     background-color: color-mix(in srgb, var(--headerbar-bg-color) 92%, transparent);
     color: var(--headerbar-fg-color);
     border-radius: 9999px;
-    padding: 5px 10px;
+    padding: 4px 8px;
     box-shadow:
         0 2px 10px rgba(0, 0, 0, 0.25),
         0 0 0 1px color-mix(in srgb, var(--border-color) 65%, transparent);
@@ -37,7 +37,7 @@
 }
 
 .paint-osd-pill separator {
-    margin: 4px 4px;
+    margin: 4px 2px;
     min-width: 1px;
 }
 
@@ -45,8 +45,9 @@
 .paint-osd-pill togglebutton,
 .paint-osd-pill menubutton > button {
     border-radius: 9999px;
-    min-height: 32px;
-    min-width: 32px;
+    min-height: 30px;
+    min-width: 30px;
+    padding: 0 4px;
 }
 
 .paint-osd-pill .paint-color-button > button {
@@ -73,41 +74,20 @@
     border-radius: 9999px;
 }
 
-.paint-size-button {
-    padding-left: 10px;
-    padding-right: 10px;
+.paint-osd-pill .paint-size-button > button {
+    padding-left: 8px;
+    padding-right: 6px;
     font-variant-numeric: tabular-nums;
 }
 
-.paint-osd-pill .paint-shapes-button > button {
-    padding-left: 8px;
-    padding-right: 6px;
-}
-
-.paint-osd-pill .paint-shapes-button.paint-tool-active > button {
-    background-color: color-mix(in srgb, currentColor 15%, transparent);
-}
-
-.paint-osd-pill .paint-transparent-button {
-    border-radius: 9999px;
-}
-
+.paint-osd-pill .paint-shapes-button > button,
 .paint-osd-pill .paint-transparent-button > button {
-    border-radius: 9999px 0 0 9999px;
-    padding-left: 8px;
+    padding-left: 6px;
     padding-right: 4px;
-    min-width: 28px;
 }
 
-.paint-osd-pill .paint-transparent-button > menubutton > button {
-    border-radius: 0 9999px 9999px 0;
-    padding-left: 2px;
-    padding-right: 6px;
-    min-width: 20px;
-}
-
-.paint-osd-pill .paint-transparent-button.paint-tool-active > button,
-.paint-osd-pill .paint-transparent-button.paint-tool-active > menubutton > button {
+.paint-osd-pill .paint-shapes-button.paint-tool-active > button,
+.paint-osd-pill .paint-transparent-button.paint-tool-active > button {
     background-color: color-mix(in srgb, currentColor 15%, transparent);
 }
 
@@ -131,7 +111,7 @@
 .paint-osd-pill .paint-shape-mode togglebutton {
     border-radius: 8px;
     min-height: 28px;
-    padding: 4px 12px;
+    padding: 4px 10px;
 }
 
 .paint-osd-pill .paint-shape-tile {

@@ -44,20 +44,22 @@ struct _PaintCanvasPage {
   GtkWidget *osd_pill;
   GtkWidget *undo_btn;
   GtkWidget *redo_btn;
-  GtkWidget *clear_btn;
   GtkWidget *shapes_btn;
   GtkWidget *shapes_btn_icon;
   GtkWidget *shapes_popover;
   GtkWidget *shape_outline_btn;
   GtkWidget *shape_fill_btn;
   GtkWidget *transparent_btn;
+  GtkWidget *transparent_btn_icon;
   GtkWidget *transparent_popover;
   GtkToggleButton *dummy_primary_btn;
   GtkToggleButton *dummy_shape_btn;
   GtkToggleButton *dummy_transparent_btn;
   const char *last_shape_tool_id;
   const char *last_transparency_tool_id;
+  const char *previous_tool_id;
   GtkWidget *size_btn;
+  GtkWidget *size_popover;
   GtkScale *size_scale;
   GtkWidget *brush_style_btns[3];
   GtkWidget *color_btn;
@@ -281,10 +283,10 @@ sync_tool_ui (PaintCanvasPage *self, const PaintTool *tool)
       gtk_toggle_button_set_active (self->dummy_primary_btn, TRUE);
     if (self->dummy_shape_btn)
       gtk_toggle_button_set_active (self->dummy_shape_btn, TRUE);
-    if (self->transparent_btn) {
-      adw_split_button_set_icon_name (ADW_SPLIT_BUTTON (self->transparent_btn), tool->icon_name);
+    if (self->transparent_btn_icon)
+      gtk_image_set_from_icon_name (GTK_IMAGE (self->transparent_btn_icon), tool->icon_name);
+    if (self->transparent_btn)
       gtk_widget_add_css_class (self->transparent_btn, "paint-tool-active");
-    }
     if (self->shapes_btn)
       gtk_widget_remove_css_class (self->shapes_btn, "paint-tool-active");
   } else {
@@ -314,6 +316,11 @@ on_tool_toggled (GtkToggleButton *btn, gpointer user_data)
   if (tool_id) {
     if (g_strcmp0 (self->settings->active_tool_id, tool_id) != 0)
       paint_canvas_commit_active_overlays (self->canvas);
+    if (g_strcmp0 (tool_id, "eyedropper") == 0 &&
+        self->settings->active_tool_id &&
+        g_strcmp0 (self->settings->active_tool_id, "eyedropper") != 0) {
+      self->previous_tool_id = self->settings->active_tool_id;
+    }
     self->settings->active_tool_id = tool_id;
     const PaintTool *tool = paint_tools_find (tool_id);
     sync_tool_ui (self, tool);
@@ -333,6 +340,22 @@ on_brush_style_toggled (GtkToggleButton *btn, gpointer user_data)
     return;
   int idx = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (btn), "paint-brush-style"));
   self->settings->brush_style = (PaintBrushStyle) CLAMP (idx, 0, 2);
+  gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+}
+
+static void
+on_brush_style_clicked (GtkButton *btn, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  int idx = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (btn), "paint-brush-style"));
+  self->settings->brush_style = (PaintBrushStyle) CLAMP (idx, 0, 2);
+  if (g_strcmp0 (self->settings->active_tool_id, "brush") != 0)
+    paint_canvas_page_select_tool (self, "brush");
+  if (self->size_popover)
+    gtk_popover_popdown (GTK_POPOVER (self->size_popover));
+  gtk_widget_grab_focus (GTK_WIDGET (self->canvas));
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
 }
 
@@ -1064,6 +1087,7 @@ static GtkPopover *
 build_size_popover (PaintCanvasPage *self)
 {
   GtkWidget *pop = gtk_popover_new ();
+  gtk_popover_set_position (GTK_POPOVER (pop), GTK_POS_TOP);
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
   gtk_widget_set_margin_top (box, 10);
   gtk_widget_set_margin_bottom (box, 10);
@@ -1097,14 +1121,15 @@ build_size_popover (PaintCanvasPage *self)
   }
   gtk_box_append (GTK_BOX (box), presets);
 
-  GtkWidget *style_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *style_section = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
   GtkWidget *style_lbl = gtk_label_new ("Style");
   gtk_widget_add_css_class (style_lbl, "paint-dim-label");
-  gtk_widget_set_hexpand (style_lbl, TRUE);
   gtk_widget_set_halign (style_lbl, GTK_ALIGN_START);
-  gtk_box_append (GTK_BOX (style_row), style_lbl);
+  gtk_box_append (GTK_BOX (style_section), style_lbl);
 
   GtkWidget *style_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  gtk_box_set_homogeneous (GTK_BOX (style_box), TRUE);
+  gtk_widget_set_hexpand (style_box, TRUE);
   gtk_widget_add_css_class (style_box, "paint-shape-mode");
   static const char *STYLE_LABELS[3] = { "Smooth", "Soft", "Pixel" };
   GtkToggleButton *first_style = NULL;
@@ -1118,13 +1143,15 @@ build_size_popover (PaintCanvasPage *self)
                                   (int) self->settings->brush_style == i);
     g_object_set_data (G_OBJECT (sbtn), "paint-brush-style", GINT_TO_POINTER (i));
     g_signal_connect (sbtn, "toggled", G_CALLBACK (on_brush_style_toggled), self);
+    g_signal_connect (sbtn, "clicked", G_CALLBACK (on_brush_style_clicked), self);
     gtk_box_append (GTK_BOX (style_box), sbtn);
     self->brush_style_btns[i] = sbtn;
   }
-  gtk_box_append (GTK_BOX (style_row), style_box);
-  gtk_box_append (GTK_BOX (box), style_row);
+  gtk_box_append (GTK_BOX (style_section), style_box);
+  gtk_box_append (GTK_BOX (box), style_section);
 
   gtk_popover_set_child (GTK_POPOVER (pop), box);
+  self->size_popover = pop;
   return GTK_POPOVER (pop);
 }
 
@@ -1218,12 +1245,6 @@ build_shapes_popover (PaintCanvasPage *self)
   gtk_popover_set_child (GTK_POPOVER (pop), box);
   self->shapes_popover = pop;
   return GTK_POPOVER (pop);
-}
-
-static void
-on_transparent_split_clicked (AdwSplitButton *btn G_GNUC_UNUSED, gpointer user_data)
-{
-  paint_canvas_page_select_last_transparency (PAINT_CANVAS_PAGE (user_data));
 }
 
 static void
@@ -1343,11 +1364,20 @@ sync_overlay_bars (PaintCanvasPage *self)
 }
 
 static void
-on_canvas_color_picked (PaintCanvas *canvas G_GNUC_UNUSED, gpointer user_data)
+on_canvas_color_picked (PaintCanvas *canvas G_GNUC_UNUSED, gboolean finished, gpointer user_data)
 {
   PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
   sync_hsv_from_settings (self);
-  sync_recent_colors (self);
+  if (finished) {
+    sync_recent_colors (self);
+    if (g_strcmp0 (self->settings->active_tool_id, "eyedropper") == 0) {
+      const char *prev = (self->previous_tool_id &&
+                          g_strcmp0 (self->previous_tool_id, "eyedropper") != 0)
+                           ? self->previous_tool_id
+                           : "brush";
+      paint_canvas_page_select_tool (self, prev);
+    }
+  }
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
 }
 
@@ -1625,13 +1655,13 @@ build_ui (PaintCanvasPage *self)
   g_signal_connect (vadj, "notify::page-size", G_CALLBACK (on_adjustment_prop_changed), self);
 
   /* Floating OSD pill */
-  GtkWidget *pill = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  GtkWidget *pill = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
   gtk_widget_add_css_class (pill, "paint-osd-pill");
   gtk_widget_set_halign (pill, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (pill, GTK_ALIGN_END);
   gtk_widget_set_margin_bottom (pill, 16);
 
-  GtkWidget *undo_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
+  GtkWidget *undo_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 1);
   self->undo_btn = gtk_button_new_from_icon_name ("edit-undo-symbolic");
   gtk_widget_add_css_class (self->undo_btn, "flat");
   gtk_widget_set_tooltip_text (self->undo_btn, "Undo (Ctrl+Z)");
@@ -1648,7 +1678,7 @@ build_ui (PaintCanvasPage *self)
 
   gtk_box_append (GTK_BOX (pill), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
 
-  GtkWidget *tools_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
+  GtkWidget *tools_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 1);
   gsize n_tools = 0;
   const PaintTool *tools = paint_tools_get_all (&n_tools);
   GtkToggleButton *first_btn = NULL;
@@ -1679,16 +1709,21 @@ build_ui (PaintCanvasPage *self)
   gtk_box_append (GTK_BOX (tools_box), dummy_primary);
   self->dummy_primary_btn = GTK_TOGGLE_BUTTON (dummy_primary);
 
-  self->transparent_btn = adw_split_button_new ();
+  GtkWidget *trans_content = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
+  self->transparent_btn_icon = gtk_image_new_from_icon_name ("tool-transparent-symbolic");
+  GtkWidget *trans_arrow = gtk_image_new_from_icon_name ("pan-down-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (trans_arrow), 12);
+  gtk_widget_set_opacity (trans_arrow, 0.75);
+  gtk_box_append (GTK_BOX (trans_content), self->transparent_btn_icon);
+  gtk_box_append (GTK_BOX (trans_content), trans_arrow);
+
+  self->transparent_btn = gtk_menu_button_new ();
   gtk_widget_add_css_class (self->transparent_btn, "flat");
   gtk_widget_add_css_class (self->transparent_btn, "paint-transparent-button");
-  adw_split_button_set_icon_name (ADW_SPLIT_BUTTON (self->transparent_btn), "tool-transparent-symbolic");
+  gtk_menu_button_set_child (GTK_MENU_BUTTON (self->transparent_btn), trans_content);
   gtk_widget_set_tooltip_text (self->transparent_btn, "Transparency (T)");
-  adw_split_button_set_dropdown_tooltip (ADW_SPLIT_BUTTON (self->transparent_btn), "Transparency Options");
-  adw_split_button_set_popover (ADW_SPLIT_BUTTON (self->transparent_btn),
-                                build_transparency_popover (self));
-  g_signal_connect (self->transparent_btn, "clicked",
-                    G_CALLBACK (on_transparent_split_clicked), self);
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (self->transparent_btn),
+                                GTK_WIDGET (build_transparency_popover (self)));
   gtk_box_append (GTK_BOX (tools_box), self->transparent_btn);
 
   GtkWidget *shapes_content = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
@@ -1734,14 +1769,6 @@ build_ui (PaintCanvasPage *self)
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (self->color_btn), GTK_WIDGET (build_color_popover (self)));
   gtk_box_append (GTK_BOX (pill), self->color_btn);
 
-  gtk_box_append (GTK_BOX (pill), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
-
-  self->clear_btn = gtk_button_new_from_icon_name ("edit-clear-all-symbolic");
-  gtk_widget_add_css_class (self->clear_btn, "flat");
-  gtk_widget_set_tooltip_text (self->clear_btn, "Clear Canvas");
-  gtk_actionable_set_action_name (GTK_ACTIONABLE (self->clear_btn), "win.clear");
-  gtk_box_append (GTK_BOX (pill), self->clear_btn);
-
   self->osd_pill = pill;
   gtk_overlay_add_overlay (self->overlay, pill);
 
@@ -1786,6 +1813,7 @@ paint_canvas_page_init (PaintCanvasPage *self)
   self->last_zoom = 1.0;
   self->last_shape_tool_id = "shape-rectangle";
   self->last_transparency_tool_id = "transparent";
+  self->previous_tool_id = "brush";
 }
 
 PaintCanvasPage *

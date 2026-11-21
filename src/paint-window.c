@@ -1618,6 +1618,53 @@ on_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
   return FALSE;
 }
 
+static gboolean
+on_alt_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
+                    guint keyval,
+                    guint keycode G_GNUC_UNUSED,
+                    GdkModifierType state G_GNUC_UNUSED,
+                    gpointer user_data)
+{
+  PaintWindow *self = PAINT_WINDOW (user_data);
+  if (keyval == GDK_KEY_Alt_L || keyval == GDK_KEY_Alt_R) {
+    GtkWidget *focus = gtk_window_get_focus (GTK_WINDOW (self));
+    if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus)))
+      return FALSE;
+    PaintCanvasPage *page = get_active_canvas_page (self);
+    if (page)
+      paint_canvas_set_alt_eyedropper (paint_canvas_page_get_canvas (page), TRUE);
+  }
+  return FALSE;
+}
+
+static void
+on_alt_key_released (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
+                     guint keyval,
+                     guint keycode G_GNUC_UNUSED,
+                     GdkModifierType state G_GNUC_UNUSED,
+                     gpointer user_data)
+{
+  PaintWindow *self = PAINT_WINDOW (user_data);
+  if (keyval == GDK_KEY_Alt_L || keyval == GDK_KEY_Alt_R) {
+    PaintCanvasPage *page = get_active_canvas_page (self);
+    if (page)
+      paint_canvas_set_alt_eyedropper (paint_canvas_page_get_canvas (page), FALSE);
+  }
+}
+
+static void
+on_window_is_active_changed (GObject *obj,
+                             GParamSpec *pspec G_GNUC_UNUSED,
+                             gpointer user_data G_GNUC_UNUSED)
+{
+  PaintWindow *self = PAINT_WINDOW (obj);
+  if (!gtk_window_is_active (GTK_WINDOW (self))) {
+    PaintCanvasPage *page = get_active_canvas_page (self);
+    if (page)
+      paint_canvas_set_alt_eyedropper (paint_canvas_page_get_canvas (page), FALSE);
+  }
+}
+
 /* ============================================================================
  * UI Construction
  * ============================================================================ */
@@ -1648,16 +1695,9 @@ build_zoom_row (PaintWindow *self)
   gtk_widget_set_tooltip_text (zoom_in, "Zoom In (Ctrl++)");
   gtk_actionable_set_action_name (GTK_ACTIONABLE (zoom_in), "win.zoom-in");
 
-  GtkWidget *zoom_fit = gtk_button_new_from_icon_name ("zoom-fit-best-symbolic");
-  gtk_widget_add_css_class (zoom_fit, "circular");
-  gtk_widget_add_css_class (zoom_fit, "flat");
-  gtk_widget_set_tooltip_text (zoom_fit, "Fit to Window (Ctrl+9)");
-  gtk_actionable_set_action_name (GTK_ACTIONABLE (zoom_fit), "win.zoom-fit");
-
   gtk_box_append (GTK_BOX (row), zoom_out);
   gtk_box_append (GTK_BOX (row), pct);
   gtk_box_append (GTK_BOX (row), zoom_in);
-  gtk_box_append (GTK_BOX (row), zoom_fit);
   return row;
 }
 
@@ -1690,30 +1730,42 @@ build_primary_menu (PaintWindow *self)
   g_menu_append (file_section, "Save As…", "win.save-as");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (file_section));
 
-  g_autoptr (GMenu) edit_section = g_menu_new ();
-  g_menu_append (edit_section, "Copy", "win.copy");
-  g_menu_append (edit_section, "Cut", "win.cut");
-  g_menu_append (edit_section, "Paste", "win.paste");
-  g_menu_append (edit_section, "Paste as New Canvas", "win.paste-new-tab");
-  g_menu_append_section (menu, NULL, G_MENU_MODEL (edit_section));
+  g_autoptr (GMenu) actions_section = g_menu_new ();
 
-  g_autoptr (GMenu) canvas_section = g_menu_new ();
-  g_menu_append (canvas_section, "Resize & Scale…", "win.resize-canvas");
-  g_autoptr (GMenu) transform_sub = g_menu_new ();
-  g_menu_append (transform_sub, "Rotate Right 90°", "win.rotate-cw");
-  g_menu_append (transform_sub, "Rotate Left 90°", "win.rotate-ccw");
-  g_menu_append (transform_sub, "Flip Horizontal", "win.flip-horizontal");
-  g_menu_append (transform_sub, "Flip Vertical", "win.flip-vertical");
-  g_menu_append (transform_sub, "Crop to Selection", "win.crop-selection");
-  g_menu_append_submenu (canvas_section, "Transform", G_MENU_MODEL (transform_sub));
-  g_menu_append (canvas_section, "Clear Canvas", "win.clear");
-  g_menu_append_section (menu, NULL, G_MENU_MODEL (canvas_section));
+  g_autoptr (GMenu) edit_sub = g_menu_new ();
+  g_menu_append (edit_sub, "Copy", "win.copy");
+  g_menu_append (edit_sub, "Cut", "win.cut");
+  g_menu_append (edit_sub, "Paste", "win.paste");
+  g_menu_append (edit_sub, "Paste as New Canvas", "win.paste-new-tab");
+  g_menu_append (edit_sub, "Select All", "win.select-all");
+  g_menu_append_submenu (actions_section, "Edit", G_MENU_MODEL (edit_sub));
 
-  g_autoptr (GMenu) view_section = g_menu_new ();
-  g_menu_append (view_section, "Pixel Grid", "win.toggle-pixel-grid");
-  g_menu_append (view_section, "Fullscreen", "win.toggle-fullscreen");
-  g_menu_append (view_section, "Toggle Toolbar", "win.toggle-toolbar");
-  g_menu_append_section (menu, NULL, G_MENU_MODEL (view_section));
+  g_autoptr (GMenu) canvas_sub = g_menu_new ();
+  g_autoptr (GMenu) resize_sec = g_menu_new ();
+  g_menu_append (resize_sec, "Resize & Scale…", "win.resize-canvas");
+  g_menu_append_section (canvas_sub, NULL, G_MENU_MODEL (resize_sec));
+
+  g_autoptr (GMenu) transform_sec = g_menu_new ();
+  g_menu_append (transform_sec, "Rotate Right 90°", "win.rotate-cw");
+  g_menu_append (transform_sec, "Rotate Left 90°", "win.rotate-ccw");
+  g_menu_append (transform_sec, "Flip Horizontal", "win.flip-horizontal");
+  g_menu_append (transform_sec, "Flip Vertical", "win.flip-vertical");
+  g_menu_append (transform_sec, "Crop to Selection", "win.crop-selection");
+  g_menu_append_section (canvas_sub, NULL, G_MENU_MODEL (transform_sec));
+
+  g_autoptr (GMenu) clear_sec = g_menu_new ();
+  g_menu_append (clear_sec, "Clear Canvas", "win.clear");
+  g_menu_append_section (canvas_sub, NULL, G_MENU_MODEL (clear_sec));
+  g_menu_append_submenu (actions_section, "Canvas", G_MENU_MODEL (canvas_sub));
+
+  g_autoptr (GMenu) view_sub = g_menu_new ();
+  g_menu_append (view_sub, "Fit to Window", "win.zoom-fit");
+  g_menu_append (view_sub, "Pixel Grid", "win.toggle-pixel-grid");
+  g_menu_append (view_sub, "Toggle Toolbar", "win.toggle-toolbar");
+  g_menu_append (view_sub, "Fullscreen", "win.toggle-fullscreen");
+  g_menu_append_submenu (actions_section, "View", G_MENU_MODEL (view_sub));
+
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (actions_section));
 
   g_autoptr (GMenu) app_section = g_menu_new ();
   g_menu_append (app_section, "Preferences", "app.preferences");
@@ -2065,6 +2117,13 @@ paint_window_init (PaintWindow *self)
   GtkEventController *key_ctrl = gtk_event_controller_key_new ();
   g_signal_connect (key_ctrl, "key-pressed", G_CALLBACK (on_key_pressed), self);
   gtk_widget_add_controller (GTK_WIDGET (self), key_ctrl);
+
+  GtkEventController *alt_ctrl = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (alt_ctrl, GTK_PHASE_CAPTURE);
+  g_signal_connect (alt_ctrl, "key-pressed", G_CALLBACK (on_alt_key_pressed), self);
+  g_signal_connect (alt_ctrl, "key-released", G_CALLBACK (on_alt_key_released), self);
+  gtk_widget_add_controller (GTK_WIDGET (self), alt_ctrl);
+  g_signal_connect (self, "notify::is-active", G_CALLBACK (on_window_is_active_changed), NULL);
 
   self->tab_view = ADW_TAB_VIEW (adw_tab_view_new ());
   g_signal_connect (self->tab_view, "notify::selected-page", G_CALLBACK (on_selected_page_changed), self);

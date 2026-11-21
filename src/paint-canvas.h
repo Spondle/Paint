@@ -141,6 +141,7 @@ void paint_canvas_commit_active_overlays (PaintCanvas *self);
 void paint_canvas_set_show_cursor_ring (PaintCanvas *self, gboolean show);
 void paint_canvas_set_show_pixel_grid (PaintCanvas *self, gboolean show);
 gboolean paint_canvas_get_show_pixel_grid (PaintCanvas *self);
+void paint_canvas_set_alt_eyedropper (PaintCanvas *self, gboolean active);
 void paint_canvas_check_viewport (PaintCanvas *self);
 
 G_END_DECLS

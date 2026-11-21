@@ -1466,6 +1466,10 @@ struct _PaintCanvas {
 
   /* Eyedropper state */
   gboolean eyedropper_active;
+  gboolean alt_held;
+  gboolean pick_badge_active;
+  GdkRGBA pick_badge_color;
+  guint pick_badge_timeout_id;
 
   /* Selection & floating layer state */
   gboolean has_selection;
@@ -2129,6 +2133,128 @@ update_text_bounds (PaintCanvas *self)
   cairo_destroy (cr);
 }
 
+static gboolean
+is_eyedropper_mode (PaintCanvas *self)
+{
+  return self &&
+         (self->alt_held ||
+          self->eyedropper_active ||
+          (self->settings && g_strcmp0 (self->settings->active_tool_id, "eyedropper") == 0));
+}
+
+static void
+clear_pick_badge (PaintCanvas *self)
+{
+  if (!self)
+    return;
+  g_clear_handle_id (&self->pick_badge_timeout_id, g_source_remove);
+  self->pick_badge_active = FALSE;
+}
+
+static gboolean
+on_pick_badge_timeout (gpointer user_data)
+{
+  PaintCanvas *self = PAINT_CANVAS (user_data);
+  self->pick_badge_timeout_id = 0;
+  self->pick_badge_active = FALSE;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  return G_SOURCE_REMOVE;
+}
+
+static void
+trigger_pick_badge (PaintCanvas *self, const GdkRGBA *color)
+{
+  if (!self || !color)
+    return;
+  clear_pick_badge (self);
+  self->pick_badge_color = *color;
+  self->pick_badge_active = TRUE;
+  self->pick_badge_timeout_id = g_timeout_add (750, on_pick_badge_timeout, self);
+}
+
+static void
+trace_rounded_rect_path (cairo_t *cr, double x, double y, double w, double h, double r)
+{
+  double radius = MIN (r, MIN (w, h) * 0.5);
+  cairo_new_sub_path (cr);
+  cairo_arc (cr, x + w - radius, y + radius, radius, -G_PI_2, 0.0);
+  cairo_arc (cr, x + w - radius, y + h - radius, radius, 0.0, G_PI_2);
+  cairo_arc (cr, x + radius, y + h - radius, radius, G_PI_2, G_PI);
+  cairo_arc (cr, x + radius, y + radius, radius, G_PI, 3.0 * G_PI_2);
+  cairo_close_path (cr);
+}
+
+static void
+draw_cursor_color_badge (GtkSnapshot *snapshot,
+                         PaintCanvas *self,
+                         double px,
+                         double py,
+                         const GdkRGBA *color)
+{
+  if (!color)
+    return;
+
+  int w = gtk_widget_get_width (GTK_WIDGET (self));
+  int h = gtk_widget_get_height (GTK_WIDGET (self));
+  const double box_size = 24.0;
+  const double radius = 5.0;
+
+  double bx = px + 14.0;
+  double by = py - 36.0;
+  if (w > 0 && bx + box_size > (double) w - 4.0)
+    bx = px - box_size - 14.0;
+  if (by < 4.0)
+    by = py + 16.0;
+  if (w > 0)
+    bx = CLAMP (bx, 4.0, MAX (4.0, (double) w - box_size - 4.0));
+  if (h > 0)
+    by = CLAMP (by, 4.0, MAX (4.0, (double) h - box_size - 4.0));
+
+  graphene_rect_t bounds = GRAPHENE_RECT_INIT (
+      (float) (bx - 4.0), (float) (by - 4.0),
+      (float) (box_size + 8.0), (float) (box_size + 8.0));
+  cairo_t *cr = gtk_snapshot_append_cairo (snapshot, &bounds);
+
+  cairo_save (cr);
+  trace_rounded_rect_path (cr, bx, by, box_size, box_size, radius);
+  cairo_clip (cr);
+  if (color->alpha < 0.999f) {
+    const double cell = 5.0;
+    cairo_set_source_rgb (cr, 0.86, 0.86, 0.88);
+    cairo_rectangle (cr, bx, by, box_size, box_size);
+    cairo_fill (cr);
+
+    cairo_set_source_rgb (cr, 0.64, 0.64, 0.68);
+    int cols = (int) ceil (box_size / cell);
+    int rows = (int) ceil (box_size / cell);
+    for (int r = 0; r < rows; r++) {
+      for (int c = (r & 1); c < cols; c += 2) {
+        cairo_rectangle (cr, bx + c * cell, by + r * cell, cell, cell);
+      }
+    }
+    cairo_fill (cr);
+  }
+  cairo_set_source_rgba (cr, color->red, color->green, color->blue, color->alpha);
+  cairo_rectangle (cr, bx, by, box_size, box_size);
+  cairo_fill (cr);
+  cairo_restore (cr);
+
+  trace_rounded_rect_path (cr, bx, by, box_size, box_size, radius);
+  cairo_set_line_width (cr, 3.0);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.45);
+  cairo_stroke_preserve (cr);
+
+  cairo_set_line_width (cr, 1.5);
+  cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.95);
+  cairo_stroke_preserve (cr);
+
+  cairo_set_line_width (cr, 0.75);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.35);
+  cairo_stroke (cr);
+
+  cairo_destroy (cr);
+}
+
 static void
 update_canvas_cursor (PaintCanvas *self)
 {
@@ -2136,10 +2262,10 @@ update_canvas_cursor (PaintCanvas *self)
                             ? paint_tools_find (self->settings->active_tool_id)
                             : NULL;
   const char *want = NULL;
-  if (tool) {
-    if (g_strcmp0 (tool->id, "eyedropper") == 0) {
-      want = "crosshair";
-    } else if (g_strcmp0 (tool->id, "text") == 0) {
+  if (is_eyedropper_mode (self)) {
+    want = "crosshair";
+  } else if (tool) {
+    if (g_strcmp0 (tool->id, "text") == 0) {
       if (self->text_active && self->has_hover &&
           self->hover_x >= self->text_box_x - 8 &&
           self->hover_x <= self->text_box_x + self->text_box_w + 8 &&
@@ -2427,12 +2553,13 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     cairo_destroy (cr);
   }
 
+  gboolean eyedropper_active_mode = is_eyedropper_mode (self);
   gboolean show_ring = self->show_cursor_ring &&
                        self->has_hover &&
+                       !eyedropper_active_mode &&
                        active_tool &&
                        g_strcmp0 (active_tool->id, "select") != 0 &&
-                       g_strcmp0 (active_tool->id, "text") != 0 &&
-                       g_strcmp0 (active_tool->id, "eyedropper") != 0;
+                       g_strcmp0 (active_tool->id, "text") != 0;
   if (show_ring) {
     double px = self->hover_x * self->zoom;
     double py = self->hover_y * self->zoom;
@@ -2456,6 +2583,18 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     cairo_arc (cr, px, py, radius, 0.0, 2.0 * G_PI);
     cairo_stroke (cr);
     cairo_destroy (cr);
+  }
+
+  if (self->has_hover) {
+    double px = self->hover_x * self->zoom;
+    double py = self->hover_y * self->zoom;
+    if (eyedropper_active_mode) {
+      GdkRGBA hovered;
+      if (paint_document_pick_color (self->document, self->hover_x, self->hover_y, &hovered))
+        draw_cursor_color_badge (snapshot, self, px, py, &hovered);
+    } else if (self->pick_badge_active) {
+      draw_cursor_color_badge (snapshot, self, px, py, &self->pick_badge_color);
+    }
   }
 }
 
@@ -2538,14 +2677,16 @@ on_canvas_key_released (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
     self->space_held = FALSE;
 }
 
-static void
+static gboolean
 sample_color_at (PaintCanvas *self, double cx, double cy)
 {
   GdkRGBA picked;
   if (paint_document_pick_color (self->document, cx, cy, &picked)) {
     self->settings->color = picked;
-    g_signal_emit (self, signals[SIGNAL_COLOR_PICKED], 0);
+    g_signal_emit (self, signals[SIGNAL_COLOR_PICKED], 0, FALSE);
+    return TRUE;
   }
+  return FALSE;
 }
 
 static void
@@ -2584,12 +2725,16 @@ on_drag_begin (GtkGestureDrag *gesture,
 
   const PaintTool *tool = paint_tools_find (self->settings->active_tool_id);
   GdkModifierType state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
-  if (g_strcmp0 (tool->id, "eyedropper") == 0 || (state & GDK_ALT_MASK)) {
+  if (g_strcmp0 (tool->id, "eyedropper") == 0 || (state & GDK_ALT_MASK) || self->alt_held) {
     self->eyedropper_active = TRUE;
     self->touch_stroke_pending = FALSE;
     sample_color_at (self, cx, cy);
+    update_canvas_cursor (self);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
   }
+
+  clear_pick_badge (self);
 
   if (g_strcmp0 (tool->id, "select") == 0) {
     self->touch_stroke_pending = FALSE;
@@ -2673,6 +2818,7 @@ on_drag_update (GtkGestureDrag *gesture,
 
   if (self->eyedropper_active) {
     sample_color_at (self, raw_cx, raw_cy);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
   }
 
@@ -2797,9 +2943,15 @@ on_drag_end (GtkGestureDrag *gesture,
 
   if (self->eyedropper_active) {
     self->eyedropper_active = FALSE;
-    sample_color_at (self, raw_cx, raw_cy);
-    paint_tool_settings_add_recent_color (self->settings, &self->settings->color);
-    g_signal_emit (self, signals[SIGNAL_COLOR_PICKED], 0);
+    self->hover_x = raw_cx;
+    self->hover_y = raw_cy;
+    if (sample_color_at (self, raw_cx, raw_cy)) {
+      paint_tool_settings_add_recent_color (self->settings, &self->settings->color);
+      trigger_pick_badge (self, &self->settings->color);
+    }
+    g_signal_emit (self, signals[SIGNAL_COLOR_PICKED], 0, TRUE);
+    update_canvas_cursor (self);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
   }
 
@@ -2888,6 +3040,8 @@ on_drag_cancel (GtkGesture *gesture G_GNUC_UNUSED,
 
   if (self->eyedropper_active) {
     self->eyedropper_active = FALSE;
+    update_canvas_cursor (self);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
   }
   if (self->sel_moving) {
@@ -2923,7 +3077,7 @@ on_drag_cancel (GtkGesture *gesture G_GNUC_UNUSED,
 }
 
 static void
-on_motion (GtkEventControllerMotion *ctrl G_GNUC_UNUSED,
+on_motion (GtkEventControllerMotion *ctrl,
            double x,
            double y,
            gpointer user_data)
@@ -2932,8 +3086,12 @@ on_motion (GtkEventControllerMotion *ctrl G_GNUC_UNUSED,
   self->has_hover = TRUE;
   self->hover_x = x / self->zoom;
   self->hover_y = y / self->zoom;
+  if (!self->drawing_active) {
+    GdkModifierType state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (ctrl));
+    self->alt_held = (state & GDK_ALT_MASK) != 0;
+  }
   update_canvas_cursor (self);
-  if (self->show_cursor_ring)
+  if (self->show_cursor_ring || is_eyedropper_mode (self) || self->pick_badge_active)
     gtk_widget_queue_draw (GTK_WIDGET (self));
 }
 
@@ -2941,9 +3099,10 @@ static void
 on_leave (GtkEventControllerMotion *ctrl G_GNUC_UNUSED, gpointer user_data)
 {
   PaintCanvas *self = PAINT_CANVAS (user_data);
+  gboolean was_eyedropper = is_eyedropper_mode (self);
   self->has_hover = FALSE;
   update_canvas_cursor (self);
-  if (self->show_cursor_ring)
+  if (self->show_cursor_ring || was_eyedropper || self->pick_badge_active)
     gtk_widget_queue_draw (GTK_WIDGET (self));
 }
 
@@ -2951,6 +3110,7 @@ static void
 paint_canvas_finalize (GObject *object)
 {
   PaintCanvas *self = PAINT_CANVAS (object);
+  g_clear_handle_id (&self->pick_badge_timeout_id, g_source_remove);
   invalidate_viewport_cache (self);
   g_clear_object (&self->checker_texture);
   g_clear_pointer (&self->vp_surface, cairo_surface_destroy);
@@ -2986,7 +3146,7 @@ paint_canvas_class_init (PaintCanvasClass *klass)
                                                 G_TYPE_FROM_CLASS (klass),
                                                 G_SIGNAL_RUN_FIRST,
                                                 0, NULL, NULL, NULL,
-                                                G_TYPE_NONE, 0);
+                                                G_TYPE_NONE, 1, G_TYPE_BOOLEAN);
   signals[SIGNAL_SELECTION_CHANGED] = g_signal_new ("selection-changed",
                                                      G_TYPE_FROM_CLASS (klass),
                                                      G_SIGNAL_RUN_FIRST,
@@ -3530,6 +3690,16 @@ gboolean
 paint_canvas_get_show_pixel_grid (PaintCanvas *self)
 {
   return self ? self->show_pixel_grid : TRUE;
+}
+
+void
+paint_canvas_set_alt_eyedropper (PaintCanvas *self, gboolean active)
+{
+  if (!self || self->alt_held == active)
+    return;
+  self->alt_held = active;
+  update_canvas_cursor (self);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
 }
 
 void

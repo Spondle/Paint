@@ -66,49 +66,84 @@ act_shortcuts (GSimpleAction *action G_GNUC_UNUSED,
                GVariant *param G_GNUC_UNUSED,
                gpointer user_data)
 {
+  static const struct {
+    const char *section;
+    const char *title;
+    const char *accel;
+  } items[] = {
+    { "Files & Tabs", "New Canvas Tab", "<Control>n" },
+    { "Files & Tabs", "New Window", "<Control><Shift>n" },
+    { "Files & Tabs", "Open Image", "<Control>o" },
+    { "Files & Tabs", "Save", "<Control>s" },
+    { "Files & Tabs", "Save As", "<Control><Shift>s" },
+    { "Files & Tabs", "Close Tab", "<Control>w" },
+    { "Files & Tabs", "Tab Overview", "<Control><Shift>o" },
+    { "Selection & Clipboard", "Select All", "<Control>a" },
+    { "Selection & Clipboard", "Copy", "<Control>c" },
+    { "Selection & Clipboard", "Cut", "<Control>x" },
+    { "Selection & Clipboard", "Paste", "<Control>v" },
+    { "Selection & Clipboard", "Paste as New Canvas", "<Control><Shift>v" },
+    { "Selection & Clipboard", "Crop to Selection", "<Control><Shift>x" },
+    { "Selection & Clipboard", "Delete Selection", "Delete" },
+    { "Canvas & Tools", "Undo", "<Control>z" },
+    { "Canvas & Tools", "Redo", "<Control><Shift>z" },
+    { "Canvas & Tools", "Selection Tool", "m" },
+    { "Canvas & Tools", "Brush Tool", "b" },
+    { "Canvas & Tools", "Line Tool", "l" },
+    { "Canvas & Tools", "Text Tool", "x" },
+    { "Canvas & Tools", "Eraser Tool", "e" },
+    { "Canvas & Tools", "Fill Tool", "f" },
+    { "Canvas & Tools", "Color Picker (or Alt+Click)", "i" },
+    { "Canvas & Tools", "Transparency Tool", "t" },
+    { "Canvas & Tools", "Shapes Tool", "s" },
+    { "Canvas & Tools", "Decrease / Increase Brush Size", "bracketleft bracketright" },
+    { "Canvas & Tools", "Zoom In / Out / Fit / Reset", "<Control>plus <Control>minus <Control>9 <Control>0" },
+    { "Canvas & Tools", "Fullscreen", "F11" },
+    { "Canvas & Tools", "Toggle Floating Toolbar", "F9" },
+    { "Canvas & Tools", "Preferences", "<Control>comma" },
+  };
+
   GtkApplication *app = GTK_APPLICATION (user_data);
+  GtkWidget *parent = GTK_WIDGET (gtk_application_get_active_window (app));
+
+#if ADW_CHECK_VERSION (1, 8, 0)
   AdwDialog *dlg = adw_shortcuts_dialog_new ();
+  AdwShortcutsSection *cur_sec = NULL;
+  const char *cur_name = NULL;
 
-  AdwShortcutsSection *files_sec = adw_shortcuts_section_new ("Files & Tabs");
-  adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("New Canvas Tab", "<Control>n"));
-  adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("New Window", "<Control><Shift>n"));
-  adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("Open Image", "<Control>o"));
-  adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("Save", "<Control>s"));
-  adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("Save As", "<Control><Shift>s"));
-  adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("Close Tab", "<Control>w"));
-  adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("Tab Overview", "<Control><Shift>o"));
-  adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), files_sec);
+  for (gsize i = 0; i < G_N_ELEMENTS (items); i++) {
+    if (!cur_sec || g_strcmp0 (cur_name, items[i].section) != 0) {
+      cur_name = items[i].section;
+      cur_sec = adw_shortcuts_section_new (cur_name);
+      adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), cur_sec);
+    }
+    adw_shortcuts_section_add (cur_sec, adw_shortcuts_item_new (items[i].title, items[i].accel));
+  }
+  adw_dialog_present (dlg, parent);
+#else
+  AdwDialog *dlg = adw_preferences_dialog_new ();
+  adw_dialog_set_title (dlg, "Keyboard Shortcuts");
+  GtkWidget *page = adw_preferences_page_new ();
+  GtkWidget *cur_grp = NULL;
+  const char *cur_name = NULL;
 
-  AdwShortcutsSection *edit_sec = adw_shortcuts_section_new ("Selection & Clipboard");
-  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Select All", "<Control>a"));
-  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Copy", "<Control>c"));
-  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Cut", "<Control>x"));
-  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Paste", "<Control>v"));
-  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Paste as New Canvas", "<Control><Shift>v"));
-  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Crop to Selection", "<Control><Shift>x"));
-  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Delete Selection", "Delete"));
-  adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), edit_sec);
-
-  AdwShortcutsSection *draw_sec = adw_shortcuts_section_new ("Canvas & Tools");
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Undo", "<Control>z"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Redo", "<Control><Shift>z"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Selection Tool", "m"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Brush Tool", "b"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Line Tool", "l"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Text Tool", "x"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Eraser Tool", "e"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Fill Tool", "f"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Color Picker (or Alt+Click)", "i"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Transparency Tool", "t"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Shapes Tool", "s"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Decrease / Increase Brush Size", "bracketleft bracketright"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Zoom In / Out / Fit / Reset", "<Control>plus <Control>minus <Control>9 <Control>0"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Fullscreen", "F11"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Toggle Floating Toolbar", "F9"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Preferences", "<Control>comma"));
-  adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), draw_sec);
-
-  adw_dialog_present (dlg, GTK_WIDGET (gtk_application_get_active_window (app)));
+  for (gsize i = 0; i < G_N_ELEMENTS (items); i++) {
+    if (!cur_grp || g_strcmp0 (cur_name, items[i].section) != 0) {
+      cur_name = items[i].section;
+      cur_grp = adw_preferences_group_new ();
+      adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), cur_name);
+      adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (cur_grp));
+    }
+    GtkWidget *row = adw_action_row_new ();
+    adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), items[i].title);
+    GtkWidget *lbl = gtk_label_new (items[i].accel);
+    gtk_widget_add_css_class (lbl, "dim-label");
+    adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
+    adw_preferences_group_add (ADW_PREFERENCES_GROUP (cur_grp), row);
+  }
+  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg), ADW_PREFERENCES_PAGE (page));
+  adw_dialog_present (dlg, parent);
+#endif
 }
 
 static void

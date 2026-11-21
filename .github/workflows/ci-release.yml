@@ -57,17 +57,17 @@ jobs:
 
       - name: Install RPM build dependencies
         run: |
-          dnf install -y rpm-build gcc meson ninja-build gtk4-devel \
+          dnf install -y rpm-build tar gcc meson ninja-build gtk4-devel \
             libadwaita-devel cairo-devel pango-devel appstream \
-            desktop-file-utils git
+            desktop-file-utils
 
       - name: Build RPM packages
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           VERSION=$(rpmspec -q --qf '%{version}\n' --srpm packaging/rpm/paint.spec | head -n1)
-          mkdir -p ~/rpmbuild/{SOURCES,SPECS} dist-rpm
-          git archive --format=tar.gz --prefix="Draw-${VERSION}/" \
-            -o ~/rpmbuild/SOURCES/Draw-${VERSION}.tar.gz HEAD
+          mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS dist-rpm
+          tar --exclude=.git --exclude=build --exclude=dist-rpm --exclude=dist-deb \
+            --transform="s,^\.,Draw-${VERSION}," \
+            -czf ~/rpmbuild/SOURCES/Draw-${VERSION}.tar.gz .
           cp packaging/rpm/paint.spec ~/rpmbuild/SPECS/
           rpmbuild -ba ~/rpmbuild/SPECS/paint.spec
           find ~/rpmbuild/RPMS -type f -name '*.rpm' ! -name '*-debug*.rpm' \
@@ -89,8 +89,8 @@ jobs:
       - name: Install Debian build dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends debhelper dpkg-dev gcc \
-            meson ninja-build pkgconf libgtk-4-dev libadwaita-1-dev \
+          apt-get install -y --no-install-recommends build-essential debhelper \
+            dpkg-dev meson ninja-build pkgconf libgtk-4-dev libadwaita-1-dev \
             libcairo2-dev libpango1.0-dev appstream desktop-file-utils
 
       - name: Build Debian packages

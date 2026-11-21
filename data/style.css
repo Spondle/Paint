@@ -26,6 +26,16 @@
         0 0 0 1px color-mix(in srgb, var(--border-color) 65%, transparent);
 }
 
+.paint-sub-pill {
+    padding: 4px 10px;
+}
+
+.paint-sub-pill entry,
+.paint-sub-pill spinbutton,
+.paint-sub-pill dropdown > button {
+    min-height: 28px;
+}
+
 .paint-osd-pill separator {
     margin: 4px 4px;
     min-width: 1px;

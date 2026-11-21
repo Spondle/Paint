@@ -17,6 +17,9 @@ paint_tool_settings_new (void)
   settings->size = 6.0;
   settings->background_color = (GdkRGBA) { 1.0f, 1.0f, 1.0f, 1.0f };
   settings->active_tool_id = "brush";
+  settings->brush_style = PAINT_BRUSH_SMOOTH;
+  settings->text_font_family = g_strdup ("Sans");
+  settings->text_font_size = 28.0;
   settings->history_points = g_array_new (FALSE, FALSE, sizeof (PaintPoint));
   return settings;
 }
@@ -28,7 +31,60 @@ paint_tool_settings_free (PaintToolSettings *settings)
     return;
   if (settings->history_points)
     g_array_free (settings->history_points, TRUE);
+  g_free (settings->text_font_family);
   g_free (settings);
+}
+
+void
+paint_tool_settings_set_text_font_family (PaintToolSettings *settings, const char *family)
+{
+  if (!settings)
+    return;
+  g_free (settings->text_font_family);
+  settings->text_font_family = g_strdup ((family && *family) ? family : "Sans");
+}
+
+static gboolean
+rgba_nearly_equal (const GdkRGBA *a, const GdkRGBA *b)
+{
+  return fabsf (a->red - b->red) < 0.01f &&
+         fabsf (a->green - b->green) < 0.01f &&
+         fabsf (a->blue - b->blue) < 0.01f &&
+         fabsf (a->alpha - b->alpha) < 0.01f;
+}
+
+void
+paint_tool_settings_add_recent_color (PaintToolSettings *settings, const GdkRGBA *color)
+{
+  if (!settings || !color)
+    return;
+
+  int found = -1;
+  for (int i = 0; i < settings->n_recent_colors; i++) {
+    if (rgba_nearly_equal (&settings->recent_colors[i], color)) {
+      found = i;
+      break;
+    }
+  }
+
+  if (found == 0) {
+    settings->recent_colors[0] = *color;
+    return;
+  }
+
+  if (found > 0) {
+    for (int i = found; i > 0; i--)
+      settings->recent_colors[i] = settings->recent_colors[i - 1];
+    settings->recent_colors[0] = *color;
+    return;
+  }
+
+  int limit = MIN (settings->n_recent_colors, PAINT_MAX_RECENT_COLORS - 1);
+  for (int i = limit; i > 0; i--)
+    settings->recent_colors[i] = settings->recent_colors[i - 1];
+  settings->recent_colors[0] = *color;
+  if (settings->n_recent_colors < PAINT_MAX_RECENT_COLORS)
+    settings->n_recent_colors++;
 }
 
 static void
@@ -75,6 +131,99 @@ configure_for_tool (const PaintTool *tool, cairo_t *cr, const PaintToolSettings 
 }
 
 static void
+draw_pixel_stamp (cairo_t *cr, int ix, int iy, double size)
+{
+  int sz = MAX (1, (int) lround (size));
+  int px = ix - sz / 2;
+  int py = iy - sz / 2;
+  cairo_rectangle (cr, (double) px, (double) py, (double) sz, (double) sz);
+  cairo_fill (cr);
+}
+
+static void
+draw_pixel_segment (const PaintTool *tool,
+                    cairo_t *cr,
+                    double x0,
+                    double y0,
+                    double x1,
+                    double y1,
+                    const PaintToolSettings *settings)
+{
+  configure_for_tool (tool, cr, settings);
+  cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
+  int ix0 = (int) floor (x0);
+  int iy0 = (int) floor (y0);
+  int ix1 = (int) floor (x1);
+  int iy1 = (int) floor (y1);
+  int steps = MAX (abs (ix1 - ix0), abs (iy1 - iy0));
+  if (steps == 0)
+    return;
+
+  for (int i = 1; i <= steps; i++) {
+    double t = (double) i / (double) steps;
+    int sx = (int) lround ((double) ix0 + (double) (ix1 - ix0) * t);
+    int sy = (int) lround ((double) iy0 + (double) (iy1 - iy0) * t);
+    draw_pixel_stamp (cr, sx, sy, settings->size);
+  }
+}
+
+static void
+draw_soft_stamp (const PaintTool *tool,
+                 cairo_t *cr,
+                 double x,
+                 double y,
+                 const PaintToolSettings *settings)
+{
+  double r = MAX (1.5, settings->size * 0.5);
+  cairo_pattern_t *pat = cairo_pattern_create_radial (x, y, 0.0, x, y, r);
+
+  gboolean erase_alpha = (g_strcmp0 (tool->id, "transparent") == 0) ||
+                         (g_strcmp0 (tool->id, "eraser") == 0 &&
+                          settings->background_color.alpha <= 0.0f);
+  if (erase_alpha) {
+    cairo_set_operator (cr, CAIRO_OPERATOR_DEST_OUT);
+    cairo_pattern_add_color_stop_rgba (pat, 0.0, 0.0, 0.0, 0.0, 0.35);
+    cairo_pattern_add_color_stop_rgba (pat, 0.5, 0.0, 0.0, 0.0, 0.14);
+    cairo_pattern_add_color_stop_rgba (pat, 1.0, 0.0, 0.0, 0.0, 0.0);
+  } else {
+    GdkRGBA c = (g_strcmp0 (tool->id, "eraser") == 0)
+                  ? settings->background_color
+                  : settings->color;
+    double a = CLAMP ((double) c.alpha, 0.0, 1.0);
+    cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+    cairo_pattern_add_color_stop_rgba (pat, 0.0, c.red, c.green, c.blue, a * 0.35);
+    cairo_pattern_add_color_stop_rgba (pat, 0.5, c.red, c.green, c.blue, a * 0.14);
+    cairo_pattern_add_color_stop_rgba (pat, 1.0, c.red, c.green, c.blue, 0.0);
+  }
+
+  cairo_set_source (cr, pat);
+  cairo_arc (cr, x, y, r, 0.0, 2.0 * G_PI);
+  cairo_fill (cr);
+  cairo_pattern_destroy (pat);
+}
+
+static void
+draw_soft_segment (const PaintTool *tool,
+                   cairo_t *cr,
+                   double x0,
+                   double y0,
+                   double x1,
+                   double y1,
+                   const PaintToolSettings *settings)
+{
+  double r = MAX (1.5, settings->size * 0.5);
+  double dist = hypot (x1 - x0, y1 - y0);
+  if (dist < 0.5)
+    return;
+  double spacing = MAX (1.0, r * 0.25);
+  int steps = MAX (1, (int) ceil (dist / spacing));
+  for (int i = 1; i <= steps; i++) {
+    double t = (double) i / (double) steps;
+    draw_soft_stamp (tool, cr, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, settings);
+  }
+}
+
+static void
 freehand_begin_stroke (const PaintTool *tool,
                        cairo_t *cr,
                        double x,
@@ -84,6 +233,17 @@ freehand_begin_stroke (const PaintTool *tool,
   PaintPoint pt = { x, y };
   g_array_set_size (settings->history_points, 0);
   g_array_append_val (settings->history_points, pt);
+
+  if (settings->brush_style == PAINT_BRUSH_PIXEL) {
+    configure_for_tool (tool, cr, settings);
+    cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
+    draw_pixel_stamp (cr, (int) floor (x), (int) floor (y), settings->size);
+    return;
+  }
+  if (settings->brush_style == PAINT_BRUSH_SOFT) {
+    draw_soft_stamp (tool, cr, x, y, settings);
+    return;
+  }
 
   configure_for_tool (tool, cr, settings);
   cairo_arc (cr, x, y, MAX (0.5, settings->size / 2.0), 0.0, 2.0 * G_PI);
@@ -100,6 +260,21 @@ freehand_continue_stroke (const PaintTool *tool,
   GArray *pts = settings->history_points;
   if (pts->len == 0) {
     freehand_begin_stroke (tool, cr, x, y, settings);
+    return;
+  }
+
+  if (settings->brush_style == PAINT_BRUSH_PIXEL) {
+    PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
+    draw_pixel_segment (tool, cr, last.x, last.y, x, y, settings);
+    PaintPoint next = { x, y };
+    g_array_append_val (pts, next);
+    return;
+  }
+  if (settings->brush_style == PAINT_BRUSH_SOFT) {
+    PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
+    draw_soft_segment (tool, cr, last.x, last.y, x, y, settings);
+    PaintPoint next = { x, y };
+    g_array_append_val (pts, next);
     return;
   }
 
@@ -137,6 +312,23 @@ freehand_end_stroke (const PaintTool *tool,
                      PaintToolSettings *settings)
 {
   GArray *pts = settings->history_points;
+  if (settings->brush_style == PAINT_BRUSH_PIXEL) {
+    if (pts->len >= 1) {
+      PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
+      draw_pixel_segment (tool, cr, last.x, last.y, x, y, settings);
+    }
+    g_array_set_size (pts, 0);
+    return;
+  }
+  if (settings->brush_style == PAINT_BRUSH_SOFT) {
+    if (pts->len >= 1) {
+      PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
+      draw_soft_segment (tool, cr, last.x, last.y, x, y, settings);
+    }
+    g_array_set_size (pts, 0);
+    return;
+  }
+
   if (pts->len >= 2) {
     PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
     configure_for_tool (tool, cr, settings);
@@ -917,6 +1109,16 @@ block_arrow_get_bounds (const PaintTool *tool G_GNUC_UNUSED,
 
 static const PaintTool BUILTIN_TOOLS[] = {
   {
+    .id = "select",
+    .name = "Select",
+    .icon_name = "tool-select-symbolic",
+    .tooltip = "Select (M) · Drag to select, drag inside to move",
+    .uses_brush_size = FALSE,
+    .begin_stroke = fill_noop,
+    .continue_stroke = fill_noop,
+    .end_stroke = fill_noop,
+  },
+  {
     .id = "brush",
     .name = "Brush",
     .icon_name = "document-edit-symbolic",
@@ -955,6 +1157,26 @@ static const PaintTool BUILTIN_TOOLS[] = {
     .tooltip = "Fill (F)",
     .uses_brush_size = FALSE,
     .begin_stroke = fill_begin_stroke,
+    .continue_stroke = fill_noop,
+    .end_stroke = fill_noop,
+  },
+  {
+    .id = "text",
+    .name = "Text",
+    .icon_name = "tool-text-symbolic",
+    .tooltip = "Text (X) · Click canvas to add text",
+    .uses_brush_size = FALSE,
+    .begin_stroke = fill_noop,
+    .continue_stroke = fill_noop,
+    .end_stroke = fill_noop,
+  },
+  {
+    .id = "eyedropper",
+    .name = "Color Picker",
+    .icon_name = "tool-eyedropper-symbolic",
+    .tooltip = "Color Picker (I) · Or Alt+Click anytime",
+    .uses_brush_size = FALSE,
+    .begin_stroke = fill_noop,
     .continue_stroke = fill_noop,
     .end_stroke = fill_noop,
   },
@@ -1128,11 +1350,14 @@ paint_tools_get_all (gsize *n_tools)
 const PaintTool *
 paint_tools_find (const char *tool_id)
 {
+  const PaintTool *brush_fallback = &BUILTIN_TOOLS[0];
   for (gsize i = 0; i < G_N_ELEMENTS (BUILTIN_TOOLS); i++) {
+    if (g_strcmp0 (BUILTIN_TOOLS[i].id, "brush") == 0)
+      brush_fallback = &BUILTIN_TOOLS[i];
     if (g_strcmp0 (BUILTIN_TOOLS[i].id, tool_id) == 0)
       return &BUILTIN_TOOLS[i];
   }
-  return &BUILTIN_TOOLS[0];
+  return brush_fallback;
 }
 
 const char *

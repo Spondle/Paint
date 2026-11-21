@@ -19,6 +19,7 @@ paint_preferences_load (void)
   prefs->default_height = PAINT_DEFAULT_CANVAS_HEIGHT;
   prefs->default_brush_size = 6.0;
   prefs->show_cursor_ring = TRUE;
+  prefs->show_pixel_grid = TRUE;
   prefs->show_toolbar = TRUE;
   prefs->restore_session = TRUE;
 
@@ -33,6 +34,8 @@ paint_preferences_load (void)
   }
   if (g_key_file_has_key (kf, "Appearance", "ShowCursorRing", NULL))
     prefs->show_cursor_ring = g_key_file_get_boolean (kf, "Appearance", "ShowCursorRing", NULL);
+  if (g_key_file_has_key (kf, "Appearance", "ShowPixelGrid", NULL))
+    prefs->show_pixel_grid = g_key_file_get_boolean (kf, "Appearance", "ShowPixelGrid", NULL);
   if (g_key_file_has_key (kf, "Appearance", "ShowToolbar", NULL))
     prefs->show_toolbar = g_key_file_get_boolean (kf, "Appearance", "ShowToolbar", NULL);
   if (g_key_file_has_key (kf, "Behavior", "RestoreSession", NULL))
@@ -61,6 +64,7 @@ paint_preferences_save (const PaintPreferences *prefs)
   g_autoptr (GKeyFile) kf = g_key_file_new ();
   g_key_file_set_integer (kf, "Appearance", "ColorScheme", prefs->color_scheme);
   g_key_file_set_boolean (kf, "Appearance", "ShowCursorRing", prefs->show_cursor_ring);
+  g_key_file_set_boolean (kf, "Appearance", "ShowPixelGrid", prefs->show_pixel_grid);
   g_key_file_set_boolean (kf, "Appearance", "ShowToolbar", prefs->show_toolbar);
   g_key_file_set_boolean (kf, "Behavior", "RestoreSession", prefs->restore_session);
   g_key_file_set_integer (kf, "Canvas", "DefaultWidth", prefs->default_width);
@@ -234,6 +238,14 @@ on_cursor_ring_toggled (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer 
 }
 
 static void
+on_pixel_grid_toggled (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
+{
+  PrefsDialogCtx *ctx = user_data;
+  ctx->prefs->show_pixel_grid = adw_switch_row_get_active (ADW_SWITCH_ROW (obj));
+  notify_changed (ctx);
+}
+
+static void
 on_toolbar_toggled (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
 {
   PrefsDialogCtx *ctx = user_data;
@@ -303,6 +315,14 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
   adw_switch_row_set_active (ADW_SWITCH_ROW (cursor_row), prefs->show_cursor_ring);
   g_signal_connect (cursor_row, "notify::active", G_CALLBACK (on_cursor_ring_toggled), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (appearance_grp), cursor_row);
+
+  GtkWidget *grid_row = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (grid_row), "High-Zoom Pixel Grid");
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (grid_row),
+                               "Show subtle pixel grid at 800% zoom or higher");
+  adw_switch_row_set_active (ADW_SWITCH_ROW (grid_row), prefs->show_pixel_grid);
+  g_signal_connect (grid_row, "notify::active", G_CALLBACK (on_pixel_grid_toggled), ctx);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (appearance_grp), grid_row);
 
   GtkWidget *toolbar_row = adw_switch_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (toolbar_row), "Floating Toolbar");

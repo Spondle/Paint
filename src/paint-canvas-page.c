@@ -59,6 +59,7 @@ struct _PaintCanvasPage {
   const char *last_transparency_tool_id;
   GtkWidget *size_btn;
   GtkScale *size_scale;
+  GtkWidget *brush_style_btns[3];
   GtkWidget *color_btn;
   GtkWidget *color_swatch;
   GtkWidget *color_sv_area;
@@ -67,6 +68,15 @@ struct _PaintCanvasPage {
   GtkWidget *color_preview_area;
   GtkWidget *color_alpha_label;
   GtkWidget *color_hex_entry;
+  GtkWidget *recent_colors_section;
+  GtkWidget *recent_colors_box;
+  GtkWidget *selection_bar;
+  GtkWidget *text_bar;
+  GtkWidget *text_entry;
+  GtkWidget *text_font_dropdown;
+  GtkWidget *text_size_spin;
+  GtkWidget *text_bold_btn;
+  GtkWidget *text_italic_btn;
   GHashTable *tool_buttons; /* char* -> GtkToggleButton* */
 
   float hsv_h;
@@ -302,6 +312,8 @@ on_tool_toggled (GtkToggleButton *btn, gpointer user_data)
     return;
   const char *tool_id = g_object_get_data (G_OBJECT (btn), "paint-tool-id");
   if (tool_id) {
+    if (g_strcmp0 (self->settings->active_tool_id, tool_id) != 0)
+      paint_canvas_commit_active_overlays (self->canvas);
     self->settings->active_tool_id = tool_id;
     const PaintTool *tool = paint_tools_find (tool_id);
     sync_tool_ui (self, tool);
@@ -311,6 +323,17 @@ on_tool_toggled (GtkToggleButton *btn, gpointer user_data)
       gtk_popover_popdown (GTK_POPOVER (self->transparent_popover));
     gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
   }
+}
+
+static void
+on_brush_style_toggled (GtkToggleButton *btn, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing || !gtk_toggle_button_get_active (btn))
+    return;
+  int idx = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (btn), "paint-brush-style"));
+  self->settings->brush_style = (PaintBrushStyle) CLAMP (idx, 0, 2);
+  gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
 }
 
 static void
@@ -403,6 +426,8 @@ update_color_widgets (PaintCanvasPage *self)
     gtk_widget_queue_draw (self->color_alpha_area);
   if (self->color_preview_area)
     gtk_widget_queue_draw (self->color_preview_area);
+  if (self->canvas && paint_canvas_has_active_text (self->canvas))
+    gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
 
   if (self->color_alpha_label) {
     int pct = (int) lroundf (self->hsv_a * 100.0f);
@@ -725,6 +750,50 @@ on_hex_entry_activate (GtkEntry *entry G_GNUC_UNUSED, gpointer user_data)
   update_color_widgets (self);
 }
 
+static void
+sync_recent_colors (PaintCanvasPage *self)
+{
+  if (!self->recent_colors_box || !self->recent_colors_section || !self->settings)
+    return;
+
+  GtkWidget *child = gtk_widget_get_first_child (self->recent_colors_box);
+  while (child) {
+    GtkWidget *next = gtk_widget_get_next_sibling (child);
+    gtk_box_remove (GTK_BOX (self->recent_colors_box), child);
+    child = next;
+  }
+
+  if (self->settings->n_recent_colors <= 0) {
+    gtk_widget_set_visible (self->recent_colors_section, FALSE);
+    return;
+  }
+
+  gtk_widget_set_visible (self->recent_colors_section, TRUE);
+  for (int i = 0; i < self->settings->n_recent_colors; i++) {
+    GtkWidget *btn = gtk_button_new ();
+    gtk_widget_add_css_class (btn, "flat");
+    gtk_widget_add_css_class (btn, "paint-color-preset");
+    GtkWidget *dot = gtk_drawing_area_new ();
+    gtk_widget_set_size_request (dot, 18, 18);
+    g_object_set_data_full (G_OBJECT (dot), "paint-preset-rgba",
+                            g_memdup2 (&self->settings->recent_colors[i], sizeof (GdkRGBA)), g_free);
+    gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (dot), draw_color_circle, self, NULL);
+    gtk_button_set_child (GTK_BUTTON (btn), dot);
+    g_object_set_data_full (G_OBJECT (btn), "paint-preset-color",
+                            g_memdup2 (&self->settings->recent_colors[i], sizeof (GdkRGBA)), g_free);
+    g_signal_connect (btn, "clicked", G_CALLBACK (on_color_preset_clicked), self);
+    gtk_box_append (GTK_BOX (self->recent_colors_box), btn);
+  }
+}
+
+static void
+on_color_popover_closed (GtkPopover *popover G_GNUC_UNUSED, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  paint_tool_settings_add_recent_color (self->settings, &self->settings->color);
+  sync_recent_colors (self);
+}
+
 static GtkPopover *
 build_color_popover (PaintCanvasPage *self)
 {
@@ -811,8 +880,21 @@ build_color_popover (PaintCanvasPage *self)
   }
   gtk_box_append (GTK_BOX (box), presets);
 
+  self->recent_colors_section = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  GtkWidget *recent_lbl = gtk_label_new ("Recent");
+  gtk_widget_add_css_class (recent_lbl, "paint-dim-label");
+  gtk_widget_set_halign (recent_lbl, GTK_ALIGN_START);
+  gtk_box_append (GTK_BOX (self->recent_colors_section), recent_lbl);
+
+  self->recent_colors_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  gtk_widget_set_halign (self->recent_colors_box, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (self->recent_colors_section), self->recent_colors_box);
+  gtk_box_append (GTK_BOX (box), self->recent_colors_section);
+
   gtk_popover_set_child (GTK_POPOVER (pop), box);
+  g_signal_connect (pop, "closed", G_CALLBACK (on_color_popover_closed), self);
   sync_hsv_from_settings (self);
+  sync_recent_colors (self);
   return GTK_POPOVER (pop);
 }
 
@@ -1015,6 +1097,33 @@ build_size_popover (PaintCanvasPage *self)
   }
   gtk_box_append (GTK_BOX (box), presets);
 
+  GtkWidget *style_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *style_lbl = gtk_label_new ("Style");
+  gtk_widget_add_css_class (style_lbl, "paint-dim-label");
+  gtk_widget_set_hexpand (style_lbl, TRUE);
+  gtk_widget_set_halign (style_lbl, GTK_ALIGN_START);
+  gtk_box_append (GTK_BOX (style_row), style_lbl);
+
+  GtkWidget *style_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  gtk_widget_add_css_class (style_box, "paint-shape-mode");
+  static const char *STYLE_LABELS[3] = { "Smooth", "Soft", "Pixel" };
+  GtkToggleButton *first_style = NULL;
+  for (int i = 0; i < 3; i++) {
+    GtkWidget *sbtn = gtk_toggle_button_new_with_label (STYLE_LABELS[i]);
+    if (!first_style)
+      first_style = GTK_TOGGLE_BUTTON (sbtn);
+    else
+      gtk_toggle_button_set_group (GTK_TOGGLE_BUTTON (sbtn), first_style);
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (sbtn),
+                                  (int) self->settings->brush_style == i);
+    g_object_set_data (G_OBJECT (sbtn), "paint-brush-style", GINT_TO_POINTER (i));
+    g_signal_connect (sbtn, "toggled", G_CALLBACK (on_brush_style_toggled), self);
+    gtk_box_append (GTK_BOX (style_box), sbtn);
+    self->brush_style_btns[i] = sbtn;
+  }
+  gtk_box_append (GTK_BOX (style_row), style_box);
+  gtk_box_append (GTK_BOX (box), style_row);
+
   gtk_popover_set_child (GTK_POPOVER (pop), box);
   return GTK_POPOVER (pop);
 }
@@ -1101,7 +1210,7 @@ build_shapes_popover (PaintCanvasPage *self)
 
   gtk_box_append (GTK_BOX (box), grid);
 
-  GtkWidget *hint = gtk_label_new ("Hold Shift while dragging to constrain proportions");
+  GtkWidget *hint = gtk_label_new ("Hold Shift for proportions · Space to move");
   gtk_widget_add_css_class (hint, "paint-dim-label");
   gtk_widget_set_halign (hint, GTK_ALIGN_START);
   gtk_box_append (GTK_BOX (box), hint);
@@ -1218,6 +1327,238 @@ on_adjustment_prop_changed (GObject *obj G_GNUC_UNUSED,
 {
   PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
   paint_canvas_check_viewport (self->canvas);
+}
+
+static void
+sync_overlay_bars (PaintCanvasPage *self)
+{
+  if (!self->canvas)
+    return;
+  gboolean has_text = paint_canvas_has_active_text (self->canvas);
+  gboolean has_sel = paint_canvas_has_selection (self->canvas);
+  if (self->text_bar)
+    gtk_widget_set_visible (self->text_bar, has_text);
+  if (self->selection_bar)
+    gtk_widget_set_visible (self->selection_bar, !has_text && has_sel);
+}
+
+static void
+on_canvas_color_picked (PaintCanvas *canvas G_GNUC_UNUSED, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  sync_hsv_from_settings (self);
+  sync_recent_colors (self);
+  gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+}
+
+static void
+on_canvas_selection_changed (PaintCanvas *canvas G_GNUC_UNUSED, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  sync_overlay_bars (self);
+  g_signal_emit (self, signals[SIGNAL_STATE_CHANGED], 0);
+}
+
+static void
+on_canvas_text_state_changed (PaintCanvas *canvas, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  gboolean active = paint_canvas_has_active_text (canvas);
+  sync_overlay_bars (self);
+  if (active && self->text_entry) {
+    self->syncing = TRUE;
+    gtk_editable_set_text (GTK_EDITABLE (self->text_entry),
+                           paint_canvas_get_active_text (canvas));
+    self->syncing = FALSE;
+    gtk_widget_grab_focus (self->text_entry);
+  } else if (!active && self->canvas) {
+    gtk_widget_grab_focus (GTK_WIDGET (self->canvas));
+  }
+}
+
+static void
+on_text_entry_changed (GtkEditable *editable, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  paint_canvas_set_active_text (self->canvas, gtk_editable_get_text (editable));
+}
+
+static void
+on_text_entry_activate (GtkEntry *entry G_GNUC_UNUSED, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  paint_canvas_commit_text (self->canvas);
+}
+
+static gboolean
+on_text_entry_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
+                           guint keyval,
+                           guint keycode G_GNUC_UNUSED,
+                           GdkModifierType state G_GNUC_UNUSED,
+                           gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (keyval == GDK_KEY_Escape) {
+    paint_canvas_cancel_text (self->canvas);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static void
+on_text_font_changed (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  static const char *FAMILIES[] = { "Sans", "Serif", "Monospace" };
+  guint idx = gtk_drop_down_get_selected (GTK_DROP_DOWN (obj));
+  const char *family = (idx < G_N_ELEMENTS (FAMILIES)) ? FAMILIES[idx] : "Sans";
+  paint_tool_settings_set_text_font_family (self->settings, family);
+  gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+}
+
+static void
+on_text_size_changed (GtkSpinButton *spin, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  self->settings->text_font_size = gtk_spin_button_get_value (spin);
+  gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+}
+
+static void
+on_text_bold_toggled (GtkToggleButton *btn, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  self->settings->text_bold = gtk_toggle_button_get_active (btn);
+  gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+}
+
+static void
+on_text_italic_toggled (GtkToggleButton *btn, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  self->settings->text_italic = gtk_toggle_button_get_active (btn);
+  gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+}
+
+static GtkWidget *
+add_action_pill_button (GtkWidget *box,
+                        const char *icon_name,
+                        const char *tooltip,
+                        const char *action_name)
+{
+  GtkWidget *btn = gtk_button_new_from_icon_name (icon_name);
+  gtk_widget_add_css_class (btn, "flat");
+  gtk_widget_set_tooltip_text (btn, tooltip);
+  if (action_name)
+    gtk_actionable_set_action_name (GTK_ACTIONABLE (btn), action_name);
+  gtk_box_append (GTK_BOX (box), btn);
+  return btn;
+}
+
+static GtkWidget *
+build_selection_bar (PaintCanvasPage *self)
+{
+  GtkWidget *bar = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
+  gtk_widget_add_css_class (bar, "paint-osd-pill");
+  gtk_widget_add_css_class (bar, "paint-sub-pill");
+  gtk_widget_set_halign (bar, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (bar, GTK_ALIGN_END);
+  gtk_widget_set_margin_bottom (bar, 68);
+  gtk_widget_set_visible (bar, FALSE);
+
+  add_action_pill_button (bar, "edit-copy-symbolic", "Copy Selection (Ctrl+C)", "win.copy");
+  add_action_pill_button (bar, "edit-cut-symbolic", "Cut Selection (Ctrl+X)", "win.cut");
+  add_action_pill_button (bar, "tool-crop-symbolic", "Crop to Selection (Ctrl+Shift+X)", "win.crop-selection");
+  gtk_box_append (GTK_BOX (bar), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
+  add_action_pill_button (bar, "object-rotate-left-symbolic", "Rotate Selection Left 90°", "win.rotate-ccw");
+  add_action_pill_button (bar, "object-rotate-right-symbolic", "Rotate Selection Right 90°", "win.rotate-cw");
+  add_action_pill_button (bar, "object-flip-horizontal-symbolic", "Flip Selection Horizontally", "win.flip-horizontal");
+  add_action_pill_button (bar, "object-flip-vertical-symbolic", "Flip Selection Vertically", "win.flip-vertical");
+  gtk_box_append (GTK_BOX (bar), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
+  add_action_pill_button (bar, "edit-delete-symbolic", "Delete Selection (Del)", "win.delete-selection");
+
+  GtkWidget *done_btn = gtk_button_new_from_icon_name ("object-select-symbolic");
+  gtk_widget_add_css_class (done_btn, "suggested-action");
+  gtk_widget_set_tooltip_text (done_btn, "Apply Selection (Enter)");
+  g_signal_connect_swapped (done_btn, "clicked", G_CALLBACK (paint_canvas_commit_selection), self->canvas);
+  gtk_box_append (GTK_BOX (bar), done_btn);
+  return bar;
+}
+
+static GtkWidget *
+build_text_bar (PaintCanvasPage *self)
+{
+  GtkWidget *bar = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_widget_add_css_class (bar, "paint-osd-pill");
+  gtk_widget_add_css_class (bar, "paint-sub-pill");
+  gtk_widget_set_halign (bar, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (bar, GTK_ALIGN_END);
+  gtk_widget_set_margin_bottom (bar, 68);
+  gtk_widget_set_visible (bar, FALSE);
+
+  self->text_entry = gtk_entry_new ();
+  gtk_entry_set_placeholder_text (GTK_ENTRY (self->text_entry), "Type text…");
+  gtk_editable_set_width_chars (GTK_EDITABLE (self->text_entry), 16);
+  g_signal_connect (self->text_entry, "changed", G_CALLBACK (on_text_entry_changed), self);
+  g_signal_connect (self->text_entry, "activate", G_CALLBACK (on_text_entry_activate), self);
+  GtkEventController *ekey = gtk_event_controller_key_new ();
+  g_signal_connect (ekey, "key-pressed", G_CALLBACK (on_text_entry_key_pressed), self);
+  gtk_widget_add_controller (self->text_entry, ekey);
+  gtk_box_append (GTK_BOX (bar), self->text_entry);
+
+  static const char *const FONT_ITEMS[] = { "Sans", "Serif", "Monospace", NULL };
+  self->text_font_dropdown = gtk_drop_down_new_from_strings (FONT_ITEMS);
+  gtk_widget_set_tooltip_text (self->text_font_dropdown, "Font Family");
+  g_signal_connect (self->text_font_dropdown, "notify::selected", G_CALLBACK (on_text_font_changed), self);
+  gtk_box_append (GTK_BOX (bar), self->text_font_dropdown);
+
+  self->text_size_spin = gtk_spin_button_new_with_range (8.0, 256.0, 2.0);
+  gtk_spin_button_set_value (GTK_SPIN_BUTTON (self->text_size_spin), self->settings->text_font_size);
+  gtk_widget_set_tooltip_text (self->text_size_spin, "Font Size (px)");
+  g_signal_connect (self->text_size_spin, "value-changed", G_CALLBACK (on_text_size_changed), self);
+  gtk_box_append (GTK_BOX (bar), self->text_size_spin);
+
+  self->text_bold_btn = gtk_toggle_button_new ();
+  GtkWidget *b_lbl = gtk_label_new (NULL);
+  gtk_label_set_markup (GTK_LABEL (b_lbl), "<b>B</b>");
+  gtk_button_set_child (GTK_BUTTON (self->text_bold_btn), b_lbl);
+  gtk_widget_add_css_class (self->text_bold_btn, "flat");
+  gtk_widget_set_tooltip_text (self->text_bold_btn, "Bold");
+  g_signal_connect (self->text_bold_btn, "toggled", G_CALLBACK (on_text_bold_toggled), self);
+  gtk_box_append (GTK_BOX (bar), self->text_bold_btn);
+
+  self->text_italic_btn = gtk_toggle_button_new ();
+  GtkWidget *i_lbl = gtk_label_new (NULL);
+  gtk_label_set_markup (GTK_LABEL (i_lbl), "<i>I</i>");
+  gtk_button_set_child (GTK_BUTTON (self->text_italic_btn), i_lbl);
+  gtk_widget_add_css_class (self->text_italic_btn, "flat");
+  gtk_widget_set_tooltip_text (self->text_italic_btn, "Italic");
+  g_signal_connect (self->text_italic_btn, "toggled", G_CALLBACK (on_text_italic_toggled), self);
+  gtk_box_append (GTK_BOX (bar), self->text_italic_btn);
+
+  GtkWidget *apply_btn = gtk_button_new_from_icon_name ("object-select-symbolic");
+  gtk_widget_add_css_class (apply_btn, "suggested-action");
+  gtk_widget_set_tooltip_text (apply_btn, "Apply Text (Enter)");
+  g_signal_connect_swapped (apply_btn, "clicked", G_CALLBACK (paint_canvas_commit_text), self->canvas);
+  gtk_box_append (GTK_BOX (bar), apply_btn);
+
+  GtkWidget *cancel_btn = gtk_button_new_from_icon_name ("window-close-symbolic");
+  gtk_widget_add_css_class (cancel_btn, "flat");
+  gtk_widget_set_tooltip_text (cancel_btn, "Cancel Text (Esc)");
+  g_signal_connect_swapped (cancel_btn, "clicked", G_CALLBACK (paint_canvas_cancel_text), self->canvas);
+  gtk_box_append (GTK_BOX (bar), cancel_btn);
+
+  return bar;
 }
 
 static void
@@ -1404,8 +1745,17 @@ build_ui (PaintCanvasPage *self)
   self->osd_pill = pill;
   gtk_overlay_add_overlay (self->overlay, pill);
 
+  self->selection_bar = build_selection_bar (self);
+  gtk_overlay_add_overlay (self->overlay, self->selection_bar);
+
+  self->text_bar = build_text_bar (self);
+  gtk_overlay_add_overlay (self->overlay, self->text_bar);
+
   g_signal_connect (self->canvas, "changed", G_CALLBACK (on_canvas_changed), self);
   g_signal_connect (self->canvas, "zoom-changed", G_CALLBACK (on_canvas_zoom_changed), self);
+  g_signal_connect (self->canvas, "color-picked", G_CALLBACK (on_canvas_color_picked), self);
+  g_signal_connect (self->canvas, "selection-changed", G_CALLBACK (on_canvas_selection_changed), self);
+  g_signal_connect (self->canvas, "text-state-changed", G_CALLBACK (on_canvas_text_state_changed), self);
 }
 
 static void
@@ -1500,6 +1850,33 @@ paint_canvas_page_adjust_brush_size (PaintCanvasPage *self, double delta)
 }
 
 void
+paint_canvas_page_zoom_fit (PaintCanvasPage *self)
+{
+  if (!self || !self->canvas || !self->scrolled)
+    return;
+  PaintDocument *doc = paint_canvas_get_document (self->canvas);
+  if (!doc)
+    return;
+
+  double view_w = (double) gtk_widget_get_width (GTK_WIDGET (self->scrolled));
+  double view_h = (double) gtk_widget_get_height (GTK_WIDGET (self->scrolled));
+  if (view_w <= 0.0 || view_h <= 0.0) {
+    GtkAdjustment *hadj = gtk_scrolled_window_get_hadjustment (self->scrolled);
+    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment (self->scrolled);
+    view_w = gtk_adjustment_get_page_size (hadj);
+    view_h = gtk_adjustment_get_page_size (vadj);
+  }
+  double avail_w = MAX (32.0, view_w - (double) (WORKSPACE_MARGIN_START + WORKSPACE_MARGIN_END));
+  double avail_h = MAX (32.0, view_h - (double) (WORKSPACE_MARGIN_TOP + WORKSPACE_MARGIN_BOTTOM));
+  double dw = (double) MAX (1, paint_document_get_width (doc));
+  double dh = (double) MAX (1, paint_document_get_height (doc));
+
+  double fit = MIN (avail_w / dw, avail_h / dh);
+  fit = CLAMP (fit, paint_canvas_get_min_zoom (), paint_canvas_get_max_zoom ());
+  paint_canvas_set_zoom (self->canvas, fit);
+}
+
+void
 paint_canvas_page_toggle_osd (PaintCanvasPage *self)
 {
   gtk_widget_set_visible (self->osd_pill, !gtk_widget_get_visible (self->osd_pill));
@@ -1533,8 +1910,30 @@ paint_canvas_page_sync_controls (PaintCanvasPage *self)
   gtk_range_set_value (GTK_RANGE (self->size_scale), self->settings->size);
   g_autofree char *lbl = g_strdup_printf ("%d px", (int) lround (self->settings->size));
   gtk_menu_button_set_label (GTK_MENU_BUTTON (self->size_btn), lbl);
+
+  for (int i = 0; i < 3; i++) {
+    if (self->brush_style_btns[i])
+      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (self->brush_style_btns[i]),
+                                    (int) self->settings->brush_style == i);
+  }
+  if (self->text_size_spin)
+    gtk_spin_button_set_value (GTK_SPIN_BUTTON (self->text_size_spin), self->settings->text_font_size);
+  if (self->text_bold_btn)
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (self->text_bold_btn), self->settings->text_bold);
+  if (self->text_italic_btn)
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (self->text_italic_btn), self->settings->text_italic);
+  if (self->text_font_dropdown) {
+    guint sel = 0;
+    if (g_strcmp0 (self->settings->text_font_family, "Serif") == 0)
+      sel = 1;
+    else if (g_strcmp0 (self->settings->text_font_family, "Monospace") == 0)
+      sel = 2;
+    gtk_drop_down_set_selected (GTK_DROP_DOWN (self->text_font_dropdown), sel);
+  }
   self->syncing = FALSE;
   sync_hsv_from_settings (self);
+  sync_recent_colors (self);
+  sync_overlay_bars (self);
 }
 
 char *

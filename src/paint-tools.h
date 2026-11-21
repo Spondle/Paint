@@ -5,6 +5,14 @@
 
 G_BEGIN_DECLS
 
+#define PAINT_MAX_RECENT_COLORS 8
+
+typedef enum {
+  PAINT_BRUSH_SMOOTH = 0,
+  PAINT_BRUSH_SOFT = 1,
+  PAINT_BRUSH_PIXEL = 2,
+} PaintBrushStyle;
+
 typedef struct {
   double x;
   double y;
@@ -16,6 +24,13 @@ typedef struct {
   GdkRGBA background_color;
   const char *active_tool_id;
   gboolean shape_filled;
+  PaintBrushStyle brush_style;
+  GdkRGBA recent_colors[PAINT_MAX_RECENT_COLORS];
+  int n_recent_colors;
+  char *text_font_family;
+  double text_font_size;
+  gboolean text_bold;
+  gboolean text_italic;
   GArray *history_points; /* element-type: PaintPoint */
 } PaintToolSettings;
 
@@ -71,6 +86,10 @@ struct _PaintTool {
 
 PaintToolSettings *paint_tool_settings_new (void);
 void paint_tool_settings_free (PaintToolSettings *settings);
+void paint_tool_settings_add_recent_color (PaintToolSettings *settings,
+                                           const GdkRGBA *color);
+void paint_tool_settings_set_text_font_family (PaintToolSettings *settings,
+                                               const char *family);
 
 const PaintTool *paint_tools_get_all (gsize *n_tools);
 const PaintTool *paint_tools_find (const char *tool_id);

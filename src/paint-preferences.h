@@ -16,6 +16,7 @@ typedef struct {
   int default_height;
   double default_brush_size;
   gboolean show_cursor_ring;
+  gboolean show_pixel_grid;
   gboolean show_toolbar;
   gboolean restore_session;
 } PaintPreferences;

@@ -875,6 +875,356 @@ test_block_arrow_outline_filled_and_undo (void)
   paint_document_free (doc);
 }
 
+static void
+test_eyedropper_pick_color (void)
+{
+  PaintDocument *doc = paint_document_new_transparent (40, 40);
+  cairo_t *cr = cairo_create (paint_document_get_surface (doc));
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (cr, 1.0, 0.25, 0.5, 0.5);
+  cairo_rectangle (cr, 10.0, 10.0, 10.0, 10.0);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  g_assert_nonnull (paint_tools_find ("eyedropper"));
+
+  GdkRGBA picked = { 0 };
+  g_assert_true (paint_document_pick_color (doc, 15.0, 15.0, &picked));
+  g_assert_cmpfloat_with_epsilon (picked.red, 1.0, 0.02);
+  g_assert_cmpfloat_with_epsilon (picked.green, 0.25, 0.02);
+  g_assert_cmpfloat_with_epsilon (picked.blue, 0.5, 0.02);
+  g_assert_cmpfloat_with_epsilon (picked.alpha, 0.5, 0.02);
+
+  g_assert_true (paint_document_pick_color (doc, 5.0, 5.0, &picked));
+  g_assert_cmpfloat_with_epsilon (picked.alpha, 0.0, 0.01);
+
+  g_assert_false (paint_document_pick_color (doc, -1.0, 5.0, &picked));
+  g_assert_false (paint_document_pick_color (doc, 40.0, 5.0, &picked));
+
+  paint_document_free (doc);
+}
+
+static void
+test_brush_styles_pixel_and_soft (void)
+{
+  PaintDocument *doc = paint_document_new (100, 100);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  const PaintTool *brush = paint_tools_find ("brush");
+
+  /* Pixel brush produces crisp hard-edged pixels without anti-aliased fringe */
+  settings->brush_style = PAINT_BRUSH_PIXEL;
+  settings->size = 4.0;
+  paint_document_begin_stroke (doc, 10.0, 10.0, brush, settings);
+  paint_document_continue_stroke (doc, 20.0, 18.0, brush, settings);
+  paint_document_end_stroke (doc, 30.0, 30.0, brush, settings);
+
+  guint8 r, g, b, a;
+  for (int y = 0; y < 40; y++)
+    for (int x = 0; x < 40; x++)
+      {
+        read_pixel_rgba (doc, x, y, &r, &g, &b, &a);
+        g_assert_true (g == 0 || g == 255);
+      }
+  read_pixel_rgba (doc, 20, 18, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+
+  /* Soft brush creates a feathered radial gradient falloff around the stamp */
+  settings->brush_style = PAINT_BRUSH_SOFT;
+  settings->size = 20.0;
+  paint_document_begin_stroke (doc, 70.0, 70.0, brush, settings);
+  paint_document_end_stroke (doc, 70.0, 70.0, brush, settings);
+
+  read_pixel_rgba (doc, 70, 70, &r, &g, &b, &a);
+  guint8 g_center = g;
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g_center, <, 220);
+
+  read_pixel_rgba (doc, 70, 76, &r, &g, &b, &a);
+  g_assert_cmpuint (g, >, g_center);
+  g_assert_cmpuint (g, <, 255);
+
+  read_pixel_rgba (doc, 70, 82, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_recent_colors_dedup_and_cap (void)
+{
+  PaintToolSettings *settings = paint_tool_settings_new ();
+
+  for (int i = 0; i < 10; i++)
+    {
+      GdkRGBA c = { i / 10.0f, 0.2f, 0.8f, 1.0f };
+      paint_tool_settings_add_recent_color (settings, &c);
+    }
+
+  g_assert_cmpint (settings->n_recent_colors, ==, PAINT_MAX_RECENT_COLORS);
+  g_assert_cmpfloat_with_epsilon (settings->recent_colors[0].red, 0.9f, 1e-4);
+  g_assert_cmpfloat_with_epsilon (settings->recent_colors[PAINT_MAX_RECENT_COLORS - 1].red, 0.2f, 1e-4);
+
+  /* Re-adding an existing swatch moves it to front without duplicating */
+  GdkRGBA dup = { 0.5f, 0.2f, 0.8f, 1.0f };
+  paint_tool_settings_add_recent_color (settings, &dup);
+
+  g_assert_cmpint (settings->n_recent_colors, ==, PAINT_MAX_RECENT_COLORS);
+  g_assert_cmpfloat_with_epsilon (settings->recent_colors[0].red, 0.5f, 1e-4);
+
+  int matches = 0;
+  for (int i = 0; i < settings->n_recent_colors; i++)
+    {
+      if (settings->recent_colors[i].red > 0.45f && settings->recent_colors[i].red < 0.55f)
+        matches++;
+    }
+  g_assert_cmpint (matches, ==, 1);
+
+  paint_tool_settings_free (settings);
+}
+
+static void
+test_selection_move_delete_crop_and_undo (void)
+{
+  PaintDocument *doc = paint_document_new (80, 80);
+  cairo_t *cr = cairo_create (paint_document_get_surface (doc));
+  cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 1.0, 1.0);
+  cairo_rectangle (cr, 10.0, 10.0, 20.0, 20.0);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  cairo_surface_t *copied = paint_document_copy_rect (doc, 10, 10, 20, 20);
+  g_assert_nonnull (copied);
+  g_assert_cmpint (cairo_image_surface_get_width (copied), ==, 20);
+  g_assert_cmpint (cairo_image_surface_get_height (copied), ==, 20);
+
+  cairo_rectangle_int_t src_hole = { 10, 10, 20, 20 };
+  paint_document_commit_move (doc, &src_hole, copied, 40, 45);
+  cairo_surface_destroy (copied);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+  read_pixel_rgba (doc, 50, 55, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (b, ==, 255);
+
+  /* Single undo restores both source and destination */
+  g_assert_true (paint_document_undo (doc));
+  read_pixel_rgba (doc, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (b, ==, 255);
+  read_pixel_rgba (doc, 50, 55, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+
+  g_assert_true (paint_document_redo (doc));
+
+  /* Clear rect & undo */
+  paint_document_clear_rect (doc, 40, 45, 20, 20);
+  read_pixel_rgba (doc, 50, 55, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+  g_assert_true (paint_document_undo (doc));
+  read_pixel_rgba (doc, 50, 55, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (b, ==, 255);
+
+  /* Crop to selection & undo */
+  paint_document_crop (doc, 40, 45, 20, 20);
+  g_assert_cmpint (paint_document_get_width (doc), ==, 20);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 20);
+  read_pixel_rgba (doc, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpint (paint_document_get_width (doc), ==, 80);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 80);
+
+  paint_document_free (doc);
+
+  /* Clear rect on transparent document restores transparency */
+  PaintDocument *tdoc = paint_document_new_transparent (40, 40);
+  cairo_t *tcr = cairo_create (paint_document_get_surface (tdoc));
+  cairo_set_source_rgba (tcr, 1.0, 0.0, 0.0, 1.0);
+  cairo_rectangle (tcr, 5.0, 5.0, 20.0, 20.0);
+  cairo_fill (tcr);
+  cairo_destroy (tcr);
+
+  paint_document_clear_rect (tdoc, 10, 10, 10, 10);
+  read_pixel_rgba (tdoc, 15, 15, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  paint_document_free (tdoc);
+}
+
+static void
+test_scale_rotate_and_flip (void)
+{
+  PaintDocument *doc = paint_document_new (40, 20);
+  cairo_t *cr = cairo_create (paint_document_get_surface (doc));
+  cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+  cairo_set_source_rgba (cr, 1.0, 0.0, 0.0, 1.0);
+  cairo_rectangle (cr, 2.0, 2.0, 4.0, 4.0);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  guint8 r, g, b, a;
+
+  /* Scale 2x */
+  paint_document_scale (doc, 80, 40);
+  g_assert_cmpint (paint_document_get_width (doc), ==, 80);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 40);
+  read_pixel_rgba (doc, 8, 8, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpint (paint_document_get_width (doc), ==, 40);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 20);
+
+  /* Rotate 90 CW */
+  paint_document_rotate_90 (doc, TRUE);
+  g_assert_cmpint (paint_document_get_width (doc), ==, 20);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 40);
+  read_pixel_rgba (doc, 16, 4, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  g_assert_true (paint_document_undo (doc));
+
+  /* Rotate 90 CCW */
+  paint_document_rotate_90 (doc, FALSE);
+  g_assert_cmpint (paint_document_get_width (doc), ==, 20);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 40);
+  read_pixel_rgba (doc, 4, 35, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  g_assert_true (paint_document_undo (doc));
+
+  /* Flip horizontal */
+  paint_document_flip (doc, TRUE);
+  read_pixel_rgba (doc, 35, 4, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  read_pixel_rgba (doc, 4, 4, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_true (paint_document_undo (doc));
+
+  /* Flip vertical */
+  paint_document_flip (doc, FALSE);
+  read_pixel_rgba (doc, 4, 15, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  read_pixel_rgba (doc, 4, 4, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+
+  paint_document_free (doc);
+}
+
+static int
+count_dark_pixels (PaintDocument *doc, int x0, int y0, int x1, int y1)
+{
+  int dark = 0;
+  for (int y = y0; y < y1; y++)
+    for (int x = x0; x < x1; x++)
+      {
+        guint8 r, g, b, a;
+        read_pixel_rgba (doc, x, y, &r, &g, &b, &a);
+        if (r < 128 && g < 128 && b < 128)
+          dark++;
+      }
+  return dark;
+}
+
+static void
+test_text_rendering_and_undo (void)
+{
+  PaintDocument *doc = paint_document_new (200, 80);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 1.0f };
+  paint_tool_settings_set_text_font_family (settings, "Sans");
+  settings->text_font_size = 32;
+  settings->text_bold = TRUE;
+  settings->text_italic = FALSE;
+
+  g_assert_nonnull (paint_tools_find ("text"));
+
+  paint_document_draw_text (doc, 20.0, 15.0, "HELLO", settings);
+  g_assert_true (paint_document_get_modified (doc));
+  g_assert_cmpint (count_dark_pixels (doc, 20, 15, 180, 65), >, 20);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 5, 5, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpint (count_dark_pixels (doc, 20, 15, 180, 65), ==, 0);
+
+  g_assert_true (paint_document_redo (doc));
+  g_assert_cmpint (count_dark_pixels (doc, 20, 15, 180, 65), >, 20);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_texture_roundtrip_and_preview_shift (void)
+{
+  PaintDocument *doc = paint_document_new (60, 60);
+  cairo_t *cr = cairo_create (paint_document_get_surface (doc));
+  cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 1.0, 1.0);
+  cairo_rectangle (cr, 20.0, 20.0, 10.0, 10.0);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  cairo_surface_t *copied = paint_document_copy_rect (doc, 20, 20, 10, 10);
+  g_autoptr (GdkTexture) tex = paint_texture_from_surface (copied);
+  cairo_surface_destroy (copied);
+  g_assert_nonnull (tex);
+
+  cairo_surface_t *surf2 = paint_surface_from_texture (tex);
+  g_assert_nonnull (surf2);
+  g_assert_cmpint (cairo_image_surface_get_width (surf2), ==, 10);
+  g_assert_cmpint (cairo_image_surface_get_height (surf2), ==, 10);
+  cairo_surface_destroy (surf2);
+
+  PaintDocument *from_tex = paint_document_new_from_texture (tex);
+  g_assert_nonnull (from_tex);
+  g_assert_cmpint (paint_document_get_width (from_tex), ==, 10);
+  g_assert_cmpint (paint_document_get_height (from_tex), ==, 10);
+  guint8 r, g, b, a;
+  read_pixel_rgba (from_tex, 5, 5, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+  paint_document_free (from_tex);
+
+  /* Space-drag reposition shifts preview origin before committing */
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  settings->size = 6.0;
+  const PaintTool *line = paint_tools_find ("line");
+
+  paint_document_begin_stroke (doc, 10.0, 10.0, line, settings);
+  paint_document_shift_preview_start (doc, settings, 10.0, 45.0);
+  paint_document_end_stroke (doc, 40.0, 45.0, line, settings);
+
+  read_pixel_rgba (doc, 25, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+
+  read_pixel_rgba (doc, 25, 45, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -895,5 +1245,12 @@ main (int argc, char **argv)
   g_test_add_func ("/canvas/shapes_vertical_flip_triangle_and_star", test_shapes_vertical_flip_triangle_and_star);
   g_test_add_func ("/canvas/shape_tool_filled_icon_names", test_shape_tool_filled_icon_names);
   g_test_add_func ("/canvas/block_arrow_outline_filled_and_undo", test_block_arrow_outline_filled_and_undo);
+  g_test_add_func ("/canvas/eyedropper_pick_color", test_eyedropper_pick_color);
+  g_test_add_func ("/canvas/brush_styles_pixel_and_soft", test_brush_styles_pixel_and_soft);
+  g_test_add_func ("/canvas/recent_colors_dedup_and_cap", test_recent_colors_dedup_and_cap);
+  g_test_add_func ("/canvas/selection_move_delete_crop_and_undo", test_selection_move_delete_crop_and_undo);
+  g_test_add_func ("/canvas/scale_rotate_and_flip", test_scale_rotate_and_flip);
+  g_test_add_func ("/canvas/text_rendering_and_undo", test_text_rendering_and_undo);
+  g_test_add_func ("/canvas/texture_roundtrip_and_preview_shift", test_texture_roundtrip_and_preview_shift);
   return g_test_run ();
 }

@@ -28,5 +28,9 @@
     <file>icons/scalable/actions/tool-shape-arrow-filled-symbolic.svg</file>
     <file>icons/scalable/actions/tool-shape-block-arrow-symbolic.svg</file>
     <file>icons/scalable/actions/tool-shape-block-arrow-filled-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-select-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-text-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-eyedropper-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-crop-symbolic.svg</file>
   </gresource>
 </gresources>

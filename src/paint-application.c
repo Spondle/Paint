@@ -79,17 +79,30 @@ act_shortcuts (GSimpleAction *action G_GNUC_UNUSED,
   adw_shortcuts_section_add (files_sec, adw_shortcuts_item_new ("Tab Overview", "<Control><Shift>o"));
   adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), files_sec);
 
+  AdwShortcutsSection *edit_sec = adw_shortcuts_section_new ("Selection & Clipboard");
+  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Select All", "<Control>a"));
+  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Copy", "<Control>c"));
+  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Cut", "<Control>x"));
+  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Paste", "<Control>v"));
+  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Paste as New Canvas", "<Control><Shift>v"));
+  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Crop to Selection", "<Control><Shift>x"));
+  adw_shortcuts_section_add (edit_sec, adw_shortcuts_item_new ("Delete Selection", "Delete"));
+  adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), edit_sec);
+
   AdwShortcutsSection *draw_sec = adw_shortcuts_section_new ("Canvas & Tools");
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Undo", "<Control>z"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Redo", "<Control><Shift>z"));
+  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Selection Tool", "m"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Brush Tool", "b"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Line Tool", "l"));
+  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Text Tool", "x"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Eraser Tool", "e"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Fill Tool", "f"));
+  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Color Picker (or Alt+Click)", "i"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Transparency Tool", "t"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Shapes Tool", "s"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Decrease / Increase Brush Size", "bracketleft bracketright"));
-  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Zoom In / Out / Reset", "<Control>plus <Control>minus <Control>0"));
+  adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Zoom In / Out / Fit / Reset", "<Control>plus <Control>minus <Control>9 <Control>0"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Fullscreen", "F11"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Toggle Floating Toolbar", "F9"));
   adw_shortcuts_section_add (draw_sec, adw_shortcuts_item_new ("Preferences", "<Control>comma"));
@@ -162,8 +175,15 @@ paint_application_startup (GApplication *app)
     { "win.save-as", { "<Primary><Shift>s", NULL } },
     { "win.undo", { "<Primary>z", NULL } },
     { "win.redo", { "<Primary><Shift>z", "<Primary>y", NULL } },
+    { "win.copy", { "<Primary>c", NULL } },
+    { "win.cut", { "<Primary>x", NULL } },
+    { "win.paste", { "<Primary>v", NULL } },
+    { "win.paste-new-tab", { "<Primary><Shift>v", NULL } },
+    { "win.select-all", { "<Primary>a", NULL } },
+    { "win.crop-selection", { "<Primary><Shift>x", NULL } },
     { "win.zoom-in", { "<Primary>plus", "<Primary>equal", "<Primary>KP_Add", NULL } },
     { "win.zoom-out", { "<Primary>minus", "<Primary>KP_Subtract", NULL } },
+    { "win.zoom-fit", { "<Primary>9", "<Primary>KP_9", NULL } },
     { "win.zoom-reset", { "<Primary>0", "<Primary>KP_0", NULL } },
     { "win.tab-overview", { "<Primary><Shift>o", NULL } },
     { "win.toggle-toolbar", { "F9", NULL } },

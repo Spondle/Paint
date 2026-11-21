@@ -11,6 +11,7 @@ gnome = import('gnome')
 gtk4_dep = dependency('gtk4', version: '>= 4.12')
 adw_dep = dependency('libadwaita-1', version: '>= 1.6')
 cairo_dep = dependency('cairo')
+pangocairo_dep = dependency('pangocairo')
 math_dep = meson.get_compiler('c').find_library('m', required: false)
 
 resources = gnome.compile_resources('paint-resources',
@@ -33,7 +34,7 @@ app_sources = core_sources + files(
 
 executable('paint',
   app_sources,
-  dependencies: [gtk4_dep, adw_dep, cairo_dep, math_dep],
+  dependencies: [gtk4_dep, adw_dep, cairo_dep, pangocairo_dep, math_dep],
   include_directories: include_directories('src'),
   install: true,
 )
@@ -56,7 +57,7 @@ install_data('data/icons/symbolic/apps/io.github.spondle.Paint-symbolic.svg',
 
 test_canvas = executable('test-canvas',
   core_sources + files('tests/test-canvas.c'),
-  dependencies: [gtk4_dep, cairo_dep, math_dep],
+  dependencies: [gtk4_dep, cairo_dep, pangocairo_dep, math_dep],
   include_directories: include_directories('src'),
 )
 

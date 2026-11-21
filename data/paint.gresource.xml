@@ -32,5 +32,7 @@
     <file>icons/scalable/actions/tool-text-symbolic.svg</file>
     <file>icons/scalable/actions/tool-eyedropper-symbolic.svg</file>
     <file>icons/scalable/actions/tool-crop-symbolic.svg</file>
+    <file>icons/scalable/actions/layers-symbolic.svg</file>
+    <file>icons/scalable/actions/layer-merge-down-symbolic.svg</file>
   </gresource>
 </gresources>

@@ -21,6 +21,8 @@ void paint_canvas_page_adjust_brush_size (PaintCanvasPage *self, double delta);
 void paint_canvas_page_zoom_fit (PaintCanvasPage *self);
 void paint_canvas_page_toggle_osd (PaintCanvasPage *self);
 void paint_canvas_page_set_osd_visible (PaintCanvasPage *self, gboolean visible);
+void paint_canvas_page_set_layers_visible (PaintCanvasPage *self, gboolean visible);
+gboolean paint_canvas_page_get_layers_visible (PaintCanvasPage *self);
 void paint_canvas_page_sync_controls (PaintCanvasPage *self);
 
 char *paint_canvas_page_dup_title (PaintCanvasPage *self);

@@ -22,9 +22,11 @@ struct _PaintWindow {
   AdwSplitButton *open_btn;
   GtkButton *zoom_pct_btn;
   GtkLabel *info_dims_label;
+  GtkLabel *info_layers_label;
   GtkLabel *info_zoom_label;
   GtkLabel *info_bg_label;
   GtkLabel *info_path_label;
+  gboolean layers_visible;
 };
 
 G_DEFINE_FINAL_TYPE (PaintWindow, paint_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -175,16 +177,27 @@ sync_window_state (PaintWindow *self)
   if (crop_act)
     g_simple_action_set_enabled (G_SIMPLE_ACTION (crop_act),
                                  paint_canvas_has_selection (canvas));
+  GAction *merge_act = g_action_map_lookup_action (G_ACTION_MAP (self), "merge-layer-down");
+  if (merge_act)
+    g_simple_action_set_enabled (G_SIMPLE_ACTION (merge_act),
+                                 paint_document_get_active_layer (doc) > 0);
+  GAction *flatten_act = g_action_map_lookup_action (G_ACTION_MAP (self), "flatten-layers");
+  if (flatten_act)
+    g_simple_action_set_enabled (G_SIMPLE_ACTION (flatten_act),
+                                 paint_document_get_n_layers (doc) > 1);
 
   g_autofree char *zoom_str = g_strdup_printf ("%d%%", zoom_pct);
   g_autofree char *dims_str = g_strdup_printf ("%d × %d px",
                                                paint_document_get_width (doc),
                                                paint_document_get_height (doc));
+  g_autofree char *layers_str = g_strdup_printf ("%d", paint_document_get_n_layers (doc));
   GFile *file = paint_document_get_file (doc);
   g_autofree char *path_str = file ? g_file_get_path (file) : NULL;
 
   gtk_button_set_label (self->zoom_pct_btn, zoom_str);
   gtk_label_set_text (self->info_dims_label, dims_str);
+  if (self->info_layers_label)
+    gtk_label_set_text (self->info_layers_label, layers_str);
   gtk_label_set_text (self->info_zoom_label, zoom_str);
   gtk_label_set_text (self->info_bg_label,
                       paint_document_has_transparent_background (doc) ? "Transparent" : "White");
@@ -707,7 +720,32 @@ paint_window_save_all_sessions (AdwApplication *app)
           g_key_file_set_string (kf, tab_grp, "FilePath", orig_path);
       }
 
-      if (modified || !orig_file) {
+      int n_layers = paint_document_get_n_layers (doc);
+      gboolean multi_or_custom = (n_layers > 1) ||
+                                 !paint_document_layer_get_visible (doc, 0) ||
+                                 paint_document_layer_get_opacity (doc, 0) < 0.999 ||
+                                 paint_document_layer_get_blend_mode (doc, 0) != PAINT_BLEND_NORMAL;
+      if (multi_or_custom) {
+        g_key_file_set_integer (kf, tab_grp, "LayerCount", n_layers);
+        g_key_file_set_integer (kf, tab_grp, "ActiveLayer", paint_document_get_active_layer (doc));
+        for (int li = 0; li < n_layers; li++) {
+          g_autofree char *draft_name = g_strdup_printf ("draft-%d-%d-L%d.png", win_idx, saved_tabs, li);
+          g_autofree char *draft_path = g_build_filename (dir, draft_name, NULL);
+          cairo_surface_t *lsurf = paint_document_layer_get_surface (doc, li);
+          if (lsurf && cairo_surface_write_to_png (lsurf, draft_path) == CAIRO_STATUS_SUCCESS) {
+            g_autofree char *k_file = g_strdup_printf ("Layer.%d.File", li);
+            g_autofree char *k_name = g_strdup_printf ("Layer.%d.Name", li);
+            g_autofree char *k_vis = g_strdup_printf ("Layer.%d.Visible", li);
+            g_autofree char *k_op = g_strdup_printf ("Layer.%d.Opacity", li);
+            g_autofree char *k_blend = g_strdup_printf ("Layer.%d.BlendMode", li);
+            g_key_file_set_string (kf, tab_grp, k_file, draft_name);
+            g_key_file_set_string (kf, tab_grp, k_name, paint_document_layer_get_name (doc, li));
+            g_key_file_set_boolean (kf, tab_grp, k_vis, paint_document_layer_get_visible (doc, li));
+            g_key_file_set_double (kf, tab_grp, k_op, paint_document_layer_get_opacity (doc, li));
+            g_key_file_set_integer (kf, tab_grp, k_blend, (int) paint_document_layer_get_blend_mode (doc, li));
+          }
+        }
+      } else if (modified || !orig_file) {
         g_autofree char *draft_name = g_strdup_printf ("draft-%d-%d.png", win_idx, saved_tabs);
         g_autofree char *draft_path = g_build_filename (dir, draft_name, NULL);
         if (cairo_surface_write_to_png (paint_document_get_surface (doc), draft_path) == CAIRO_STATUS_SUCCESS)
@@ -766,7 +804,72 @@ paint_window_restore_session (AdwApplication *app)
 
       g_autoptr (GFile) orig_file = file_path ? g_file_new_for_path (file_path) : NULL;
       PaintDocument *doc = NULL;
-      if (draft_name) {
+      int layer_count = g_key_file_has_key (kf, tab_grp, "LayerCount", NULL)
+                          ? g_key_file_get_integer (kf, tab_grp, "LayerCount", NULL)
+                          : 0;
+      if (layer_count >= 1) {
+        g_autofree char *l0_file_name = g_key_file_get_string (kf, tab_grp, "Layer.0.File", NULL);
+        if (l0_file_name) {
+          g_autofree char *l0_path = g_build_filename (dir, l0_file_name, NULL);
+          g_autoptr (GFile) l0_file = g_file_new_for_path (l0_path);
+          doc = paint_document_new_from_draft (l0_file, orig_file, modified, NULL);
+        }
+        if (doc) {
+          g_autofree char *l0_name = g_key_file_get_string (kf, tab_grp, "Layer.0.Name", NULL);
+          if (l0_name)
+            paint_document_layer_set_name (doc, 0, l0_name);
+          gboolean l0_vis = g_key_file_has_key (kf, tab_grp, "Layer.0.Visible", NULL)
+                              ? g_key_file_get_boolean (kf, tab_grp, "Layer.0.Visible", NULL)
+                              : TRUE;
+          paint_document_layer_set_visible (doc, 0, l0_vis);
+          double l0_op = g_key_file_has_key (kf, tab_grp, "Layer.0.Opacity", NULL)
+                           ? g_key_file_get_double (kf, tab_grp, "Layer.0.Opacity", NULL)
+                           : 1.0;
+          paint_document_layer_set_opacity (doc, 0, l0_op);
+          int l0_blend = g_key_file_has_key (kf, tab_grp, "Layer.0.BlendMode", NULL)
+                           ? g_key_file_get_integer (kf, tab_grp, "Layer.0.BlendMode", NULL)
+                           : PAINT_BLEND_NORMAL;
+          paint_document_layer_set_blend_mode (
+              doc, 0, (PaintBlendMode) CLAMP (l0_blend, 0, PAINT_BLEND_LIGHTEN));
+
+          for (int li = 1; li < layer_count; li++) {
+            g_autofree char *k_file = g_strdup_printf ("Layer.%d.File", li);
+            g_autofree char *k_name = g_strdup_printf ("Layer.%d.Name", li);
+            g_autofree char *k_vis = g_strdup_printf ("Layer.%d.Visible", li);
+            g_autofree char *k_op = g_strdup_printf ("Layer.%d.Opacity", li);
+            g_autofree char *k_blend = g_strdup_printf ("Layer.%d.BlendMode", li);
+
+            g_autofree char *lfile_name = g_key_file_get_string (kf, tab_grp, k_file, NULL);
+            g_autofree char *lname = g_key_file_get_string (kf, tab_grp, k_name, NULL);
+            gboolean lvis = g_key_file_has_key (kf, tab_grp, k_vis, NULL)
+                              ? g_key_file_get_boolean (kf, tab_grp, k_vis, NULL)
+                              : TRUE;
+            double lop = g_key_file_has_key (kf, tab_grp, k_op, NULL)
+                           ? g_key_file_get_double (kf, tab_grp, k_op, NULL)
+                           : 1.0;
+            int lblend = g_key_file_has_key (kf, tab_grp, k_blend, NULL)
+                           ? g_key_file_get_integer (kf, tab_grp, k_blend, NULL)
+                           : PAINT_BLEND_NORMAL;
+
+            if (lfile_name) {
+              g_autofree char *lpath = g_build_filename (dir, lfile_name, NULL);
+              g_autoptr (GFile) lfile = g_file_new_for_path (lpath);
+              paint_document_append_restored_layer (
+                  doc,
+                  lname ? lname : "Layer",
+                  lfile,
+                  lvis,
+                  lop,
+                  (PaintBlendMode) CLAMP (lblend, 0, PAINT_BLEND_LIGHTEN));
+            }
+          }
+
+          int active_layer = g_key_file_has_key (kf, tab_grp, "ActiveLayer", NULL)
+                               ? g_key_file_get_integer (kf, tab_grp, "ActiveLayer", NULL)
+                               : 0;
+          paint_document_finish_session_restore (doc, active_layer, modified);
+        }
+      } else if (draft_name) {
         g_autofree char *draft_path = g_build_filename (dir, draft_name, NULL);
         g_autoptr (GFile) draft_file = g_file_new_for_path (draft_path);
         doc = paint_document_new_from_draft (draft_file, orig_file, modified, NULL);
@@ -1408,6 +1511,63 @@ static void act_toggle_toolbar (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GN
     paint_canvas_page_toggle_osd (page);
 }
 
+static void act_toggle_layers_state (GSimpleAction *action, GVariant *value, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  gboolean show = g_variant_get_boolean (value);
+  self->layers_visible = show;
+  g_simple_action_set_state (action, value);
+
+  int n = adw_tab_view_get_n_pages (self->tab_view);
+  for (int i = 0; i < n; i++) {
+    AdwTabPage *tab = adw_tab_view_get_nth_page (self->tab_view, i);
+    GtkWidget *child = adw_tab_page_get_child (tab);
+    if (PAINT_IS_CANVAS_PAGE (child))
+      paint_canvas_page_set_layers_visible (PAINT_CANVAS_PAGE (child), show);
+  }
+}
+
+static void act_new_layer (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (!page)
+    return;
+  paint_canvas_add_layer (paint_canvas_page_get_canvas (page), NULL);
+  if (!self->layers_visible) {
+    GAction *act = g_action_map_lookup_action (G_ACTION_MAP (self), "toggle-layers");
+    if (act)
+      g_action_change_state (act, g_variant_new_boolean (TRUE));
+  }
+}
+
+static void act_duplicate_layer (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (!page)
+    return;
+  PaintCanvas *canvas = paint_canvas_page_get_canvas (page);
+  PaintDocument *doc = paint_canvas_get_document (canvas);
+  paint_canvas_duplicate_layer (canvas, paint_document_get_active_layer (doc));
+}
+
+static void act_merge_layer_down (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (!page)
+    return;
+  PaintCanvas *canvas = paint_canvas_page_get_canvas (page);
+  PaintDocument *doc = paint_canvas_get_document (canvas);
+  paint_canvas_merge_layer_down (canvas, paint_document_get_active_layer (doc));
+}
+
+static void act_flatten_layers (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_flatten_layers (paint_canvas_page_get_canvas (page));
+}
+
 static void act_toggle_fullscreen (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
   GtkWindow *win = GTK_WINDOW (d);
@@ -1756,10 +1916,17 @@ build_primary_menu (PaintWindow *self)
   g_autoptr (GMenu) clear_sec = g_menu_new ();
   g_menu_append (clear_sec, "Clear Canvas", "win.clear");
   g_menu_append_section (canvas_sub, NULL, G_MENU_MODEL (clear_sec));
+
+  g_autoptr (GMenu) layers_sec = g_menu_new ();
+  g_menu_append (layers_sec, "New Layer", "win.new-layer");
+  g_menu_append (layers_sec, "Merge Layer Down", "win.merge-layer-down");
+  g_menu_append (layers_sec, "Flatten Layers", "win.flatten-layers");
+  g_menu_append_section (canvas_sub, "Layers", G_MENU_MODEL (layers_sec));
   g_menu_append_submenu (actions_section, "Canvas", G_MENU_MODEL (canvas_sub));
 
   g_autoptr (GMenu) view_sub = g_menu_new ();
   g_menu_append (view_sub, "Fit to Window", "win.zoom-fit");
+  g_menu_append (view_sub, "Layers", "win.toggle-layers");
   g_menu_append (view_sub, "Pixel Grid", "win.toggle-pixel-grid");
   g_menu_append (view_sub, "Toggle Toolbar", "win.toggle-toolbar");
   g_menu_append (view_sub, "Fullscreen", "win.toggle-fullscreen");
@@ -1821,9 +1988,10 @@ build_info_popover (PaintWindow *self)
   gtk_grid_set_row_spacing (GTK_GRID (grid), 6);
 
   self->info_dims_label = add_info_row (GTK_GRID (grid), 0, "Dimensions");
-  self->info_zoom_label = add_info_row (GTK_GRID (grid), 1, "Zoom");
-  self->info_bg_label = add_info_row (GTK_GRID (grid), 2, "Background");
-  self->info_path_label = add_info_row (GTK_GRID (grid), 3, "Location");
+  self->info_layers_label = add_info_row (GTK_GRID (grid), 1, "Layers");
+  self->info_zoom_label = add_info_row (GTK_GRID (grid), 2, "Zoom");
+  self->info_bg_label = add_info_row (GTK_GRID (grid), 3, "Background");
+  self->info_path_label = add_info_row (GTK_GRID (grid), 4, "Location");
   gtk_label_set_max_width_chars (self->info_path_label, 28);
   gtk_label_set_ellipsize (self->info_path_label, PANGO_ELLIPSIZE_END);
   gtk_box_append (GTK_BOX (box), grid);
@@ -1876,6 +2044,12 @@ build_header_bar (PaintWindow *self)
   gtk_widget_set_tooltip_text (info_btn, "Canvas Details");
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (info_btn), build_info_popover (self));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), info_btn);
+
+  GtkWidget *layers_btn = gtk_toggle_button_new ();
+  gtk_button_set_icon_name (GTK_BUTTON (layers_btn), "layers-symbolic");
+  gtk_widget_set_tooltip_text (layers_btn, "Layers (Ctrl+L)");
+  gtk_actionable_set_action_name (GTK_ACTIONABLE (layers_btn), "win.toggle-layers");
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), layers_btn);
 
   return header;
 }
@@ -2023,6 +2197,7 @@ paint_window_add_new_tab (PaintWindow *self, PaintDocument *doc)
     paint_canvas_set_show_pixel_grid (canvas, prefs->show_pixel_grid);
     paint_canvas_page_set_osd_visible (page, prefs->show_toolbar);
   }
+  paint_canvas_page_set_layers_visible (page, self->layers_visible);
 
   AdwTabPage *tab = adw_tab_view_append (self->tab_view, GTK_WIDGET (page));
   adw_tab_view_set_selected_page (self->tab_view, tab);
@@ -2074,6 +2249,11 @@ paint_window_init (PaintWindow *self)
     { "zoom-reset", act_zoom_reset, NULL, NULL, NULL, { 0 } },
     { "zoom-fit", act_zoom_fit, NULL, NULL, NULL, { 0 } },
     { "toggle-pixel-grid", NULL, NULL, "true", act_toggle_pixel_grid_state, { 0 } },
+    { "toggle-layers", NULL, NULL, "false", act_toggle_layers_state, { 0 } },
+    { "new-layer", act_new_layer, NULL, NULL, NULL, { 0 } },
+    { "duplicate-layer", act_duplicate_layer, NULL, NULL, NULL, { 0 } },
+    { "merge-layer-down", act_merge_layer_down, NULL, NULL, NULL, { 0 } },
+    { "flatten-layers", act_flatten_layers, NULL, NULL, NULL, { 0 } },
     { "toggle-toolbar", act_toggle_toolbar, NULL, NULL, NULL, { 0 } },
     { "toggle-fullscreen", act_toggle_fullscreen, NULL, NULL, NULL, { 0 } },
     { "tab-overview", act_tab_overview, NULL, NULL, NULL, { 0 } },

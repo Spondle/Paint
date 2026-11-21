@@ -1225,6 +1225,343 @@ test_texture_roundtrip_and_preview_shift (void)
   paint_document_free (doc);
 }
 
+static void
+read_surface_pixel_rgba (cairo_surface_t *surface, int x, int y,
+                         guint8 *r, guint8 *g, guint8 *b, guint8 *a)
+{
+  cairo_surface_flush (surface);
+  int stride = cairo_image_surface_get_stride (surface);
+  const guint8 *px = cairo_image_surface_get_data (surface) + y * stride + x * 4;
+  *b = px[0];
+  *g = px[1];
+  *r = px[2];
+  *a = px[3];
+}
+
+static void
+test_layers_add_composite_visibility_and_opacity (void)
+{
+  PaintDocument *doc = paint_document_new (60, 60);
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 1);
+  g_assert_cmpint (paint_document_get_active_layer (doc), ==, 0);
+  g_assert_cmpstr (paint_document_layer_get_name (doc, 0), ==, "Background");
+  g_assert_true (paint_document_layer_get_visible (doc, 0));
+  g_assert_cmpfloat_with_epsilon (paint_document_layer_get_opacity (doc, 0), 1.0, 1e-5);
+
+  int idx = paint_document_add_layer (doc, NULL);
+  g_assert_cmpint (idx, ==, 1);
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 2);
+  g_assert_cmpint (paint_document_get_active_layer (doc), ==, 1);
+  g_assert_cmpstr (paint_document_layer_get_name (doc, 1), ==, "Layer 1");
+
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  settings->size = 14.0;
+  const PaintTool *brush = paint_tools_find ("brush");
+
+  paint_document_begin_stroke (doc, 30.0, 30.0, brush, settings);
+  paint_document_end_stroke (doc, 30.0, 30.0, brush, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  g_assert_cmpuint (b, ==, 0);
+
+  /* Background layer underneath stays white */
+  read_surface_pixel_rgba (paint_document_layer_get_surface (doc, 0), 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+
+  /* Hiding layer 1 reveals white background */
+  paint_document_layer_set_visible (doc, 1, FALSE);
+  g_assert_false (paint_document_layer_get_visible (doc, 1));
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+
+  g_assert_true (paint_document_undo (doc));
+  g_assert_true (paint_document_layer_get_visible (doc, 1));
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 0);
+
+  /* Sequential opacity drags coalesce into a single undo step */
+  paint_document_layer_set_opacity (doc, 1, 0.7);
+  paint_document_layer_set_opacity (doc, 1, 0.5);
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, >, 110);
+  g_assert_cmpuint (g, <, 145);
+
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpfloat_with_epsilon (paint_document_layer_get_opacity (doc, 1), 1.0, 1e-5);
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 0);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_layers_blend_modes (void)
+{
+  PaintDocument *doc = paint_document_new (60, 60);
+  cairo_t *cr0 = cairo_create (paint_document_layer_get_surface (doc, 0));
+  cairo_set_source_rgba (cr0, 0.0, 1.0, 0.0, 1.0);
+  cairo_rectangle (cr0, 10.0, 10.0, 40.0, 40.0);
+  cairo_fill (cr0);
+  cairo_destroy (cr0);
+
+  paint_document_add_layer (doc, "Blend");
+  cairo_t *cr1 = cairo_create (paint_document_layer_get_surface (doc, 1));
+  cairo_set_source_rgba (cr1, 1.0, 0.0, 0.0, 1.0);
+  cairo_rectangle (cr1, 10.0, 10.0, 40.0, 40.0);
+  cairo_fill (cr1);
+  cairo_destroy (cr1);
+
+  guint8 r, g, b, a;
+
+  paint_document_layer_set_blend_mode (doc, 1, PAINT_BLEND_MULTIPLY);
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (g, ==, 0);
+  g_assert_cmpuint (b, ==, 0);
+
+  paint_document_layer_set_blend_mode (doc, 1, PAINT_BLEND_SCREEN);
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 0);
+
+  paint_document_layer_set_blend_mode (doc, 1, PAINT_BLEND_DARKEN);
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (g, ==, 0);
+
+  paint_document_layer_set_blend_mode (doc, 1, PAINT_BLEND_LIGHTEN);
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+
+  paint_document_free (doc);
+}
+
+static void
+test_layers_eraser_and_selection_preserve_lower_layers (void)
+{
+  PaintDocument *doc = paint_document_new (80, 80);
+  cairo_t *cr0 = cairo_create (paint_document_layer_get_surface (doc, 0));
+  cairo_set_source_rgba (cr0, 0.0, 1.0, 0.0, 1.0);
+  cairo_rectangle (cr0, 10.0, 10.0, 60.0, 60.0);
+  cairo_fill (cr0);
+  cairo_destroy (cr0);
+
+  paint_document_add_layer (doc, "Top");
+  cairo_t *cr1 = cairo_create (paint_document_layer_get_surface (doc, 1));
+  cairo_set_source_rgba (cr1, 0.0, 0.0, 1.0, 1.0);
+  cairo_rectangle (cr1, 15.0, 15.0, 20.0, 20.0);
+  cairo_fill (cr1);
+  cairo_destroy (cr1);
+
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->size = 10.0;
+  const PaintTool *eraser = paint_tools_find ("eraser");
+
+  /* Erasing on upper layer clears to transparent, revealing green bottom layer */
+  paint_document_begin_stroke (doc, 25.0, 25.0, eraser, settings);
+  paint_document_end_stroke (doc, 25.0, 25.0, eraser, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 25, 25, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 0);
+
+  /* Moving selection hole on upper layer also reveals green bottom layer */
+  paint_document_undo (doc);
+  cairo_surface_t *clip = paint_document_copy_rect (doc, 16, 16, 10, 10);
+  cairo_rectangle_int_t hole = { 16, 16, 10, 10 };
+  paint_document_commit_move (doc, &hole, clip, 45, 45);
+  cairo_surface_destroy (clip);
+
+  read_pixel_rgba (doc, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 0);
+
+  read_pixel_rgba (doc, 50, 50, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (g, ==, 0);
+  g_assert_cmpuint (b, ==, 255);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_layers_reorder_duplicate_remove_merge_and_flatten (void)
+{
+  PaintDocument *doc = paint_document_new (60, 60);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->shape_filled = TRUE;
+  const PaintTool *rect = paint_tools_find ("shape-rectangle");
+
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  paint_document_begin_stroke (doc, 10.0, 10.0, rect, settings);
+  paint_document_end_stroke (doc, 50.0, 50.0, rect, settings);
+
+  paint_document_add_layer (doc, "Green");
+  settings->color = (GdkRGBA) { 0.0f, 1.0f, 0.0f, 1.0f };
+  paint_document_begin_stroke (doc, 15.0, 15.0, rect, settings);
+  paint_document_end_stroke (doc, 45.0, 45.0, rect, settings);
+
+  paint_document_add_layer (doc, "Blue");
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  paint_document_begin_stroke (doc, 20.0, 20.0, rect, settings);
+  paint_document_end_stroke (doc, 40.0, 40.0, rect, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+
+  /* Move Green (1) above Blue (2) -> active follows to 2 */
+  paint_document_set_active_layer (doc, 1);
+  g_assert_true (paint_document_move_layer (doc, 1, 2));
+  g_assert_cmpint (paint_document_get_active_layer (doc), ==, 2);
+  g_assert_cmpstr (paint_document_layer_get_name (doc, 2), ==, "Green");
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 0);
+
+  /* Duplicate layer */
+  g_assert_true (paint_document_duplicate_layer (doc, 2));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 4);
+  g_assert_cmpstr (paint_document_layer_get_name (doc, 3), ==, "Green Copy");
+
+  /* Remove duplicated layer */
+  g_assert_true (paint_document_remove_layer (doc, 3));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 3);
+
+  /* Merge top down onto Blue, cannot merge layer 0 */
+  g_assert_false (paint_document_merge_layer_down (doc, 0));
+  g_assert_true (paint_document_merge_layer_down (doc, 2));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 2);
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+
+  /* Flatten collapses stack cleanly and supports undo */
+  g_assert_true (paint_document_flatten_layers (doc));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 1);
+  g_assert_false (paint_document_remove_layer (doc, 0));
+  read_pixel_rgba (doc, 30, 30, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 2);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_layers_transforms_affect_all_layers (void)
+{
+  PaintDocument *doc = paint_document_new (40, 20);
+  cairo_t *cr0 = cairo_create (paint_document_layer_get_surface (doc, 0));
+  cairo_set_source_rgba (cr0, 1.0, 0.0, 0.0, 1.0);
+  cairo_rectangle (cr0, 2.0, 2.0, 4.0, 4.0);
+  cairo_fill (cr0);
+  cairo_destroy (cr0);
+
+  paint_document_add_layer (doc, "BlueMark");
+  cairo_t *cr1 = cairo_create (paint_document_layer_get_surface (doc, 1));
+  cairo_set_source_rgba (cr1, 0.0, 0.0, 1.0, 1.0);
+  cairo_rectangle (cr1, 34.0, 14.0, 4.0, 4.0);
+  cairo_fill (cr1);
+  cairo_destroy (cr1);
+
+  guint8 r, g, b, a;
+
+  paint_document_scale (doc, 80, 40);
+  g_assert_cmpint (cairo_image_surface_get_width (paint_document_layer_get_surface (doc, 0)), ==, 80);
+  g_assert_cmpint (cairo_image_surface_get_width (paint_document_layer_get_surface (doc, 1)), ==, 80);
+  read_surface_pixel_rgba (paint_document_layer_get_surface (doc, 0), 8, 8, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  read_surface_pixel_rgba (paint_document_layer_get_surface (doc, 1), 71, 31, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+  g_assert_true (paint_document_undo (doc));
+
+  paint_document_rotate_90 (doc, TRUE);
+  g_assert_cmpint (cairo_image_surface_get_width (paint_document_layer_get_surface (doc, 1)), ==, 20);
+  g_assert_cmpint (cairo_image_surface_get_height (paint_document_layer_get_surface (doc, 1)), ==, 40);
+  read_surface_pixel_rgba (paint_document_layer_get_surface (doc, 0), 16, 4, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  read_surface_pixel_rgba (paint_document_layer_get_surface (doc, 1), 4, 35, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+  g_assert_true (paint_document_undo (doc));
+
+  paint_document_flip (doc, TRUE);
+  read_surface_pixel_rgba (paint_document_layer_get_surface (doc, 0), 35, 4, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 0);
+  read_surface_pixel_rgba (paint_document_layer_get_surface (doc, 1), 4, 15, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+
+  paint_document_free (doc);
+}
+
+static void
+test_layers_per_layer_tiled_undo_and_names (void)
+{
+  PaintDocument *doc = paint_document_new (400, 400);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->size = 10.0;
+  const PaintTool *brush = paint_tools_find ("brush");
+
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  paint_document_begin_stroke (doc, 50.0, 50.0, brush, settings);
+  paint_document_end_stroke (doc, 50.0, 50.0, brush, settings);
+
+  paint_document_add_layer (doc, NULL);
+  paint_document_layer_set_name (doc, 1, "Ink");
+  g_assert_cmpstr (paint_document_layer_get_name (doc, 1), ==, "Ink");
+
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  paint_document_begin_stroke (doc, 300.0, 300.0, brush, settings);
+  paint_document_end_stroke (doc, 300.0, 300.0, brush, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 300, 300, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+
+  /* Undo 1: reverts tiled stroke on Layer 1 */
+  g_assert_true (paint_document_undo (doc));
+  read_pixel_rgba (doc, 300, 300, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+
+  /* Undo 2: reverts rename to "Layer 1" */
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpstr (paint_document_layer_get_name (doc, 1), ==, "Layer 1");
+
+  /* Undo 3: reverts adding Layer 1 */
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 1);
+
+  /* Undo 4: reverts red stroke on Layer 0 */
+  g_assert_true (paint_document_undo (doc));
+  read_pixel_rgba (doc, 50, 50, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1252,5 +1589,11 @@ main (int argc, char **argv)
   g_test_add_func ("/canvas/scale_rotate_and_flip", test_scale_rotate_and_flip);
   g_test_add_func ("/canvas/text_rendering_and_undo", test_text_rendering_and_undo);
   g_test_add_func ("/canvas/texture_roundtrip_and_preview_shift", test_texture_roundtrip_and_preview_shift);
+  g_test_add_func ("/canvas/layers_add_composite_visibility_and_opacity", test_layers_add_composite_visibility_and_opacity);
+  g_test_add_func ("/canvas/layers_blend_modes", test_layers_blend_modes);
+  g_test_add_func ("/canvas/layers_eraser_and_selection_preserve_lower_layers", test_layers_eraser_and_selection_preserve_lower_layers);
+  g_test_add_func ("/canvas/layers_reorder_duplicate_remove_merge_and_flatten", test_layers_reorder_duplicate_remove_merge_and_flatten);
+  g_test_add_func ("/canvas/layers_transforms_affect_all_layers", test_layers_transforms_affect_all_layers);
+  g_test_add_func ("/canvas/layers_per_layer_tiled_undo_and_names", test_layers_per_layer_tiled_undo_and_names);
   return g_test_run ();
 }

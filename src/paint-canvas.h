@@ -10,6 +10,15 @@ G_BEGIN_DECLS
 #define PAINT_DEFAULT_CANVAS_WIDTH 640
 #define PAINT_DEFAULT_CANVAS_HEIGHT 380
 
+typedef enum {
+  PAINT_BLEND_NORMAL = 0,
+  PAINT_BLEND_MULTIPLY,
+  PAINT_BLEND_SCREEN,
+  PAINT_BLEND_OVERLAY,
+  PAINT_BLEND_DARKEN,
+  PAINT_BLEND_LIGHTEN
+} PaintBlendMode;
+
 typedef struct _PaintDocument PaintDocument;
 
 PaintDocument *paint_document_new (int width, int height);
@@ -28,6 +37,38 @@ GFile *paint_document_get_file (const PaintDocument *doc);
 gboolean paint_document_get_modified (const PaintDocument *doc);
 void paint_document_set_modified (PaintDocument *doc, gboolean modified);
 gboolean paint_document_has_transparent_background (const PaintDocument *doc);
+
+int paint_document_get_n_layers (const PaintDocument *doc);
+int paint_document_get_active_layer (const PaintDocument *doc);
+void paint_document_set_active_layer (PaintDocument *doc, int index);
+guint64 paint_document_get_layers_revision (const PaintDocument *doc);
+
+const char *paint_document_layer_get_name (const PaintDocument *doc, int index);
+void paint_document_layer_set_name (PaintDocument *doc, int index, const char *name);
+gboolean paint_document_layer_get_visible (const PaintDocument *doc, int index);
+void paint_document_layer_set_visible (PaintDocument *doc, int index, gboolean visible);
+double paint_document_layer_get_opacity (const PaintDocument *doc, int index);
+void paint_document_layer_set_opacity (PaintDocument *doc, int index, double opacity);
+PaintBlendMode paint_document_layer_get_blend_mode (const PaintDocument *doc, int index);
+void paint_document_layer_set_blend_mode (PaintDocument *doc, int index, PaintBlendMode mode);
+cairo_surface_t *paint_document_layer_get_surface (const PaintDocument *doc, int index);
+
+int paint_document_add_layer (PaintDocument *doc, const char *name);
+gboolean paint_document_duplicate_layer (PaintDocument *doc, int index);
+gboolean paint_document_remove_layer (PaintDocument *doc, int index);
+gboolean paint_document_move_layer (PaintDocument *doc, int from_index, int to_index);
+gboolean paint_document_merge_layer_down (PaintDocument *doc, int index);
+gboolean paint_document_flatten_layers (PaintDocument *doc);
+
+gboolean paint_document_append_restored_layer (PaintDocument *doc,
+                                               const char *name,
+                                               GFile *png_file,
+                                               gboolean visible,
+                                               double opacity,
+                                               PaintBlendMode blend_mode);
+void paint_document_finish_session_restore (PaintDocument *doc,
+                                            int active_layer,
+                                            gboolean modified);
 
 gboolean paint_document_can_undo (const PaintDocument *doc);
 gboolean paint_document_can_redo (const PaintDocument *doc);
@@ -143,5 +184,17 @@ void paint_canvas_set_show_pixel_grid (PaintCanvas *self, gboolean show);
 gboolean paint_canvas_get_show_pixel_grid (PaintCanvas *self);
 void paint_canvas_set_alt_eyedropper (PaintCanvas *self, gboolean active);
 void paint_canvas_check_viewport (PaintCanvas *self);
+
+int paint_canvas_add_layer (PaintCanvas *self, const char *name);
+gboolean paint_canvas_duplicate_layer (PaintCanvas *self, int index);
+gboolean paint_canvas_remove_layer (PaintCanvas *self, int index);
+gboolean paint_canvas_move_layer (PaintCanvas *self, int from_index, int to_index);
+gboolean paint_canvas_merge_layer_down (PaintCanvas *self, int index);
+gboolean paint_canvas_flatten_layers (PaintCanvas *self);
+void paint_canvas_set_active_layer (PaintCanvas *self, int index);
+void paint_canvas_set_layer_visible (PaintCanvas *self, int index, gboolean visible);
+void paint_canvas_set_layer_opacity (PaintCanvas *self, int index, double opacity);
+void paint_canvas_set_layer_blend_mode (PaintCanvas *self, int index, PaintBlendMode mode);
+void paint_canvas_set_layer_name (PaintCanvas *self, int index, const char *name);
 
 G_END_DECLS

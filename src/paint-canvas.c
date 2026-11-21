@@ -21,12 +21,112 @@ static const double ZOOM_STEPS[] = {
  * ============================================================================ */
 
 typedef struct {
+  char *name;
+  cairo_surface_t *surface; /* ARGB32, doc->width x doc->height */
+  gboolean visible;
+  double opacity;           /* 0.0 .. 1.0 */
+  PaintBlendMode blend_mode;
+} PaintLayer;
+
+typedef struct {
+  char *name;
+  gboolean visible;
+  double opacity;
+  PaintBlendMode blend_mode;
+  int width;
+  int height;
+  int stride;
+  GBytes *pixels;
+} UndoLayerSnapshot;
+
+typedef struct {
   int x;
   int y;
   int w;
   int h;
   GBytes *pixels; /* packed row-major w * 4 bytes */
 } UndoTile;
+
+static PaintLayer *
+paint_layer_new (const char *name,
+                 cairo_surface_t *surface,
+                 gboolean visible,
+                 double opacity,
+                 PaintBlendMode blend_mode)
+{
+  PaintLayer *layer = g_new0 (PaintLayer, 1);
+  layer->name = g_strdup (name ? name : "Layer");
+  layer->surface = surface;
+  layer->visible = visible;
+  layer->opacity = CLAMP (opacity, 0.0, 1.0);
+  layer->blend_mode = blend_mode;
+  return layer;
+}
+
+static void
+paint_layer_free (gpointer ptr)
+{
+  PaintLayer *layer = ptr;
+  if (!layer)
+    return;
+  g_free (layer->name);
+  g_clear_pointer (&layer->surface, cairo_surface_destroy);
+  g_free (layer);
+}
+
+static UndoLayerSnapshot *
+undo_layer_snapshot_new (const PaintLayer *layer)
+{
+  cairo_surface_flush (layer->surface);
+  int w = cairo_image_surface_get_width (layer->surface);
+  int h = cairo_image_surface_get_height (layer->surface);
+  int stride = cairo_image_surface_get_stride (layer->surface);
+  const unsigned char *data = cairo_image_surface_get_data (layer->surface);
+
+  UndoLayerSnapshot *snap = g_new0 (UndoLayerSnapshot, 1);
+  snap->name = g_strdup (layer->name);
+  snap->visible = layer->visible;
+  snap->opacity = layer->opacity;
+  snap->blend_mode = layer->blend_mode;
+  snap->width = w;
+  snap->height = h;
+  snap->stride = stride;
+  snap->pixels = g_bytes_new (data, (gsize) stride * (gsize) h);
+  return snap;
+}
+
+static void
+undo_layer_snapshot_free (gpointer ptr)
+{
+  UndoLayerSnapshot *snap = ptr;
+  if (!snap)
+    return;
+  g_free (snap->name);
+  g_clear_pointer (&snap->pixels, g_bytes_unref);
+  g_free (snap);
+}
+
+static PaintLayer *
+undo_layer_snapshot_restore (const UndoLayerSnapshot *snap)
+{
+  cairo_surface_t *surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+                                                         snap->width,
+                                                         snap->height);
+  gsize len = 0;
+  const unsigned char *src = g_bytes_get_data (snap->pixels, &len);
+  unsigned char *dst = cairo_image_surface_get_data (surface);
+  int dst_stride = cairo_image_surface_get_stride (surface);
+
+  if (dst_stride == snap->stride) {
+    memcpy (dst, src, len);
+  } else {
+    int copy_bytes = MIN (dst_stride, snap->stride);
+    for (int y = 0; y < snap->height; y++)
+      memcpy (dst + y * dst_stride, src + y * snap->stride, (gsize) copy_bytes);
+  }
+  cairo_surface_mark_dirty (surface);
+  return paint_layer_new (snap->name, surface, snap->visible, snap->opacity, snap->blend_mode);
+}
 
 static void
 undo_tile_free (gpointer ptr)
@@ -43,8 +143,12 @@ typedef struct {
   int height;
   gboolean is_full;
   GdkRGBA background_color;
-  int full_stride;
-  GBytes *full_pixels;
+  GPtrArray *layer_snaps; /* element-type: UndoLayerSnapshot* */
+  int active_layer_index;
+  int next_layer_num;
+  gboolean is_opacity_step;
+  int opacity_layer_idx;
+  int layer_index;        /* for tiled steps */
   GPtrArray *tiles;       /* element-type: UndoTile* */
   GHashTable *saved_keys; /* key: uint32 packed (ty << 16) | tx */
 } UndoStep;
@@ -55,7 +159,7 @@ undo_step_free (gpointer ptr)
   UndoStep *step = ptr;
   if (!step)
     return;
-  g_clear_pointer (&step->full_pixels, g_bytes_unref);
+  g_clear_pointer (&step->layer_snaps, g_ptr_array_unref);
   g_clear_pointer (&step->tiles, g_ptr_array_unref);
   g_clear_pointer (&step->saved_keys, g_hash_table_unref);
   g_free (step);
@@ -100,33 +204,13 @@ restore_rect_tile (cairo_surface_t *surface, const UndoTile *t)
 }
 
 static UndoStep *
-undo_step_new_full (cairo_surface_t *surface, const GdkRGBA *background_color)
-{
-  cairo_surface_flush (surface);
-  int w = cairo_image_surface_get_width (surface);
-  int h = cairo_image_surface_get_height (surface);
-  int stride = cairo_image_surface_get_stride (surface);
-  const unsigned char *data = cairo_image_surface_get_data (surface);
-
-  UndoStep *step = g_new0 (UndoStep, 1);
-  step->width = w;
-  step->height = h;
-  step->is_full = TRUE;
-  step->background_color = background_color
-                             ? *background_color
-                             : (GdkRGBA) { 1.0f, 1.0f, 1.0f, 1.0f };
-  step->full_stride = stride;
-  step->full_pixels = g_bytes_new (data, (gsize) stride * (gsize) h);
-  return step;
-}
-
-static UndoStep *
-undo_step_new_tiled (int width, int height)
+undo_step_new_tiled (int width, int height, int layer_index)
 {
   UndoStep *step = g_new0 (UndoStep, 1);
   step->width = width;
   step->height = height;
   step->is_full = FALSE;
+  step->layer_index = layer_index;
   step->tiles = g_ptr_array_new_with_free_func (undo_tile_free);
   step->saved_keys = g_hash_table_new (g_direct_hash, g_direct_equal);
   return step;
@@ -168,28 +252,6 @@ undo_step_capture_rect (UndoStep *step,
   }
 }
 
-static cairo_surface_t *
-restore_full_surface (const UndoStep *step)
-{
-  cairo_surface_t *surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                         step->width,
-                                                         step->height);
-  gsize len = 0;
-  const unsigned char *src = g_bytes_get_data (step->full_pixels, &len);
-  unsigned char *dst = cairo_image_surface_get_data (surface);
-  int dst_stride = cairo_image_surface_get_stride (surface);
-
-  if (dst_stride == step->full_stride) {
-    memcpy (dst, src, len);
-  } else {
-    int copy_bytes = MIN (dst_stride, step->full_stride);
-    for (int y = 0; y < step->height; y++)
-      memcpy (dst + y * dst_stride, src + y * step->full_stride, (gsize) copy_bytes);
-  }
-  cairo_surface_mark_dirty (surface);
-  return surface;
-}
-
 /* ============================================================================
  * PaintDocument
  * ============================================================================ */
@@ -198,7 +260,16 @@ struct _PaintDocument {
   int width;
   int height;
   GdkRGBA background_color;
-  cairo_surface_t *surface;
+  cairo_surface_t *surface;           /* non-owning alias to visible composite */
+  cairo_surface_t *composite_surface; /* owned when multi-layer/opacity/blend/hole active */
+  GPtrArray *layers;                  /* element-type: PaintLayer* (bottom -> top) */
+  int active_layer_index;
+  int next_layer_num;
+  guint64 layers_revision;
+
+  gboolean has_active_hole;
+  cairo_rectangle_int_t active_hole;
+
   GFile *file;
   gboolean modified;
   GPtrArray *undo_stack; /* element-type: UndoStep* */
@@ -217,6 +288,191 @@ struct _PaintDocument {
   gboolean has_dirty_rect;
   cairo_rectangle_int_t dirty_rect;
 };
+
+static UndoStep *
+undo_step_new_full_doc (const PaintDocument *doc)
+{
+  UndoStep *step = g_new0 (UndoStep, 1);
+  step->width = doc->width;
+  step->height = doc->height;
+  step->is_full = TRUE;
+  step->background_color = doc->background_color;
+  step->active_layer_index = doc->active_layer_index;
+  step->next_layer_num = doc->next_layer_num;
+  step->layer_snaps = g_ptr_array_new_with_free_func (undo_layer_snapshot_free);
+  for (guint i = 0; i < doc->layers->len; i++) {
+    const PaintLayer *layer = g_ptr_array_index (doc->layers, i);
+    g_ptr_array_add (step->layer_snaps, undo_layer_snapshot_new (layer));
+  }
+  return step;
+}
+
+static PaintLayer *
+get_active_layer (const PaintDocument *doc)
+{
+  if (!doc || !doc->layers || doc->layers->len == 0)
+    return NULL;
+  int idx = CLAMP (doc->active_layer_index, 0, (int) doc->layers->len - 1);
+  return g_ptr_array_index (doc->layers, (guint) idx);
+}
+
+static GdkRGBA
+get_active_layer_clear_color (const PaintDocument *doc)
+{
+  if (doc && doc->active_layer_index == 0)
+    return doc->background_color;
+  return (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
+}
+
+static cairo_operator_t
+blend_mode_to_cairo (PaintBlendMode mode)
+{
+  switch (mode) {
+  case PAINT_BLEND_MULTIPLY:
+    return CAIRO_OPERATOR_MULTIPLY;
+  case PAINT_BLEND_SCREEN:
+    return CAIRO_OPERATOR_SCREEN;
+  case PAINT_BLEND_OVERLAY:
+    return CAIRO_OPERATOR_OVERLAY;
+  case PAINT_BLEND_DARKEN:
+    return CAIRO_OPERATOR_DARKEN;
+  case PAINT_BLEND_LIGHTEN:
+    return CAIRO_OPERATOR_LIGHTEN;
+  case PAINT_BLEND_NORMAL:
+  default:
+    return CAIRO_OPERATOR_OVER;
+  }
+}
+
+static gboolean
+needs_composite_surface (const PaintDocument *doc)
+{
+  if (!doc || !doc->layers || doc->layers->len != 1 || doc->has_active_hole)
+    return TRUE;
+  const PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
+  return !l0->visible || l0->opacity < 0.999 || l0->blend_mode != PAINT_BLEND_NORMAL;
+}
+
+static void
+composite_region_into (const PaintDocument *doc,
+                       cairo_surface_t *dst,
+                       int rx,
+                       int ry,
+                       int rw,
+                       int rh)
+{
+  int x0 = CLAMP (rx, 0, doc->width);
+  int y0 = CLAMP (ry, 0, doc->height);
+  int x1 = CLAMP (rx + rw, 0, doc->width);
+  int y1 = CLAMP (ry + rh, 0, doc->height);
+  int cw = x1 - x0;
+  int ch = y1 - y0;
+  if (cw <= 0 || ch <= 0)
+    return;
+
+  cairo_t *cr = cairo_create (dst);
+  cairo_rectangle (cr, (double) x0, (double) y0, (double) cw, (double) ch);
+  cairo_clip (cr);
+  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  cairo_paint (cr);
+
+  for (guint i = 0; i < doc->layers->len; i++) {
+    const PaintLayer *layer = g_ptr_array_index (doc->layers, i);
+    if (!layer->visible || layer->opacity <= 0.001)
+      continue;
+
+    cairo_save (cr);
+    if (doc->has_active_hole && (int) i == doc->active_layer_index) {
+      int hx0 = MAX (x0, doc->active_hole.x);
+      int hy0 = MAX (y0, doc->active_hole.y);
+      int hx1 = MIN (x1, doc->active_hole.x + doc->active_hole.width);
+      int hy1 = MIN (y1, doc->active_hole.y + doc->active_hole.height);
+      if (hx1 > hx0 && hy1 > hy0) {
+        if (i == 0 && doc->background_color.alpha > 0.0f) {
+          cairo_save (cr);
+          cairo_rectangle (cr, (double) hx0, (double) hy0,
+                           (double) (hx1 - hx0), (double) (hy1 - hy0));
+          cairo_clip (cr);
+          cairo_set_source_rgba (cr,
+                                 doc->background_color.red,
+                                 doc->background_color.green,
+                                 doc->background_color.blue,
+                                 doc->background_color.alpha);
+          cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+          cairo_paint (cr);
+          cairo_restore (cr);
+        }
+
+        cairo_set_fill_rule (cr, CAIRO_FILL_RULE_EVEN_ODD);
+        cairo_rectangle (cr, (double) x0, (double) y0, (double) cw, (double) ch);
+        cairo_rectangle (cr, (double) hx0, (double) hy0,
+                         (double) (hx1 - hx0), (double) (hy1 - hy0));
+        cairo_clip (cr);
+      }
+    }
+
+    cairo_set_operator (cr, blend_mode_to_cairo (layer->blend_mode));
+    cairo_set_source_surface (cr, layer->surface, 0.0, 0.0);
+    if (layer->opacity >= 0.999)
+      cairo_paint (cr);
+    else
+      cairo_paint_with_alpha (cr, layer->opacity);
+    cairo_restore (cr);
+  }
+  cairo_destroy (cr);
+}
+
+static void mark_all_dirty (PaintDocument *doc);
+
+static void
+recomposite_all (PaintDocument *doc)
+{
+  if (!doc || !doc->layers || doc->layers->len == 0)
+    return;
+
+  if (!needs_composite_surface (doc)) {
+    g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
+    PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
+    doc->surface = l0->surface;
+    return;
+  }
+
+  if (!doc->composite_surface ||
+      cairo_image_surface_get_width (doc->composite_surface) != doc->width ||
+      cairo_image_surface_get_height (doc->composite_surface) != doc->height) {
+    g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
+    doc->composite_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+                                                         doc->width,
+                                                         doc->height);
+  }
+  doc->surface = doc->composite_surface;
+  composite_region_into (doc, doc->composite_surface, 0, 0, doc->width, doc->height);
+}
+
+static void
+recomposite_rect (PaintDocument *doc, int rx, int ry, int rw, int rh)
+{
+  if (!doc || !doc->layers || doc->layers->len == 0)
+    return;
+
+  if (needs_composite_surface (doc)) {
+    if (!doc->composite_surface ||
+        cairo_image_surface_get_width (doc->composite_surface) != doc->width ||
+        cairo_image_surface_get_height (doc->composite_surface) != doc->height) {
+      recomposite_all (doc);
+      mark_all_dirty (doc);
+      return;
+    }
+    doc->surface = doc->composite_surface;
+    composite_region_into (doc, doc->composite_surface, rx, ry, rw, rh);
+  } else if (doc->composite_surface) {
+    recomposite_all (doc);
+    mark_all_dirty (doc);
+  } else {
+    PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
+    doc->surface = l0->surface;
+  }
+}
 
 static void
 mark_all_dirty (PaintDocument *doc)
@@ -277,7 +533,14 @@ paint_document_new_with_background (int width, int height, const GdkRGBA *bg)
   doc->width = MAX (1, width);
   doc->height = MAX (1, height);
   doc->background_color = *bg;
-  doc->surface = create_blank_surface (doc->width, doc->height, &doc->background_color);
+  doc->layers = g_ptr_array_new_with_free_func (paint_layer_free);
+  cairo_surface_t *bg_surf = create_blank_surface (doc->width, doc->height, &doc->background_color);
+  g_ptr_array_add (doc->layers,
+                   paint_layer_new ("Background", bg_surf, TRUE, 1.0, PAINT_BLEND_NORMAL));
+  doc->active_layer_index = 0;
+  doc->next_layer_num = 1;
+  doc->layers_revision = 1;
+  doc->surface = bg_surf;
   doc->undo_stack = g_ptr_array_new_with_free_func (undo_step_free);
   doc->redo_stack = g_ptr_array_new_with_free_func (undo_step_free);
   doc->all_dirty = TRUE;
@@ -387,7 +650,8 @@ paint_document_new_from_file (GFile *file, GError **error)
   gboolean has_alpha = surface_has_transparency (loaded);
   PaintDocument *doc = has_alpha ? paint_document_new_transparent (w, h)
                                  : paint_document_new (w, h);
-  cairo_t *cr = cairo_create (doc->surface);
+  PaintLayer *l0 = get_active_layer (doc);
+  cairo_t *cr = cairo_create (l0->surface);
   cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
   cairo_set_source_surface (cr, loaded, 0, 0);
   cairo_paint (cr);
@@ -396,6 +660,7 @@ paint_document_new_from_file (GFile *file, GError **error)
 
   doc->file = g_object_ref (file);
   doc->modified = FALSE;
+  recomposite_all (doc);
   mark_all_dirty (doc);
   return doc;
 }
@@ -420,7 +685,9 @@ paint_document_free (PaintDocument *doc)
   if (!doc)
     return;
   g_clear_pointer (&doc->active_stroke_undo, undo_step_free);
-  g_clear_pointer (&doc->surface, cairo_surface_destroy);
+  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
+  doc->surface = NULL;
+  g_clear_pointer (&doc->layers, g_ptr_array_unref);
   g_clear_object (&doc->file);
   g_clear_pointer (&doc->undo_stack, g_ptr_array_unref);
   g_clear_pointer (&doc->redo_stack, g_ptr_array_unref);
@@ -485,24 +752,41 @@ static UndoStep *
 apply_undo_step (PaintDocument *doc, const UndoStep *step)
 {
   if (step->is_full) {
-    UndoStep *reverse = undo_step_new_full (doc->surface, &doc->background_color);
-    cairo_surface_destroy (doc->surface);
-    doc->surface = restore_full_surface (step);
-    doc->width = cairo_image_surface_get_width (doc->surface);
-    doc->height = cairo_image_surface_get_height (doc->surface);
+    UndoStep *reverse = undo_step_new_full_doc (doc);
+    doc->has_active_hole = FALSE;
+    doc->active_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+    g_ptr_array_set_size (doc->layers, 0);
+    for (guint i = 0; i < step->layer_snaps->len; i++) {
+      const UndoLayerSnapshot *snap = g_ptr_array_index (step->layer_snaps, i);
+      g_ptr_array_add (doc->layers, undo_layer_snapshot_restore (snap));
+    }
+    doc->width = step->width;
+    doc->height = step->height;
     doc->background_color = step->background_color;
+    doc->active_layer_index = CLAMP (step->active_layer_index, 0, MAX (0, (int) doc->layers->len - 1));
+    doc->next_layer_num = step->next_layer_num;
+    g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
+    recomposite_all (doc);
+    doc->layers_revision++;
     mark_all_dirty (doc);
     return reverse;
   }
 
-  UndoStep *reverse = undo_step_new_tiled (doc->width, doc->height);
+  int idx = CLAMP (step->layer_index, 0, MAX (0, (int) doc->layers->len - 1));
+  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) idx);
+  UndoStep *reverse = undo_step_new_tiled (doc->width, doc->height, idx);
   for (guint i = 0; i < step->tiles->len; i++) {
     const UndoTile *t = g_ptr_array_index (step->tiles, i);
-    g_ptr_array_add (reverse->tiles, capture_rect_tile (doc->surface, t->x, t->y, t->w, t->h));
-    restore_rect_tile (doc->surface, t);
+    g_ptr_array_add (reverse->tiles, capture_rect_tile (layer->surface, t->x, t->y, t->w, t->h));
+    restore_rect_tile (layer->surface, t);
+    recomposite_rect (doc, t->x, t->y, t->w, t->h);
     mark_rect_dirty (doc, t->x, t->y, t->w, t->h);
   }
-  cairo_surface_mark_dirty (doc->surface);
+  cairo_surface_mark_dirty (layer->surface);
+  if (doc->active_layer_index != idx) {
+    doc->active_layer_index = idx;
+    doc->layers_revision++;
+  }
   return reverse;
 }
 
@@ -599,6 +883,10 @@ paint_document_begin_stroke (PaintDocument *doc,
     doc->active_stroke_undo = NULL;
   }
 
+  PaintLayer *active = get_active_layer (doc);
+  if (!active)
+    return;
+
   doc->pre_stroke_modified = doc->modified;
   doc->stroke_start_x = x;
   doc->stroke_start_y = y;
@@ -608,10 +896,10 @@ paint_document_begin_stroke (PaintDocument *doc,
   doc->prev2_stroke_y = y;
 
   GdkRGBA prev_bg = settings->background_color;
-  settings->background_color = doc->background_color;
+  settings->background_color = get_active_layer_clear_color (doc);
 
   if (tool->draw_preview) {
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->begin_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
     settings->background_color = prev_bg;
@@ -622,18 +910,20 @@ paint_document_begin_stroke (PaintDocument *doc,
     int rx, ry, rw, rh;
     compute_stroke_bounds (x, y, x, y, settings->size, &rx, &ry, &rw, &rh);
 
-    doc->active_stroke_undo = undo_step_new_tiled (doc->width, doc->height);
-    undo_step_capture_rect (doc->active_stroke_undo, doc->surface, rx, ry, rw, rh);
+    doc->active_stroke_undo = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
+    undo_step_capture_rect (doc->active_stroke_undo, active->surface, rx, ry, rw, rh);
 
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->begin_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
+    recomposite_rect (doc, rx, ry, rw, rh);
     mark_rect_dirty (doc, rx, ry, rw, rh);
   } else {
-    push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
-    cairo_t *cr = cairo_create (doc->surface);
+    push_undo_step (doc, undo_step_new_full_doc (doc));
+    cairo_t *cr = cairo_create (active->surface);
     tool->begin_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
+    recomposite_all (doc);
     mark_all_dirty (doc);
   }
 
@@ -648,11 +938,15 @@ paint_document_continue_stroke (PaintDocument *doc,
                                 const PaintTool *tool,
                                 PaintToolSettings *settings)
 {
+  PaintLayer *active = get_active_layer (doc);
+  if (!active)
+    return;
+
   GdkRGBA prev_bg = settings->background_color;
-  settings->background_color = doc->background_color;
+  settings->background_color = get_active_layer_clear_color (doc);
 
   if (tool->draw_preview) {
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->continue_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
     settings->background_color = prev_bg;
@@ -661,7 +955,7 @@ paint_document_continue_stroke (PaintDocument *doc,
 
   if (tool->uses_brush_size) {
     if (!doc->active_stroke_undo)
-      doc->active_stroke_undo = undo_step_new_tiled (doc->width, doc->height);
+      doc->active_stroke_undo = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
 
     int pad = (int) ceil (settings->size / 2.0) + 4;
     double min_x = MIN (MIN (doc->prev2_stroke_x, doc->prev_stroke_x), x);
@@ -674,11 +968,12 @@ paint_document_continue_stroke (PaintDocument *doc,
     int rw = (int) ceil (max_x - min_x) + pad * 2 + 2;
     int rh = (int) ceil (max_y - min_y) + pad * 2 + 2;
 
-    undo_step_capture_rect (doc->active_stroke_undo, doc->surface, rx, ry, rw, rh);
+    undo_step_capture_rect (doc->active_stroke_undo, active->surface, rx, ry, rw, rh);
 
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->continue_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
+    recomposite_rect (doc, rx, ry, rw, rh);
     mark_rect_dirty (doc, rx, ry, rw, rh);
 
     doc->prev2_stroke_x = doc->prev_stroke_x;
@@ -686,9 +981,11 @@ paint_document_continue_stroke (PaintDocument *doc,
     doc->prev_stroke_x = x;
     doc->prev_stroke_y = y;
   } else {
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->continue_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
+    recomposite_all (doc);
+    mark_all_dirty (doc);
   }
 
   settings->background_color = prev_bg;
@@ -702,20 +999,25 @@ paint_document_end_stroke (PaintDocument *doc,
                            const PaintTool *tool,
                            PaintToolSettings *settings)
 {
+  PaintLayer *active = get_active_layer (doc);
+  if (!active)
+    return;
+
   GdkRGBA prev_bg = settings->background_color;
-  settings->background_color = doc->background_color;
+  settings->background_color = get_active_layer_clear_color (doc);
 
   if (tool->draw_preview) {
     int rx, ry, rw, rh;
     compute_tool_stroke_bounds (tool, settings, doc->stroke_start_x, doc->stroke_start_y,
                                 x, y, &rx, &ry, &rw, &rh);
 
-    UndoStep *step = undo_step_new_tiled (doc->width, doc->height);
-    undo_step_capture_rect (step, doc->surface, rx, ry, rw, rh);
+    UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
+    undo_step_capture_rect (step, active->surface, rx, ry, rw, rh);
 
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->end_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
+    recomposite_rect (doc, rx, ry, rw, rh);
     mark_rect_dirty (doc, rx, ry, rw, rh);
 
     push_undo_step (doc, step);
@@ -730,11 +1032,12 @@ paint_document_end_stroke (PaintDocument *doc,
                            settings->size, &rx, &ry, &rw, &rh);
 
     if (doc->active_stroke_undo)
-      undo_step_capture_rect (doc->active_stroke_undo, doc->surface, rx, ry, rw, rh);
+      undo_step_capture_rect (doc->active_stroke_undo, active->surface, rx, ry, rw, rh);
 
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->end_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
+    recomposite_rect (doc, rx, ry, rw, rh);
     mark_rect_dirty (doc, rx, ry, rw, rh);
 
     if (doc->active_stroke_undo) {
@@ -742,9 +1045,11 @@ paint_document_end_stroke (PaintDocument *doc,
       doc->active_stroke_undo = NULL;
     }
   } else {
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     tool->end_stroke (tool, cr, x, y, settings);
     cairo_destroy (cr);
+    recomposite_all (doc);
+    mark_all_dirty (doc);
   }
 
   settings->background_color = prev_bg;
@@ -760,83 +1065,18 @@ paint_document_cancel_stroke (PaintDocument *doc)
   UndoStep *step = doc->active_stroke_undo;
   doc->active_stroke_undo = NULL;
 
+  int idx = CLAMP (step->layer_index, 0, MAX (0, (int) doc->layers->len - 1));
+  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) idx);
+
   for (guint i = 0; i < step->tiles->len; i++) {
     const UndoTile *t = g_ptr_array_index (step->tiles, i);
-    restore_rect_tile (doc->surface, t);
+    restore_rect_tile (layer->surface, t);
+    recomposite_rect (doc, t->x, t->y, t->w, t->h);
     mark_rect_dirty (doc, t->x, t->y, t->w, t->h);
   }
-  cairo_surface_mark_dirty (doc->surface);
+  cairo_surface_mark_dirty (layer->surface);
   undo_step_free (step);
   doc->modified = doc->pre_stroke_modified;
-}
-
-void
-paint_document_clear (PaintDocument *doc)
-{
-  if (doc->active_stroke_undo) {
-    push_undo_step (doc, doc->active_stroke_undo);
-    doc->active_stroke_undo = NULL;
-  }
-  push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
-  cairo_t *cr = cairo_create (doc->surface);
-  cairo_set_source_rgba (cr,
-                         doc->background_color.red,
-                         doc->background_color.green,
-                         doc->background_color.blue,
-                         doc->background_color.alpha);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-void
-paint_document_clear_transparent (PaintDocument *doc)
-{
-  if (doc->active_stroke_undo) {
-    push_undo_step (doc, doc->active_stroke_undo);
-    doc->active_stroke_undo = NULL;
-  }
-  push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
-  doc->background_color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
-  cairo_t *cr = cairo_create (doc->surface);
-  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-void
-paint_document_resize (PaintDocument *doc, int new_width, int new_height)
-{
-  int w = MAX (1, new_width);
-  int h = MAX (1, new_height);
-  if (w == doc->width && h == doc->height)
-    return;
-
-  if (doc->active_stroke_undo) {
-    push_undo_step (doc, doc->active_stroke_undo);
-    doc->active_stroke_undo = NULL;
-  }
-  push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
-
-  cairo_surface_t *new_surface = create_blank_surface (w, h, &doc->background_color);
-  cairo_t *cr = cairo_create (new_surface);
-  cairo_rectangle (cr, 0.0, 0.0, (double) MIN (w, doc->width), (double) MIN (h, doc->height));
-  cairo_clip (cr);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, doc->surface, 0, 0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-
-  cairo_surface_destroy (doc->surface);
-  doc->surface = new_surface;
-  doc->width = w;
-  doc->height = h;
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
 }
 
 static void
@@ -849,6 +1089,84 @@ flush_active_stroke_undo (PaintDocument *doc)
 }
 
 void
+paint_document_clear (PaintDocument *doc)
+{
+  PaintLayer *active = get_active_layer (doc);
+  if (!active)
+    return;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+
+  GdkRGBA clr = get_active_layer_clear_color (doc);
+  cairo_t *cr = cairo_create (active->surface);
+  cairo_set_source_rgba (cr, clr.red, clr.green, clr.blue, clr.alpha);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+
+  recomposite_all (doc);
+  doc->modified = TRUE;
+  mark_all_dirty (doc);
+}
+
+void
+paint_document_clear_transparent (PaintDocument *doc)
+{
+  PaintLayer *active = get_active_layer (doc);
+  if (!active)
+    return;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+  if (doc->active_layer_index == 0)
+    doc->background_color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
+
+  cairo_t *cr = cairo_create (active->surface);
+  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+
+  recomposite_all (doc);
+  doc->modified = TRUE;
+  mark_all_dirty (doc);
+}
+
+void
+paint_document_resize (PaintDocument *doc, int new_width, int new_height)
+{
+  int w = MAX (1, new_width);
+  int h = MAX (1, new_height);
+  if (w == doc->width && h == doc->height)
+    return;
+
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+
+  GdkRGBA transparent = { 0.0f, 0.0f, 0.0f, 0.0f };
+  for (guint i = 0; i < doc->layers->len; i++) {
+    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
+    const GdkRGBA *pad_bg = (i == 0) ? &doc->background_color : &transparent;
+    cairo_surface_t *new_surface = create_blank_surface (w, h, pad_bg);
+    cairo_t *cr = cairo_create (new_surface);
+    cairo_rectangle (cr, 0.0, 0.0, (double) MIN (w, doc->width), (double) MIN (h, doc->height));
+    cairo_clip (cr);
+    cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface (cr, layer->surface, 0, 0);
+    cairo_paint (cr);
+    cairo_destroy (cr);
+    cairo_surface_destroy (layer->surface);
+    layer->surface = new_surface;
+  }
+
+  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
+  doc->width = w;
+  doc->height = h;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  doc->modified = TRUE;
+  mark_all_dirty (doc);
+}
+
+void
 paint_document_scale (PaintDocument *doc, int new_width, int new_height)
 {
   int w = MAX (1, new_width);
@@ -857,21 +1175,29 @@ paint_document_scale (PaintDocument *doc, int new_width, int new_height)
     return;
 
   flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
+  push_undo_step (doc, undo_step_new_full_doc (doc));
 
-  cairo_surface_t *new_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
-  cairo_t *cr = cairo_create (new_surface);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_scale (cr, (double) w / (double) doc->width, (double) h / (double) doc->height);
-  cairo_set_source_surface (cr, doc->surface, 0.0, 0.0);
-  cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BEST);
-  cairo_paint (cr);
-  cairo_destroy (cr);
+  double sx = (double) w / (double) doc->width;
+  double sy = (double) h / (double) doc->height;
+  for (guint i = 0; i < doc->layers->len; i++) {
+    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
+    cairo_surface_t *new_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
+    cairo_t *cr = cairo_create (new_surface);
+    cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+    cairo_scale (cr, sx, sy);
+    cairo_set_source_surface (cr, layer->surface, 0.0, 0.0);
+    cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BEST);
+    cairo_paint (cr);
+    cairo_destroy (cr);
+    cairo_surface_destroy (layer->surface);
+    layer->surface = new_surface;
+  }
 
-  cairo_surface_destroy (doc->surface);
-  doc->surface = new_surface;
+  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
   doc->width = w;
   doc->height = h;
+  doc->layers_revision++;
+  recomposite_all (doc);
   doc->modified = TRUE;
   mark_all_dirty (doc);
 }
@@ -891,19 +1217,25 @@ paint_document_crop (PaintDocument *doc, int x, int y, int w, int h)
     return;
 
   flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
+  push_undo_step (doc, undo_step_new_full_doc (doc));
 
-  cairo_surface_t *new_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, cw, ch);
-  cairo_t *cr = cairo_create (new_surface);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, doc->surface, (double) -x0, (double) -y0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
+  for (guint i = 0; i < doc->layers->len; i++) {
+    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
+    cairo_surface_t *new_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, cw, ch);
+    cairo_t *cr = cairo_create (new_surface);
+    cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface (cr, layer->surface, (double) -x0, (double) -y0);
+    cairo_paint (cr);
+    cairo_destroy (cr);
+    cairo_surface_destroy (layer->surface);
+    layer->surface = new_surface;
+  }
 
-  cairo_surface_destroy (doc->surface);
-  doc->surface = new_surface;
+  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
   doc->width = cw;
   doc->height = ch;
+  doc->layers_revision++;
+  recomposite_all (doc);
   doc->modified = TRUE;
   mark_all_dirty (doc);
 }
@@ -969,13 +1301,21 @@ void
 paint_document_rotate_90 (PaintDocument *doc, gboolean clockwise)
 {
   flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
+  push_undo_step (doc, undo_step_new_full_doc (doc));
 
-  cairo_surface_t *rot = paint_surface_rotate_90 (doc->surface, clockwise);
-  cairo_surface_destroy (doc->surface);
-  doc->surface = rot;
-  doc->width = cairo_image_surface_get_width (rot);
-  doc->height = cairo_image_surface_get_height (rot);
+  for (guint i = 0; i < doc->layers->len; i++) {
+    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
+    cairo_surface_t *rot = paint_surface_rotate_90 (layer->surface, clockwise);
+    cairo_surface_destroy (layer->surface);
+    layer->surface = rot;
+  }
+
+  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
+  PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
+  doc->width = cairo_image_surface_get_width (l0->surface);
+  doc->height = cairo_image_surface_get_height (l0->surface);
+  doc->layers_revision++;
+  recomposite_all (doc);
   doc->modified = TRUE;
   mark_all_dirty (doc);
 }
@@ -984,11 +1324,16 @@ void
 paint_document_flip (PaintDocument *doc, gboolean horizontal)
 {
   flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full (doc->surface, &doc->background_color));
+  push_undo_step (doc, undo_step_new_full_doc (doc));
 
-  cairo_surface_t *flipped = paint_surface_flip (doc->surface, horizontal);
-  cairo_surface_destroy (doc->surface);
-  doc->surface = flipped;
+  for (guint i = 0; i < doc->layers->len; i++) {
+    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
+    cairo_surface_t *flipped = paint_surface_flip (layer->surface, horizontal);
+    cairo_surface_destroy (layer->surface);
+    layer->surface = flipped;
+  }
+
+  recomposite_all (doc);
   doc->modified = TRUE;
   mark_all_dirty (doc);
 }
@@ -1050,7 +1395,8 @@ paint_document_shift_preview_start (PaintDocument *doc,
 cairo_surface_t *
 paint_document_copy_rect (const PaintDocument *doc, int x, int y, int w, int h)
 {
-  if (!doc || !doc->surface)
+  PaintLayer *active = get_active_layer (doc);
+  if (!active || !active->surface)
     return NULL;
   int x0 = CLAMP (x, 0, doc->width);
   int y0 = CLAMP (y, 0, doc->height);
@@ -1064,23 +1410,25 @@ paint_document_copy_rect (const PaintDocument *doc, int x, int y, int w, int h)
   cairo_surface_t *copy = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, cw, ch);
   cairo_t *cr = cairo_create (copy);
   cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, doc->surface, (double) -x0, (double) -y0);
+  cairo_set_source_surface (cr, active->surface, (double) -x0, (double) -y0);
   cairo_paint (cr);
   cairo_destroy (cr);
   return copy;
 }
 
 static void
-fill_doc_rect_with_bg (PaintDocument *doc, int x0, int y0, int w, int h)
+fill_layer_rect_with_clear_color (const PaintDocument *doc,
+                                  PaintLayer *layer,
+                                  int x0,
+                                  int y0,
+                                  int w,
+                                  int h)
 {
-  cairo_t *cr = cairo_create (doc->surface);
+  GdkRGBA clr = get_active_layer_clear_color (doc);
+  cairo_t *cr = cairo_create (layer->surface);
   cairo_rectangle (cr, (double) x0, (double) y0, (double) w, (double) h);
   cairo_clip (cr);
-  cairo_set_source_rgba (cr,
-                         doc->background_color.red,
-                         doc->background_color.green,
-                         doc->background_color.blue,
-                         doc->background_color.alpha);
+  cairo_set_source_rgba (cr, clr.red, clr.green, clr.blue, clr.alpha);
   cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
   cairo_paint (cr);
   cairo_destroy (cr);
@@ -1089,6 +1437,9 @@ fill_doc_rect_with_bg (PaintDocument *doc, int x0, int y0, int w, int h)
 void
 paint_document_clear_rect (PaintDocument *doc, int x, int y, int w, int h)
 {
+  PaintLayer *active = get_active_layer (doc);
+  if (!active)
+    return;
   int x0 = CLAMP (x, 0, doc->width);
   int y0 = CLAMP (y, 0, doc->height);
   int x1 = CLAMP (x + w, 0, doc->width);
@@ -1097,9 +1448,10 @@ paint_document_clear_rect (PaintDocument *doc, int x, int y, int w, int h)
     return;
 
   flush_active_stroke_undo (doc);
-  UndoStep *step = undo_step_new_tiled (doc->width, doc->height);
-  undo_step_capture_rect (step, doc->surface, x0, y0, x1 - x0, y1 - y0);
-  fill_doc_rect_with_bg (doc, x0, y0, x1 - x0, y1 - y0);
+  UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
+  undo_step_capture_rect (step, active->surface, x0, y0, x1 - x0, y1 - y0);
+  fill_layer_rect_with_clear_color (doc, active, x0, y0, x1 - x0, y1 - y0);
+  recomposite_rect (doc, x0, y0, x1 - x0, y1 - y0);
   mark_rect_dirty (doc, x0, y0, x1 - x0, y1 - y0);
   push_undo_step (doc, step);
   doc->modified = TRUE;
@@ -1118,11 +1470,17 @@ paint_document_commit_move (PaintDocument *doc,
                             int dst_x,
                             int dst_y)
 {
-  if (!doc || (!src_hole && !floating))
+  PaintLayer *active = get_active_layer (doc);
+  if (!active || (!src_hole && !floating))
     return;
 
   flush_active_stroke_undo (doc);
-  UndoStep *step = undo_step_new_tiled (doc->width, doc->height);
+  gboolean had_hole = doc->has_active_hole;
+  cairo_rectangle_int_t prev_hole = doc->active_hole;
+  doc->has_active_hole = FALSE;
+  doc->active_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+
+  UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
 
   int hx0 = 0, hy0 = 0, hw = 0, hh = 0;
   if (src_hole && src_hole->width > 0 && src_hole->height > 0) {
@@ -1133,7 +1491,7 @@ paint_document_commit_move (PaintDocument *doc,
     hw = hx1 - hx0;
     hh = hy1 - hy0;
     if (hw > 0 && hh > 0)
-      undo_step_capture_rect (step, doc->surface, hx0, hy0, hw, hh);
+      undo_step_capture_rect (step, active->surface, hx0, hy0, hw, hh);
   }
 
   int dx0 = 0, dy0 = 0, dw = 0, dh = 0;
@@ -1147,21 +1505,26 @@ paint_document_commit_move (PaintDocument *doc,
     dw = dx1 - dx0;
     dh = dy1 - dy0;
     if (dw > 0 && dh > 0)
-      undo_step_capture_rect (step, doc->surface, dx0, dy0, dw, dh);
+      undo_step_capture_rect (step, active->surface, dx0, dy0, dw, dh);
   }
 
   if (hw > 0 && hh > 0) {
-    fill_doc_rect_with_bg (doc, hx0, hy0, hw, hh);
+    fill_layer_rect_with_clear_color (doc, active, hx0, hy0, hw, hh);
+    recomposite_rect (doc, hx0, hy0, hw, hh);
     mark_rect_dirty (doc, hx0, hy0, hw, hh);
+  } else if (had_hole && prev_hole.width > 0 && prev_hole.height > 0) {
+    recomposite_rect (doc, prev_hole.x, prev_hole.y, prev_hole.width, prev_hole.height);
+    mark_rect_dirty (doc, prev_hole.x, prev_hole.y, prev_hole.width, prev_hole.height);
   }
   if (floating && dw > 0 && dh > 0) {
-    cairo_t *cr = cairo_create (doc->surface);
+    cairo_t *cr = cairo_create (active->surface);
     cairo_rectangle (cr, (double) dx0, (double) dy0, (double) dw, (double) dh);
     cairo_clip (cr);
     cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
     cairo_set_source_surface (cr, floating, (double) dst_x, (double) dst_y);
     cairo_paint (cr);
     cairo_destroy (cr);
+    recomposite_rect (doc, dx0, dy0, dw, dh);
     mark_rect_dirty (doc, dx0, dy0, dw, dh);
   }
 
@@ -1237,12 +1600,13 @@ paint_document_draw_text (PaintDocument *doc,
                           const char *text,
                           const PaintToolSettings *settings)
 {
-  if (!doc || !settings || !text || !*text)
+  PaintLayer *active = get_active_layer (doc);
+  if (!active || !settings || !text || !*text)
     return;
 
   flush_active_stroke_undo (doc);
   int bx, by, bw, bh;
-  cairo_t *cr = cairo_create (doc->surface);
+  cairo_t *cr = cairo_create (active->surface);
   paint_render_text_layout (cr, x, y, text, settings, FALSE, &bx, &by, &bw, &bh);
   cairo_destroy (cr);
 
@@ -1250,16 +1614,449 @@ paint_document_draw_text (PaintDocument *doc,
   int ry = by - 6;
   int rw = bw + 12;
   int rh = bh + 12;
-  UndoStep *step = undo_step_new_tiled (doc->width, doc->height);
-  undo_step_capture_rect (step, doc->surface, rx, ry, rw, rh);
+  UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
+  undo_step_capture_rect (step, active->surface, rx, ry, rw, rh);
 
-  cr = cairo_create (doc->surface);
+  cr = cairo_create (active->surface);
   paint_render_text_layout (cr, x, y, text, settings, TRUE, NULL, NULL, NULL, NULL);
   cairo_destroy (cr);
 
+  recomposite_rect (doc, rx, ry, rw, rh);
   mark_rect_dirty (doc, rx, ry, rw, rh);
   push_undo_step (doc, step);
   doc->modified = TRUE;
+}
+
+static void
+paint_document_set_floating_hole (PaintDocument *doc,
+                                  const cairo_rectangle_int_t *hole)
+{
+  if (!doc)
+    return;
+  gboolean had_hole = doc->has_active_hole;
+  cairo_rectangle_int_t old_hole = doc->active_hole;
+  gboolean had_comp = (doc->composite_surface != NULL);
+
+  if (hole && hole->width > 0 && hole->height > 0) {
+    doc->has_active_hole = TRUE;
+    doc->active_hole = *hole;
+  } else {
+    doc->has_active_hole = FALSE;
+    doc->active_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+  }
+
+  gboolean want_comp = needs_composite_surface (doc);
+  if (want_comp != had_comp) {
+    recomposite_all (doc);
+    mark_all_dirty (doc);
+    return;
+  }
+
+  if (had_hole && old_hole.width > 0 && old_hole.height > 0) {
+    recomposite_rect (doc, old_hole.x, old_hole.y, old_hole.width, old_hole.height);
+    mark_rect_dirty (doc, old_hole.x, old_hole.y, old_hole.width, old_hole.height);
+  }
+  if (doc->has_active_hole) {
+    recomposite_rect (doc, doc->active_hole.x, doc->active_hole.y,
+                      doc->active_hole.width, doc->active_hole.height);
+    mark_rect_dirty (doc, doc->active_hole.x, doc->active_hole.y,
+                    doc->active_hole.width, doc->active_hole.height);
+  }
+}
+
+int
+paint_document_get_n_layers (const PaintDocument *doc)
+{
+  return (doc && doc->layers) ? (int) doc->layers->len : 0;
+}
+
+int
+paint_document_get_active_layer (const PaintDocument *doc)
+{
+  return doc ? doc->active_layer_index : 0;
+}
+
+void
+paint_document_set_active_layer (PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || doc->layers->len == 0)
+    return;
+  int clamped = CLAMP (index, 0, (int) doc->layers->len - 1);
+  if (doc->active_layer_index == clamped)
+    return;
+  flush_active_stroke_undo (doc);
+  doc->active_layer_index = clamped;
+  doc->layers_revision++;
+}
+
+guint64
+paint_document_get_layers_revision (const PaintDocument *doc)
+{
+  return doc ? doc->layers_revision : 0;
+}
+
+const char *
+paint_document_layer_get_name (const PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return "";
+  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  return layer->name;
+}
+
+void
+paint_document_layer_set_name (PaintDocument *doc, int index, const char *name)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return;
+  const char *trimmed = (name && *name) ? name : "Layer";
+  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  if (g_strcmp0 (layer->name, trimmed) == 0)
+    return;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+  g_free (layer->name);
+  layer->name = g_strdup (trimmed);
+  doc->layers_revision++;
+  doc->modified = TRUE;
+}
+
+gboolean
+paint_document_layer_get_visible (const PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return FALSE;
+  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  return layer->visible;
+}
+
+void
+paint_document_layer_set_visible (PaintDocument *doc, int index, gboolean visible)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return;
+  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  if (layer->visible == visible)
+    return;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+  layer->visible = visible;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+}
+
+double
+paint_document_layer_get_opacity (const PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return 1.0;
+  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  return layer->opacity;
+}
+
+void
+paint_document_layer_set_opacity (PaintDocument *doc, int index, double opacity)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return;
+  double clamped = CLAMP (opacity, 0.0, 1.0);
+  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  if (fabs (layer->opacity - clamped) < 1e-4)
+    return;
+
+  flush_active_stroke_undo (doc);
+  gboolean can_coalesce = FALSE;
+  if (doc->undo_stack->len > 0 && doc->redo_stack->len == 0) {
+    const UndoStep *top = g_ptr_array_index (doc->undo_stack, doc->undo_stack->len - 1);
+    if (top->is_full && top->is_opacity_step && top->opacity_layer_idx == index)
+      can_coalesce = TRUE;
+  }
+  if (!can_coalesce) {
+    UndoStep *step = undo_step_new_full_doc (doc);
+    step->is_opacity_step = TRUE;
+    step->opacity_layer_idx = index;
+    push_undo_step (doc, step);
+  }
+
+  layer->opacity = clamped;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+}
+
+PaintBlendMode
+paint_document_layer_get_blend_mode (const PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return PAINT_BLEND_NORMAL;
+  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  return layer->blend_mode;
+}
+
+void
+paint_document_layer_set_blend_mode (PaintDocument *doc, int index, PaintBlendMode mode)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return;
+  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  if (layer->blend_mode == mode)
+    return;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+  layer->blend_mode = mode;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+}
+
+cairo_surface_t *
+paint_document_layer_get_surface (const PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return NULL;
+  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
+  return layer->surface;
+}
+
+int
+paint_document_add_layer (PaintDocument *doc, const char *name)
+{
+  if (!doc || !doc->layers)
+    return -1;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+
+  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+                                                      doc->width,
+                                                      doc->height);
+  g_autofree char *auto_name = name ? g_strdup (name)
+                                    : g_strdup_printf ("Layer %d", doc->next_layer_num++);
+  int insert_idx = CLAMP (doc->active_layer_index + 1, 0, (int) doc->layers->len);
+  g_ptr_array_insert (doc->layers,
+                      (guint) insert_idx,
+                      paint_layer_new (auto_name, surf, TRUE, 1.0, PAINT_BLEND_NORMAL));
+  doc->active_layer_index = insert_idx;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+  return insert_idx;
+}
+
+gboolean
+paint_document_duplicate_layer (PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
+    return FALSE;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+
+  const PaintLayer *src = g_ptr_array_index (doc->layers, (guint) index);
+  cairo_surface_t *copy = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+                                                      doc->width,
+                                                      doc->height);
+  cairo_t *cr = cairo_create (copy);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_surface (cr, src->surface, 0.0, 0.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+
+  g_autofree char *dup_name = g_strdup_printf ("%s Copy", src->name);
+  int insert_idx = index + 1;
+  g_ptr_array_insert (doc->layers,
+                      (guint) insert_idx,
+                      paint_layer_new (dup_name, copy, src->visible, src->opacity, src->blend_mode));
+  doc->active_layer_index = insert_idx;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+  return TRUE;
+}
+
+gboolean
+paint_document_remove_layer (PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || doc->layers->len <= 1 ||
+      index < 0 || index >= (int) doc->layers->len) {
+    return FALSE;
+  }
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+
+  g_ptr_array_remove_index (doc->layers, (guint) index);
+  if (doc->active_layer_index > index)
+    doc->active_layer_index--;
+  doc->active_layer_index = CLAMP (doc->active_layer_index, 0, (int) doc->layers->len - 1);
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+  return TRUE;
+}
+
+gboolean
+paint_document_move_layer (PaintDocument *doc, int from_index, int to_index)
+{
+  if (!doc || !doc->layers ||
+      from_index < 0 || from_index >= (int) doc->layers->len ||
+      to_index < 0 || to_index >= (int) doc->layers->len ||
+      from_index == to_index) {
+    return FALSE;
+  }
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+
+  PaintLayer **arr = (PaintLayer **) doc->layers->pdata;
+  PaintLayer *moved = arr[from_index];
+  if (from_index < to_index) {
+    for (int i = from_index; i < to_index; i++)
+      arr[i] = arr[i + 1];
+  } else {
+    for (int i = from_index; i > to_index; i--)
+      arr[i] = arr[i - 1];
+  }
+  arr[to_index] = moved;
+
+  if (doc->active_layer_index == from_index)
+    doc->active_layer_index = to_index;
+  else if (from_index < doc->active_layer_index && doc->active_layer_index <= to_index)
+    doc->active_layer_index--;
+  else if (to_index <= doc->active_layer_index && doc->active_layer_index < from_index)
+    doc->active_layer_index++;
+
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+  return TRUE;
+}
+
+gboolean
+paint_document_merge_layer_down (PaintDocument *doc, int index)
+{
+  if (!doc || !doc->layers || index <= 0 || index >= (int) doc->layers->len)
+    return FALSE;
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+
+  PaintLayer *top = g_ptr_array_index (doc->layers, (guint) index);
+  PaintLayer *bot = g_ptr_array_index (doc->layers, (guint) (index - 1));
+  if (top->visible && top->opacity > 0.001) {
+    cairo_t *cr = cairo_create (bot->surface);
+    cairo_set_operator (cr, blend_mode_to_cairo (top->blend_mode));
+    cairo_set_source_surface (cr, top->surface, 0.0, 0.0);
+    if (top->opacity >= 0.999)
+      cairo_paint (cr);
+    else
+      cairo_paint_with_alpha (cr, top->opacity);
+    cairo_destroy (cr);
+  }
+
+  g_ptr_array_remove_index (doc->layers, (guint) index);
+  if (doc->active_layer_index >= index)
+    doc->active_layer_index--;
+  doc->active_layer_index = CLAMP (doc->active_layer_index, 0, (int) doc->layers->len - 1);
+
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+  return TRUE;
+}
+
+gboolean
+paint_document_flatten_layers (PaintDocument *doc)
+{
+  if (!doc || !doc->layers || doc->layers->len == 0)
+    return FALSE;
+  const PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
+  if (doc->layers->len <= 1 && l0->visible && l0->opacity >= 0.999 &&
+      l0->blend_mode == PAINT_BLEND_NORMAL) {
+    return FALSE;
+  }
+
+  flush_active_stroke_undo (doc);
+  push_undo_step (doc, undo_step_new_full_doc (doc));
+  recomposite_all (doc);
+
+  cairo_surface_t *flat_surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+                                                           doc->width,
+                                                           doc->height);
+  cairo_t *cr = cairo_create (flat_surf);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_surface (cr, doc->surface, 0.0, 0.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+
+  if (surface_has_transparency (flat_surf))
+    doc->background_color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
+
+  g_ptr_array_set_size (doc->layers, 0);
+  g_ptr_array_add (doc->layers,
+                   paint_layer_new ("Background", flat_surf, TRUE, 1.0, PAINT_BLEND_NORMAL));
+  doc->active_layer_index = 0;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
+  doc->modified = TRUE;
+  return TRUE;
+}
+
+gboolean
+paint_document_append_restored_layer (PaintDocument *doc,
+                                      const char *name,
+                                      GFile *png_file,
+                                      gboolean visible,
+                                      double opacity,
+                                      PaintBlendMode blend_mode)
+{
+  if (!doc || !doc->layers || !png_file)
+    return FALSE;
+  g_autofree char *path = g_file_get_path (png_file);
+  if (!path)
+    return FALSE;
+
+  cairo_surface_t *loaded = cairo_image_surface_create_from_png (path);
+  if (cairo_surface_status (loaded) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy (loaded);
+    return FALSE;
+  }
+
+  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+                                                      doc->width,
+                                                      doc->height);
+  cairo_t *cr = cairo_create (surf);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_surface (cr, loaded, 0.0, 0.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  cairo_surface_destroy (loaded);
+
+  g_ptr_array_add (doc->layers,
+                   paint_layer_new (name, surf, visible, opacity, blend_mode));
+  return TRUE;
+}
+
+void
+paint_document_finish_session_restore (PaintDocument *doc,
+                                       int active_layer,
+                                       gboolean modified)
+{
+  if (!doc || !doc->layers || doc->layers->len == 0)
+    return;
+  g_ptr_array_set_size (doc->undo_stack, 0);
+  g_ptr_array_set_size (doc->redo_stack, 0);
+  doc->active_layer_index = CLAMP (active_layer, 0, (int) doc->layers->len - 1);
+  doc->next_layer_num = MAX (1, (int) doc->layers->len);
+  doc->modified = modified;
+  doc->layers_revision++;
+  recomposite_all (doc);
+  mark_all_dirty (doc);
 }
 
 cairo_surface_t *
@@ -1302,7 +2099,8 @@ paint_document_new_from_texture (GdkTexture *texture)
   gboolean has_alpha = surface_has_transparency (loaded);
   PaintDocument *doc = has_alpha ? paint_document_new_transparent (w, h)
                                  : paint_document_new (w, h);
-  cairo_t *cr = cairo_create (doc->surface);
+  PaintLayer *l0 = get_active_layer (doc);
+  cairo_t *cr = cairo_create (l0->surface);
   cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
   cairo_set_source_surface (cr, loaded, 0.0, 0.0);
   cairo_paint (cr);
@@ -1310,6 +2108,7 @@ paint_document_new_from_texture (GdkTexture *texture)
   cairo_surface_destroy (loaded);
 
   doc->modified = TRUE;
+  recomposite_all (doc);
   mark_all_dirty (doc);
   return doc;
 }
@@ -1399,6 +2198,7 @@ enum {
   SIGNAL_COLOR_PICKED,
   SIGNAL_SELECTION_CHANGED,
   SIGNAL_TEXT_STATE_CHANGED,
+  SIGNAL_HIDDEN_LAYER_BLOCKED,
   N_SIGNALS
 };
 
@@ -2095,6 +2895,7 @@ lift_selection_to_floating (PaintCanvas *self)
     return;
   self->floating_has_hole = TRUE;
   self->floating_hole = self->sel_rect;
+  paint_document_set_floating_hole (self->document, &self->floating_hole);
   sync_floating_texture (self);
 }
 
@@ -2110,6 +2911,8 @@ clear_selection_state (PaintCanvas *self)
   self->floating_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
   g_clear_pointer (&self->floating_surface, cairo_surface_destroy);
   g_clear_object (&self->floating_texture);
+  if (self->document)
+    paint_document_set_floating_hole (self->document, NULL);
   if (had)
     g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
 }
@@ -2377,29 +3180,6 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
   }
 
   if (self->floating_surface && self->floating_texture) {
-    if (self->floating_has_hole &&
-        self->floating_hole.width > 0 &&
-        self->floating_hole.height > 0) {
-      graphene_rect_t hole_rect = GRAPHENE_RECT_INIT (
-          (float) (self->floating_hole.x * self->zoom),
-          (float) (self->floating_hole.y * self->zoom),
-          (float) (self->floating_hole.width * self->zoom),
-          (float) (self->floating_hole.height * self->zoom));
-      if (self->document->background_color.alpha <= 0.0f && checker) {
-        gtk_snapshot_push_clip (snapshot, &hole_rect);
-        gtk_snapshot_append_scaled_texture (snapshot,
-                                            checker,
-                                            GSK_SCALING_FILTER_NEAREST,
-                                            &GRAPHENE_RECT_INIT ((float) checker_tx,
-                                                                 (float) checker_ty,
-                                                                 (float) self->checker_w,
-                                                                 (float) self->checker_h));
-        gtk_snapshot_pop (snapshot);
-      } else {
-        gtk_snapshot_append_color (snapshot, &self->document->background_color, &hole_rect);
-      }
-    }
-
     graphene_rect_t float_rect = GRAPHENE_RECT_INIT (
         (float) (self->sel_rect.x * self->zoom),
         (float) (self->sel_rect.y * self->zoom),
@@ -2735,6 +3515,15 @@ on_drag_begin (GtkGestureDrag *gesture,
   }
 
   clear_pick_badge (self);
+
+  if (self->document &&
+      !paint_document_layer_get_visible (self->document,
+                                         paint_document_get_active_layer (self->document))) {
+    self->drawing_active = FALSE;
+    self->touch_stroke_pending = FALSE;
+    g_signal_emit (self, signals[SIGNAL_HIDDEN_LAYER_BLOCKED], 0);
+    return;
+  }
 
   if (g_strcmp0 (tool->id, "select") == 0) {
     self->touch_stroke_pending = FALSE;
@@ -3157,6 +3946,11 @@ paint_canvas_class_init (PaintCanvasClass *klass)
                                                       G_SIGNAL_RUN_FIRST,
                                                       0, NULL, NULL, NULL,
                                                       G_TYPE_NONE, 0);
+  signals[SIGNAL_HIDDEN_LAYER_BLOCKED] = g_signal_new ("hidden-layer-blocked",
+                                                        G_TYPE_FROM_CLASS (klass),
+                                                        G_SIGNAL_RUN_FIRST,
+                                                        0, NULL, NULL, NULL,
+                                                        G_TYPE_NONE, 0);
 }
 
 static void
@@ -3716,4 +4510,137 @@ paint_canvas_check_viewport (PaintCanvas *self)
       !is_visible_covered_by_vp_cache (self, &vis)) {
     gtk_widget_queue_draw (GTK_WIDGET (self));
   }
+}
+
+int
+paint_canvas_add_layer (PaintCanvas *self, const char *name)
+{
+  if (!self || !self->document)
+    return -1;
+  paint_canvas_commit_active_overlays (self);
+  int idx = paint_document_add_layer (self->document, name);
+  if (idx >= 0) {
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  }
+  return idx;
+}
+
+gboolean
+paint_canvas_duplicate_layer (PaintCanvas *self, int index)
+{
+  if (!self || !self->document)
+    return FALSE;
+  paint_canvas_commit_active_overlays (self);
+  if (!paint_document_duplicate_layer (self->document, index))
+    return FALSE;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  return TRUE;
+}
+
+gboolean
+paint_canvas_remove_layer (PaintCanvas *self, int index)
+{
+  if (!self || !self->document)
+    return FALSE;
+  paint_canvas_commit_active_overlays (self);
+  if (!paint_document_remove_layer (self->document, index))
+    return FALSE;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  return TRUE;
+}
+
+gboolean
+paint_canvas_move_layer (PaintCanvas *self, int from_index, int to_index)
+{
+  if (!self || !self->document)
+    return FALSE;
+  paint_canvas_commit_active_overlays (self);
+  if (!paint_document_move_layer (self->document, from_index, to_index))
+    return FALSE;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  return TRUE;
+}
+
+gboolean
+paint_canvas_merge_layer_down (PaintCanvas *self, int index)
+{
+  if (!self || !self->document)
+    return FALSE;
+  paint_canvas_commit_active_overlays (self);
+  if (!paint_document_merge_layer_down (self->document, index))
+    return FALSE;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  return TRUE;
+}
+
+gboolean
+paint_canvas_flatten_layers (PaintCanvas *self)
+{
+  if (!self || !self->document)
+    return FALSE;
+  paint_canvas_commit_active_overlays (self);
+  if (!paint_document_flatten_layers (self->document))
+    return FALSE;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  return TRUE;
+}
+
+void
+paint_canvas_set_active_layer (PaintCanvas *self, int index)
+{
+  if (!self || !self->document)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_set_active_layer (self->document, index);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
+paint_canvas_set_layer_visible (PaintCanvas *self, int index, gboolean visible)
+{
+  if (!self || !self->document)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_layer_set_visible (self->document, index, visible);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
+paint_canvas_set_layer_opacity (PaintCanvas *self, int index, double opacity)
+{
+  if (!self || !self->document)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_layer_set_opacity (self->document, index, opacity);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
+paint_canvas_set_layer_blend_mode (PaintCanvas *self, int index, PaintBlendMode mode)
+{
+  if (!self || !self->document)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_layer_set_blend_mode (self->document, index, mode);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
+paint_canvas_set_layer_name (PaintCanvas *self, int index, const char *name)
+{
+  if (!self || !self->document)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_layer_set_name (self->document, index, name);
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
 }

@@ -27,12 +27,19 @@ struct _PaintWindow {
   GtkLabel *info_bg_label;
   GtkLabel *info_path_label;
   gboolean layers_visible;
+
+  guint startup_fit_tick_id;
+  int startup_fit_attempts;
+  int startup_fit_last_w;
+  int startup_fit_last_h;
+  gboolean startup_fit_expect_maximize;
 };
 
 G_DEFINE_FINAL_TYPE (PaintWindow, paint_window, ADW_TYPE_APPLICATION_WINDOW)
 
 /* Forward declarations */
 static void sync_window_state (PaintWindow *self);
+static PaintPreferences *get_app_preferences (PaintWindow *self);
 static void prompt_open_file (PaintWindow *self);
 static void save_current (PaintWindow *self,
                           gboolean save_as,
@@ -642,6 +649,179 @@ get_app_preferences (PaintWindow *self)
   return NULL;
 }
 
+static void
+compute_fit_window_size (PaintWindow *self, int *out_w, int *out_h)
+{
+  PaintPreferences *prefs = get_app_preferences (self);
+  int doc_w = prefs ? prefs->default_width : PAINT_DEFAULT_CANVAS_WIDTH;
+  int doc_h = prefs ? prefs->default_height : PAINT_DEFAULT_CANVAS_HEIGHT;
+
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (page) {
+    PaintDocument *doc = paint_canvas_get_document (paint_canvas_page_get_canvas (page));
+    if (doc) {
+      doc_w = paint_document_get_width (doc);
+      doc_h = paint_document_get_height (doc);
+    }
+  }
+
+  int tab_extra = (self->tab_view && adw_tab_view_get_n_pages (self->tab_view) > 1) ? 38 : 0;
+  int desired_w = doc_w + 80;
+  int desired_h = doc_h + 140 + tab_extra;
+
+  int max_w = 1400;
+  int max_h = 920;
+  GdkDisplay *display = gtk_widget_get_display (GTK_WIDGET (self));
+  if (!display)
+    display = gdk_display_get_default ();
+  if (display) {
+    GListModel *monitors = gdk_display_get_monitors (display);
+    if (monitors && g_list_model_get_n_items (monitors) > 0) {
+      g_autoptr (GdkMonitor) mon = GDK_MONITOR (g_list_model_get_item (monitors, 0));
+      if (mon) {
+        GdkRectangle geom;
+        gdk_monitor_get_geometry (mon, &geom);
+        if (geom.width > 0 && geom.height > 0) {
+          max_w = MAX (640, (int) lround ((double) geom.width * 0.90));
+          max_h = MAX (440, (int) lround ((double) geom.height * 0.88));
+        }
+      }
+    }
+  }
+
+  *out_w = CLAMP (desired_w, 640, max_w);
+  *out_h = CLAMP (desired_h, 440, max_h);
+}
+
+static gboolean
+on_startup_fit_tick (GtkWidget *widget,
+                     GdkFrameClock *clock G_GNUC_UNUSED,
+                     gpointer user_data G_GNUC_UNUSED)
+{
+  PaintWindow *self = PAINT_WINDOW (widget);
+  self->startup_fit_attempts++;
+
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (!page) {
+    if (self->startup_fit_attempts >= 60) {
+      self->startup_fit_tick_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+  }
+
+  int cur_w = gtk_widget_get_width (widget);
+  int cur_h = gtk_widget_get_height (widget);
+  if (cur_w <= 0 || cur_h <= 0) {
+    if (self->startup_fit_attempts >= 60) {
+      self->startup_fit_tick_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+  }
+
+  gboolean max_pending = self->startup_fit_expect_maximize &&
+                         !gtk_window_is_maximized (GTK_WINDOW (self)) &&
+                         self->startup_fit_attempts < 15;
+  gboolean fitted = paint_canvas_page_zoom_fit (page);
+  if (fitted)
+    sync_window_state (self);
+
+  if ((!fitted || cur_w != self->startup_fit_last_w ||
+       cur_h != self->startup_fit_last_h || max_pending) &&
+      self->startup_fit_attempts < 60) {
+    self->startup_fit_last_w = cur_w;
+    self->startup_fit_last_h = cur_h;
+    return G_SOURCE_CONTINUE;
+  }
+
+  self->startup_fit_tick_id = 0;
+  return G_SOURCE_REMOVE;
+}
+
+static void
+schedule_startup_fit (PaintWindow *self, gboolean expect_maximize)
+{
+  if (self->startup_fit_tick_id != 0) {
+    gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->startup_fit_tick_id);
+    self->startup_fit_tick_id = 0;
+  }
+  self->startup_fit_attempts = 0;
+  self->startup_fit_last_w = 0;
+  self->startup_fit_last_h = 0;
+  self->startup_fit_expect_maximize = expect_maximize;
+  self->startup_fit_tick_id = gtk_widget_add_tick_callback (GTK_WIDGET (self),
+                                                            on_startup_fit_tick,
+                                                            NULL,
+                                                            NULL);
+}
+
+void
+paint_window_save_window_state (PaintWindow *self)
+{
+  if (!self)
+    return;
+  PaintPreferences *prefs = get_app_preferences (self);
+  if (!prefs)
+    return;
+
+  gboolean maximized = gtk_window_is_maximized (GTK_WINDOW (self));
+  gboolean fullscreen = gtk_window_is_fullscreen (GTK_WINDOW (self));
+  prefs->last_window_maximized = maximized;
+  if (!maximized && !fullscreen) {
+    int w = gtk_widget_get_width (GTK_WIDGET (self));
+    int h = gtk_widget_get_height (GTK_WIDGET (self));
+    if (w >= 360 && h >= 300) {
+      prefs->last_window_width = CLAMP (w, 360, 8192);
+      prefs->last_window_height = CLAMP (h, 300, 8192);
+    }
+  }
+  paint_preferences_save (prefs);
+}
+
+void
+paint_window_apply_startup_sizing (PaintWindow *self)
+{
+  if (!self)
+    return;
+  PaintPreferences *prefs = get_app_preferences (self);
+  PaintStartupWindowMode mode = prefs ? prefs->startup_window_mode : PAINT_WINDOW_SIZE_REMEMBER;
+  gboolean expect_maximize = FALSE;
+
+  switch (mode) {
+  case PAINT_WINDOW_SIZE_FIT_CANVAS: {
+    int w = PAINT_DEFAULT_WINDOW_WIDTH;
+    int h = PAINT_DEFAULT_WINDOW_HEIGHT;
+    compute_fit_window_size (self, &w, &h);
+    gtk_window_set_default_size (GTK_WINDOW (self), w, h);
+    break;
+  }
+  case PAINT_WINDOW_SIZE_DEFAULT:
+    gtk_window_set_default_size (GTK_WINDOW (self),
+                                 PAINT_DEFAULT_WINDOW_WIDTH,
+                                 PAINT_DEFAULT_WINDOW_HEIGHT);
+    break;
+  case PAINT_WINDOW_SIZE_REMEMBER:
+  default: {
+    int w = prefs ? prefs->last_window_width : PAINT_DEFAULT_WINDOW_WIDTH;
+    int h = prefs ? prefs->last_window_height : PAINT_DEFAULT_WINDOW_HEIGHT;
+    if (w < 360 || h < 300) {
+      w = PAINT_DEFAULT_WINDOW_WIDTH;
+      h = PAINT_DEFAULT_WINDOW_HEIGHT;
+    }
+    gtk_window_set_default_size (GTK_WINDOW (self), w, h);
+    if (prefs && prefs->last_window_maximized) {
+      gtk_window_maximize (GTK_WINDOW (self));
+      expect_maximize = TRUE;
+    }
+    break;
+  }
+  }
+
+  if (prefs && prefs->fit_canvas_on_startup)
+    schedule_startup_fit (self, expect_maximize);
+}
+
 static char *
 session_dir_path (void)
 {
@@ -686,9 +866,17 @@ paint_window_save_all_sessions (AdwApplication *app)
       continue;
 
     g_autofree char *win_grp = g_strdup_printf ("Window.%d", win_idx);
-    int w_width = gtk_widget_get_width (GTK_WIDGET (win));
-    int w_height = gtk_widget_get_height (GTK_WIDGET (win));
-    if (w_width > 0 && w_height > 0) {
+    PaintPreferences *prefs = get_app_preferences (win);
+    gboolean is_max = gtk_window_is_maximized (GTK_WINDOW (win));
+    gboolean is_fs = gtk_window_is_fullscreen (GTK_WINDOW (win));
+    g_key_file_set_boolean (kf, win_grp, "Maximized", is_max);
+    int w_width = (!is_max && !is_fs)
+                    ? gtk_widget_get_width (GTK_WIDGET (win))
+                    : (prefs ? prefs->last_window_width : 0);
+    int w_height = (!is_max && !is_fs)
+                     ? gtk_widget_get_height (GTK_WIDGET (win))
+                     : (prefs ? prefs->last_window_height : 0);
+    if (w_width >= 360 && w_height >= 300) {
       g_key_file_set_integer (kf, win_grp, "Width", w_width);
       g_key_file_set_integer (kf, win_grp, "Height", w_height);
     }
@@ -788,10 +976,6 @@ paint_window_restore_session (AdwApplication *app)
       continue;
 
     PaintWindow *win = paint_window_new_empty (app);
-    int win_w = g_key_file_get_integer (kf, win_grp, "Width", NULL);
-    int win_h = g_key_file_get_integer (kf, win_grp, "Height", NULL);
-    if (win_w > 200 && win_h > 200)
-      gtk_window_set_default_size (GTK_WINDOW (win), win_w, win_h);
 
     for (int t = 0; t < tab_count; t++) {
       g_autofree char *tab_grp = g_strdup_printf ("Tab.%d.%d", w, t);
@@ -895,7 +1079,48 @@ paint_window_restore_session (AdwApplication *app)
     if (active >= 0 && active < n_pages)
       adw_tab_view_set_selected_page (win->tab_view,
                                       adw_tab_view_get_nth_page (win->tab_view, active));
+
+    PaintPreferences *prefs = get_app_preferences (win);
+    PaintStartupWindowMode mode = prefs ? prefs->startup_window_mode : PAINT_WINDOW_SIZE_REMEMBER;
+    gboolean expect_maximize = FALSE;
+
+    switch (mode) {
+    case PAINT_WINDOW_SIZE_FIT_CANVAS: {
+      int fit_w = PAINT_DEFAULT_WINDOW_WIDTH;
+      int fit_h = PAINT_DEFAULT_WINDOW_HEIGHT;
+      compute_fit_window_size (win, &fit_w, &fit_h);
+      gtk_window_set_default_size (GTK_WINDOW (win), fit_w, fit_h);
+      break;
+    }
+    case PAINT_WINDOW_SIZE_DEFAULT:
+      gtk_window_set_default_size (GTK_WINDOW (win),
+                                   PAINT_DEFAULT_WINDOW_WIDTH,
+                                   PAINT_DEFAULT_WINDOW_HEIGHT);
+      break;
+    case PAINT_WINDOW_SIZE_REMEMBER:
+    default: {
+      int win_w = g_key_file_get_integer (kf, win_grp, "Width", NULL);
+      int win_h = g_key_file_get_integer (kf, win_grp, "Height", NULL);
+      if (win_w < 360 || win_h < 300) {
+        win_w = prefs ? prefs->last_window_width : PAINT_DEFAULT_WINDOW_WIDTH;
+        win_h = prefs ? prefs->last_window_height : PAINT_DEFAULT_WINDOW_HEIGHT;
+      }
+      if (win_w >= 360 && win_h >= 300)
+        gtk_window_set_default_size (GTK_WINDOW (win), win_w, win_h);
+      gboolean win_max = g_key_file_has_key (kf, win_grp, "Maximized", NULL)
+                           ? g_key_file_get_boolean (kf, win_grp, "Maximized", NULL)
+                           : (prefs ? prefs->last_window_maximized : FALSE);
+      if (win_max) {
+        gtk_window_maximize (GTK_WINDOW (win));
+        expect_maximize = TRUE;
+      }
+      break;
+    }
+    }
+
     sync_window_state (win);
+    if (prefs && prefs->fit_canvas_on_startup)
+      schedule_startup_fit (win, expect_maximize);
     gtk_window_present (GTK_WINDOW (win));
     restored_any = TRUE;
   }
@@ -919,6 +1144,7 @@ on_window_close_request (GtkWindow *window, gpointer user_data G_GNUC_UNUSED)
   }
 
   if (prefs && prefs->restore_session && open_paint_windows <= 1) {
+    paint_window_save_window_state (self);
     paint_window_save_all_sessions (ADW_APPLICATION (app));
     return FALSE;
   }
@@ -939,8 +1165,10 @@ on_window_close_request (GtkWindow *window, gpointer user_data G_GNUC_UNUSED)
     }
   }
 
-  if (dirty_tabs->len == 0)
+  if (dirty_tabs->len == 0) {
+    paint_window_save_window_state (self);
     return FALSE;
+  }
 
   WindowCloseContext *ctx = g_new0 (WindowCloseContext, 1);
   ctx->window = self;
@@ -2170,6 +2398,17 @@ paint_window_add_new_tab (PaintWindow *self, PaintDocument *doc)
 }
 
 static void
+paint_window_dispose (GObject *object)
+{
+  PaintWindow *self = PAINT_WINDOW (object);
+  if (self->startup_fit_tick_id != 0) {
+    gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->startup_fit_tick_id);
+    self->startup_fit_tick_id = 0;
+  }
+  G_OBJECT_CLASS (paint_window_parent_class)->dispose (object);
+}
+
+static void
 paint_window_finalize (GObject *object)
 {
   PaintWindow *self = PAINT_WINDOW (object);
@@ -2181,6 +2420,7 @@ static void
 paint_window_class_init (PaintWindowClass *klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
+  object_class->dispose = paint_window_dispose;
   object_class->finalize = paint_window_finalize;
 }
 
@@ -2244,7 +2484,9 @@ paint_window_init (PaintWindow *self)
 
   gtk_window_set_title (GTK_WINDOW (self), "Paint");
   gtk_window_set_icon_name (GTK_WINDOW (self), PAINT_APP_ID);
-  gtk_window_set_default_size (GTK_WINDOW (self), 720, 520);
+  gtk_window_set_default_size (GTK_WINDOW (self),
+                               PAINT_DEFAULT_WINDOW_WIDTH,
+                               PAINT_DEFAULT_WINDOW_HEIGHT);
 
   g_action_map_add_action_entries (G_ACTION_MAP (self),
                                    win_actions,
@@ -2313,6 +2555,7 @@ paint_window_new (AdwApplication *app)
 {
   PaintWindow *self = paint_window_new_empty (app);
   paint_window_add_new_tab (self, NULL);
+  paint_window_apply_startup_sizing (self);
   return self;
 }
 

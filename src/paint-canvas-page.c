@@ -2407,14 +2407,14 @@ paint_canvas_page_adjust_brush_size (PaintCanvasPage *self, double delta)
   paint_canvas_page_set_brush_size (self, self->settings->size + delta);
 }
 
-void
+gboolean
 paint_canvas_page_zoom_fit (PaintCanvasPage *self)
 {
   if (!self || !self->canvas || !self->scrolled)
-    return;
+    return FALSE;
   PaintDocument *doc = paint_canvas_get_document (self->canvas);
   if (!doc)
-    return;
+    return FALSE;
 
   double view_w = (double) gtk_widget_get_width (GTK_WIDGET (self->scrolled));
   double view_h = (double) gtk_widget_get_height (GTK_WIDGET (self->scrolled));
@@ -2424,6 +2424,9 @@ paint_canvas_page_zoom_fit (PaintCanvasPage *self)
     view_w = gtk_adjustment_get_page_size (hadj);
     view_h = gtk_adjustment_get_page_size (vadj);
   }
+  if (view_w <= 0.0 || view_h <= 0.0)
+    return FALSE;
+
   double avail_w = MAX (32.0, view_w - (double) (WORKSPACE_MARGIN_START + WORKSPACE_MARGIN_END));
   double avail_h = MAX (32.0, view_h - (double) (WORKSPACE_MARGIN_TOP + WORKSPACE_MARGIN_BOTTOM));
   double dw = (double) MAX (1, paint_document_get_width (doc));
@@ -2432,6 +2435,7 @@ paint_canvas_page_zoom_fit (PaintCanvasPage *self)
   double fit = MIN (avail_w / dw, avail_h / dh);
   fit = CLAMP (fit, paint_canvas_get_min_zoom (), paint_canvas_get_max_zoom ());
   paint_canvas_set_zoom (self->canvas, fit);
+  return TRUE;
 }
 
 void

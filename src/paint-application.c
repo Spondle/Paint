@@ -31,6 +31,7 @@ act_preferences (GSimpleAction *action G_GNUC_UNUSED,
   GtkWindow *active = gtk_application_get_active_window (GTK_APPLICATION (self));
   paint_preferences_dialog_present (self->preferences,
                                     GTK_WIDGET (active),
+                                    "general",
                                     on_preferences_changed,
                                     self);
 }
@@ -67,86 +68,13 @@ act_shortcuts (GSimpleAction *action G_GNUC_UNUSED,
                GVariant *param G_GNUC_UNUSED,
                gpointer user_data)
 {
-  PaintApplication *paint_app = PAINT_APPLICATION (user_data);
-  GtkApplication *app = GTK_APPLICATION (user_data);
-  GtkWidget *parent = GTK_WIDGET (gtk_application_get_active_window (app));
-
-  gsize n_specs = 0;
-  const PaintKeybindSpec *specs = paint_preferences_get_keybind_specs (&n_specs);
-
-#if ADW_CHECK_VERSION (1, 8, 0)
-  AdwDialog *dlg = adw_shortcuts_dialog_new ();
-  AdwShortcutsSection *cur_sec = NULL;
-  const char *cur_name = NULL;
-
-  for (gsize i = 0; i < n_specs; i++) {
-    const PaintKeybindSpec *spec = &specs[i];
-    const char *accel = paint_preferences_get_keybind (paint_app->preferences, spec->id);
-    if (accel && *accel) {
-      if (!cur_sec || g_strcmp0 (cur_name, spec->section) != 0) {
-        cur_name = spec->section;
-        cur_sec = adw_shortcuts_section_new (cur_name);
-        adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), cur_sec);
-      }
-      adw_shortcuts_section_add (cur_sec, adw_shortcuts_item_new (spec->label, accel));
-    }
-
-    if (g_strcmp0 (spec->section, "Selection & Clipboard") == 0 &&
-        (i + 1 == n_specs || g_strcmp0 (specs[i + 1].section, "Selection & Clipboard") != 0)) {
-      if (!cur_sec || g_strcmp0 (cur_name, "Selection & Clipboard") != 0) {
-        cur_name = "Selection & Clipboard";
-        cur_sec = adw_shortcuts_section_new (cur_name);
-        adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg), cur_sec);
-      }
-      adw_shortcuts_section_add (cur_sec, adw_shortcuts_item_new ("Delete Selection", "Delete"));
-    }
-  }
-  adw_dialog_present (dlg, parent);
-#else
-  AdwDialog *dlg = adw_preferences_dialog_new ();
-  adw_dialog_set_title (dlg, "Keyboard Shortcuts");
-  GtkWidget *page = adw_preferences_page_new ();
-  GtkWidget *cur_grp = NULL;
-  const char *cur_name = NULL;
-
-  for (gsize i = 0; i < n_specs; i++) {
-    const PaintKeybindSpec *spec = &specs[i];
-    const char *accel = paint_preferences_get_keybind (paint_app->preferences, spec->id);
-    if (accel && *accel) {
-      if (!cur_grp || g_strcmp0 (cur_name, spec->section) != 0) {
-        cur_name = spec->section;
-        cur_grp = adw_preferences_group_new ();
-        adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), cur_name);
-        adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (cur_grp));
-      }
-      GtkWidget *row = adw_action_row_new ();
-      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), spec->label);
-      g_autofree char *pretty = paint_preferences_format_accel_label (accel);
-      GtkWidget *lbl = gtk_label_new (pretty);
-      gtk_widget_add_css_class (lbl, "dim-label");
-      adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
-      adw_preferences_group_add (ADW_PREFERENCES_GROUP (cur_grp), row);
-    }
-
-    if (g_strcmp0 (spec->section, "Selection & Clipboard") == 0 &&
-        (i + 1 == n_specs || g_strcmp0 (specs[i + 1].section, "Selection & Clipboard") != 0)) {
-      if (!cur_grp || g_strcmp0 (cur_name, "Selection & Clipboard") != 0) {
-        cur_name = "Selection & Clipboard";
-        cur_grp = adw_preferences_group_new ();
-        adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), cur_name);
-        adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (cur_grp));
-      }
-      GtkWidget *row = adw_action_row_new ();
-      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), "Delete Selection");
-      GtkWidget *lbl = gtk_label_new ("Delete");
-      gtk_widget_add_css_class (lbl, "dim-label");
-      adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
-      adw_preferences_group_add (ADW_PREFERENCES_GROUP (cur_grp), row);
-    }
-  }
-  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg), ADW_PREFERENCES_PAGE (page));
-  adw_dialog_present (dlg, parent);
-#endif
+  PaintApplication *self = PAINT_APPLICATION (user_data);
+  GtkWindow *active = gtk_application_get_active_window (GTK_APPLICATION (self));
+  paint_preferences_dialog_present (self->preferences,
+                                    GTK_WIDGET (active),
+                                    "shortcuts",
+                                    on_preferences_changed,
+                                    self);
 }
 
 static void
@@ -155,6 +83,20 @@ act_quit (GSimpleAction *action G_GNUC_UNUSED,
           gpointer user_data)
 {
   PaintApplication *self = PAINT_APPLICATION (user_data);
+  GtkApplication *app = GTK_APPLICATION (self);
+  GtkWindow *active = gtk_application_get_active_window (app);
+  PaintWindow *state_win = (active && PAINT_IS_WINDOW (active)) ? PAINT_WINDOW (active) : NULL;
+  if (!state_win) {
+    for (GList *l = gtk_application_get_windows (app); l != NULL; l = l->next) {
+      if (PAINT_IS_WINDOW (l->data)) {
+        state_win = PAINT_WINDOW (l->data);
+        break;
+      }
+    }
+  }
+  if (state_win)
+    paint_window_save_window_state (state_win);
+
   if (self->preferences && self->preferences->restore_session)
     paint_window_save_all_sessions (ADW_APPLICATION (self));
   else
@@ -223,11 +165,18 @@ paint_application_open (GApplication *app,
                         const gchar *hint G_GNUC_UNUSED)
 {
   GtkWindow *win = gtk_application_get_active_window (GTK_APPLICATION (app));
-  if (!win)
-    win = GTK_WINDOW (paint_window_new (ADW_APPLICATION (app)));
+  gboolean is_new_window = (win == NULL);
+  if (is_new_window)
+    win = GTK_WINDOW (paint_window_new_empty (ADW_APPLICATION (app)));
 
   for (gint i = 0; i < n_files; i++)
     paint_window_open_file (PAINT_WINDOW (win), files[i]);
+
+  if (is_new_window) {
+    if (adw_tab_view_get_n_pages (paint_window_get_tab_view (PAINT_WINDOW (win))) == 0)
+      paint_window_add_new_tab (PAINT_WINDOW (win), NULL);
+    paint_window_apply_startup_sizing (PAINT_WINDOW (win));
+  }
 
   gtk_window_present (win);
 }

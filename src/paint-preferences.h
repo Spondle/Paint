@@ -4,11 +4,20 @@
 
 G_BEGIN_DECLS
 
+#define PAINT_DEFAULT_WINDOW_WIDTH 720
+#define PAINT_DEFAULT_WINDOW_HEIGHT 520
+
 typedef enum {
   PAINT_COLOR_SCHEME_SYSTEM = 0,
   PAINT_COLOR_SCHEME_LIGHT = 1,
   PAINT_COLOR_SCHEME_DARK = 2,
 } PaintColorSchemePref;
+
+typedef enum {
+  PAINT_WINDOW_SIZE_REMEMBER = 0,
+  PAINT_WINDOW_SIZE_FIT_CANVAS = 1,
+  PAINT_WINDOW_SIZE_DEFAULT = 2,
+} PaintStartupWindowMode;
 
 typedef struct {
   const char *id;
@@ -27,6 +36,11 @@ typedef struct {
   gboolean show_pixel_grid;
   gboolean show_toolbar;
   gboolean restore_session;
+  PaintStartupWindowMode startup_window_mode;
+  gboolean fit_canvas_on_startup;
+  int last_window_width;
+  int last_window_height;
+  gboolean last_window_maximized;
   GHashTable *keybinds; /* char* action_id -> char* accel ("" = disabled) */
 } PaintPreferences;
 
@@ -61,6 +75,7 @@ GtkWidget *paint_theme_selector_new (PaintPreferences *prefs,
 
 void paint_preferences_dialog_present (PaintPreferences *prefs,
                                        GtkWidget *parent,
+                                       const char *initial_page,
                                        PaintPreferencesChangedCallback on_changed,
                                        gpointer user_data);
 

@@ -281,6 +281,11 @@ paint_preferences_load (void)
   prefs->show_pixel_grid = TRUE;
   prefs->show_toolbar = TRUE;
   prefs->restore_session = TRUE;
+  prefs->startup_window_mode = PAINT_WINDOW_SIZE_REMEMBER;
+  prefs->fit_canvas_on_startup = FALSE;
+  prefs->last_window_width = PAINT_DEFAULT_WINDOW_WIDTH;
+  prefs->last_window_height = PAINT_DEFAULT_WINDOW_HEIGHT;
+  prefs->last_window_maximized = FALSE;
   prefs->keybinds = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 
   g_autofree char *path = preferences_file_path ();
@@ -300,6 +305,21 @@ paint_preferences_load (void)
     prefs->show_toolbar = g_key_file_get_boolean (kf, "Appearance", "ShowToolbar", NULL);
   if (g_key_file_has_key (kf, "Behavior", "RestoreSession", NULL))
     prefs->restore_session = g_key_file_get_boolean (kf, "Behavior", "RestoreSession", NULL);
+  if (g_key_file_has_key (kf, "Behavior", "StartupWindowMode", NULL)) {
+    int mode = g_key_file_get_integer (kf, "Behavior", "StartupWindowMode", NULL);
+    prefs->startup_window_mode =
+        (PaintStartupWindowMode) CLAMP (mode, PAINT_WINDOW_SIZE_REMEMBER, PAINT_WINDOW_SIZE_DEFAULT);
+  }
+  if (g_key_file_has_key (kf, "Behavior", "FitCanvasOnStartup", NULL))
+    prefs->fit_canvas_on_startup =
+        g_key_file_get_boolean (kf, "Behavior", "FitCanvasOnStartup", NULL);
+
+  if (g_key_file_has_key (kf, "Window", "Width", NULL))
+    prefs->last_window_width = CLAMP (g_key_file_get_integer (kf, "Window", "Width", NULL), 360, 8192);
+  if (g_key_file_has_key (kf, "Window", "Height", NULL))
+    prefs->last_window_height = CLAMP (g_key_file_get_integer (kf, "Window", "Height", NULL), 300, 8192);
+  if (g_key_file_has_key (kf, "Window", "Maximized", NULL))
+    prefs->last_window_maximized = g_key_file_get_boolean (kf, "Window", "Maximized", NULL);
 
   if (g_key_file_has_key (kf, "Canvas", "DefaultWidth", NULL))
     prefs->default_width = CLAMP (g_key_file_get_integer (kf, "Canvas", "DefaultWidth", NULL), 64, 8192);
@@ -343,6 +363,11 @@ paint_preferences_save (const PaintPreferences *prefs)
   g_key_file_set_boolean (kf, "Appearance", "ShowPixelGrid", prefs->show_pixel_grid);
   g_key_file_set_boolean (kf, "Appearance", "ShowToolbar", prefs->show_toolbar);
   g_key_file_set_boolean (kf, "Behavior", "RestoreSession", prefs->restore_session);
+  g_key_file_set_integer (kf, "Behavior", "StartupWindowMode", (int) prefs->startup_window_mode);
+  g_key_file_set_boolean (kf, "Behavior", "FitCanvasOnStartup", prefs->fit_canvas_on_startup);
+  g_key_file_set_integer (kf, "Window", "Width", prefs->last_window_width);
+  g_key_file_set_integer (kf, "Window", "Height", prefs->last_window_height);
+  g_key_file_set_boolean (kf, "Window", "Maximized", prefs->last_window_maximized);
   g_key_file_set_integer (kf, "Canvas", "DefaultWidth", prefs->default_width);
   g_key_file_set_integer (kf, "Canvas", "DefaultHeight", prefs->default_height);
   g_key_file_set_double (kf, "Canvas", "DefaultBrushSize", prefs->default_brush_size);
@@ -824,6 +849,7 @@ static GtkWidget *
 build_shortcuts_page (PrefsDialogCtx *ctx)
 {
   GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_name (ADW_PREFERENCES_PAGE (page), "shortcuts");
   adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Shortcuts");
   adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page), "input-keyboard-symbolic");
 
@@ -913,6 +939,24 @@ on_restore_session_toggled (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpoin
 }
 
 static void
+on_startup_window_mode_changed (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
+{
+  PrefsDialogCtx *ctx = user_data;
+  int sel = (int) adw_combo_row_get_selected (ADW_COMBO_ROW (obj));
+  ctx->prefs->startup_window_mode =
+      (PaintStartupWindowMode) CLAMP (sel, PAINT_WINDOW_SIZE_REMEMBER, PAINT_WINDOW_SIZE_DEFAULT);
+  notify_changed (ctx);
+}
+
+static void
+on_fit_canvas_startup_toggled (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
+{
+  PrefsDialogCtx *ctx = user_data;
+  ctx->prefs->fit_canvas_on_startup = adw_switch_row_get_active (ADW_SWITCH_ROW (obj));
+  notify_changed (ctx);
+}
+
+static void
 on_default_width_changed (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
 {
   PrefsDialogCtx *ctx = user_data;
@@ -939,6 +983,7 @@ on_default_brush_changed (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointe
 void
 paint_preferences_dialog_present (PaintPreferences *prefs,
                                   GtkWidget *parent,
+                                  const char *initial_page,
                                   PaintPreferencesChangedCallback on_changed,
                                   gpointer user_data)
 {
@@ -955,6 +1000,7 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
   g_object_set_data_full (G_OBJECT (dlg), "prefs-ctx", ctx, prefs_dialog_ctx_free);
 
   GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_name (ADW_PREFERENCES_PAGE (page), "general");
   adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "General");
   adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page), "applications-graphics-symbolic");
 
@@ -1000,6 +1046,34 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
   g_signal_connect (restore_row, "notify::active", G_CALLBACK (on_restore_session_toggled), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (behavior_grp), restore_row);
 
+  static const char *const win_modes[] = {
+    "Remember Previous Size",
+    "Fit Window to Canvas",
+    "Default Size",
+    NULL,
+  };
+  GtkWidget *win_mode_row = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (win_mode_row), "Startup Window Size");
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (win_mode_row),
+                               "Choose how the window is sized when Paint opens");
+  g_autoptr (GtkStringList) win_mode_model = gtk_string_list_new (win_modes);
+  adw_combo_row_set_model (ADW_COMBO_ROW (win_mode_row), G_LIST_MODEL (win_mode_model));
+  adw_combo_row_set_selected (ADW_COMBO_ROW (win_mode_row), (guint) prefs->startup_window_mode);
+  g_signal_connect (win_mode_row, "notify::selected", G_CALLBACK (on_startup_window_mode_changed), ctx);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (behavior_grp), win_mode_row);
+
+  GtkWidget *fit_canvas_row = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (fit_canvas_row),
+                                 "Fit Canvas to Window on Startup");
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (fit_canvas_row),
+                               "Automatically zoom the canvas to fit the window when opened");
+  adw_switch_row_set_active (ADW_SWITCH_ROW (fit_canvas_row), prefs->fit_canvas_on_startup);
+  g_signal_connect (fit_canvas_row,
+                    "notify::active",
+                    G_CALLBACK (on_fit_canvas_startup_toggled),
+                    ctx);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (behavior_grp), fit_canvas_row);
+
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (behavior_grp));
 
   /* New Canvas Defaults group */
@@ -1029,5 +1103,7 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg), ADW_PREFERENCES_PAGE (page));
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
                               ADW_PREFERENCES_PAGE (build_shortcuts_page (ctx)));
+  if (initial_page && *initial_page)
+    adw_preferences_dialog_set_visible_page_name (ADW_PREFERENCES_DIALOG (dlg), initial_page);
   adw_dialog_present (dlg, parent);
 }

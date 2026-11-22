@@ -136,6 +136,49 @@ test_keybinds_save_and_reload_roundtrip (void)
   paint_preferences_free (reloaded);
 }
 
+static void
+test_startup_behavior_defaults_and_roundtrip (void)
+{
+  g_autofree char *ini = g_build_filename (g_get_user_config_dir (), "paint", "settings.ini", NULL);
+  g_unlink (ini);
+
+  PaintPreferences *prefs = paint_preferences_load ();
+  g_assert_cmpint (prefs->startup_window_mode, ==, PAINT_WINDOW_SIZE_REMEMBER);
+  g_assert_false (prefs->fit_canvas_on_startup);
+  g_assert_cmpint (prefs->last_window_width, ==, PAINT_DEFAULT_WINDOW_WIDTH);
+  g_assert_cmpint (prefs->last_window_height, ==, PAINT_DEFAULT_WINDOW_HEIGHT);
+  g_assert_false (prefs->last_window_maximized);
+
+  prefs->startup_window_mode = PAINT_WINDOW_SIZE_FIT_CANVAS;
+  prefs->fit_canvas_on_startup = TRUE;
+  prefs->last_window_width = 1120;
+  prefs->last_window_height = 840;
+  prefs->last_window_maximized = TRUE;
+  paint_preferences_save (prefs);
+  paint_preferences_free (prefs);
+
+  PaintPreferences *reloaded = paint_preferences_load ();
+  g_assert_cmpint (reloaded->startup_window_mode, ==, PAINT_WINDOW_SIZE_FIT_CANVAS);
+  g_assert_true (reloaded->fit_canvas_on_startup);
+  g_assert_cmpint (reloaded->last_window_width, ==, 1120);
+  g_assert_cmpint (reloaded->last_window_height, ==, 840);
+  g_assert_true (reloaded->last_window_maximized);
+
+  reloaded->startup_window_mode = PAINT_WINDOW_SIZE_DEFAULT;
+  reloaded->fit_canvas_on_startup = FALSE;
+  reloaded->last_window_maximized = FALSE;
+  paint_preferences_save (reloaded);
+  paint_preferences_free (reloaded);
+
+  PaintPreferences *reloaded2 = paint_preferences_load ();
+  g_assert_cmpint (reloaded2->startup_window_mode, ==, PAINT_WINDOW_SIZE_DEFAULT);
+  g_assert_false (reloaded2->fit_canvas_on_startup);
+  g_assert_cmpint (reloaded2->last_window_width, ==, 1120);
+  g_assert_cmpint (reloaded2->last_window_height, ==, 840);
+  g_assert_false (reloaded2->last_window_maximized);
+  paint_preferences_free (reloaded2);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -149,6 +192,8 @@ main (int argc, char **argv)
   g_test_add_func ("/keybinds/conflict_detection", test_keybinds_conflict_detection);
   g_test_add_func ("/keybinds/local_matching", test_keybinds_local_matching);
   g_test_add_func ("/keybinds/save_and_reload_roundtrip", test_keybinds_save_and_reload_roundtrip);
+  g_test_add_func ("/preferences/startup_behavior_roundtrip",
+                   test_startup_behavior_defaults_and_roundtrip);
   int res = g_test_run ();
 
   g_autofree char *ini = g_build_filename (tmp_cfg, "paint", "settings.ini", NULL);

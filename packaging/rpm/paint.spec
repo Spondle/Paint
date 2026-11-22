@@ -1,5 +1,5 @@
 Name:           paint
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Clean GNOME Paint application built with GTK 4 and Libadwaita
 
@@ -40,6 +40,7 @@ appstreamcli validate --no-net %{buildroot}%{_datadir}/metainfo/io.github.spondl
 
 %files
 %license README.md
+%doc CHANGELOG.md
 %{_bindir}/paint
 %{_datadir}/applications/io.github.spondle.Paint.desktop
 %{_datadir}/metainfo/io.github.spondle.Paint.metainfo.xml
@@ -47,6 +48,12 @@ appstreamcli validate --no-net %{buildroot}%{_datadir}/metainfo/io.github.spondl
 %{_datadir}/icons/hicolor/symbolic/apps/io.github.spondle.Paint-symbolic.svg
 
 %changelog
+* Sat Nov 21 2026 spondle <noreply@example.invalid> - 0.3.0-1
+- Add multi-layer editing, blend modes, and collapsible Layers sidebar
+- Add Selection, Text, Eyedropper, Resize/Scale, Rotate/Flip, Fit to Window, and Pixel Grid tools
+- Add brush styles, Recent Colors, Block Arrow shape, and Spacebar shape repositioning
+- Add customizable keyboard shortcuts and startup window/canvas sizing preferences
+
 * Wed Nov 18 2026 spondle <noreply@example.invalid> - 0.2.0-1
 - Add full transparency support for PNG and WebP images with a checkerboard canvas backdrop
 - Add Transparency tool (Brush, Fill, and Clear to Transparent)

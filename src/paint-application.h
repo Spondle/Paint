@@ -9,7 +9,7 @@ G_BEGIN_DECLS
 
 #define PAINT_APP_ID "io.github.spondle.Paint"
 #define PAINT_APP_NAME "Paint"
-#define PAINT_APP_VERSION "0.2.0"
+#define PAINT_APP_VERSION "0.3.0"
 
 #define PAINT_TYPE_APPLICATION (paint_application_get_type ())
 G_DECLARE_FINAL_TYPE (PaintApplication, paint_application, PAINT, APPLICATION, AdwApplication)

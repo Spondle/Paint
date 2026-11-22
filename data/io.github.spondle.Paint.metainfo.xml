@@ -40,6 +40,19 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.0" date="2026-11-21">
+      <description>
+        <p>Layers, customizable shortcuts, selection and text tools, and startup sizing controls:</p>
+        <ul>
+          <li>Multi-layer editing with opacity, six blend modes, collapsible Layers sidebar, Merge Down, Flatten Layers, and per-layer undo</li>
+          <li>Selection tool with move, nudge, clipboard Cut/Copy/Paste, Paste as New Canvas, and Crop to Selection</li>
+          <li>Text tool with live preview, font family, size, Bold, and Italic styling</li>
+          <li>Eyedropper tool with cursor color preview swatch, Alt hold picking, and Recent Colors history</li>
+          <li>Brush styles (Smooth, Soft, Pixel), Block Arrow shape, Spacebar shape repositioning, Resize and Scale dialog, Rotate/Flip, Fit to Window, and Pixel Grid</li>
+          <li>Customizable keyboard shortcuts and startup window/canvas sizing options in Preferences</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-18">
       <description>
         <p>New drawing tools and full transparency support:</p>

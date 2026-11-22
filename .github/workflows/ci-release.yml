@@ -113,6 +113,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { in_sec=1; next }
+            in_sec && /^## \[/ { exit }
+            in_sec && /^\[.*\]: / { exit }
+            in_sec { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "Release ${GITHUB_REF_NAME}" > release-notes.md
+          fi
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -122,4 +137,5 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: release-assets/*

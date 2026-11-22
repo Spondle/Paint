@@ -1,3 +1,13 @@
+paint (0.3.0-1) unstable; urgency=medium
+
+  * New upstream release:
+    - Add multi-layer support, blend modes, and collapsible Layers sidebar
+    - Add Selection, Text, Eyedropper, Resize & Scale, Rotate/Flip, and Pixel Grid
+    - Add brush styles, Recent Colors, Block Arrow shape, and Spacebar repositioning
+    - Add customizable keyboard shortcuts and startup window/canvas sizing preferences
+
+ -- spondle <noreply@example.invalid>  Sat, 21 Nov 2026 19:00:00 -0500
+
 paint (0.2.0-1) unstable; urgency=medium
 
   * New upstream release:

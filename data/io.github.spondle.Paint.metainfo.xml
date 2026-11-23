@@ -12,12 +12,14 @@
       and Ptyxis.
     </p>
     <ul>
-      <li>Smooth anti-aliased brush, line, shapes, eraser, and tolerance-aware flood fill tools</li>
+      <li>Multi-layer editing with OpenRaster (.ora) projects, opacity, blend modes, alpha lock, layer lock, and drag-and-drop layer reordering</li>
+      <li>Selection tools (Rectangle, Ellipse, Freehand Lasso, Magic Wand) with 8 resize handles and Invert Selection</li>
+      <li>Smooth anti-aliased brush, line, 9 shapes, eraser, tolerance-aware Flood Fill with Sample All Layers, Linear/Radial Gradient, Blur/Pixelate retouch, and rich multiline Text</li>
+      <li>Live-preview Brightness/Contrast, Hue/Saturation, and Gaussian Blur adjustments plus Sharpen, Invert Colors, Grayscale, and Trim Transparent</li>
       <li>Full transparency support with checkerboard backdrop and transparent brush and fill tools</li>
-      <li>Tabbed canvases with tab overview and drag-out window tear-off</li>
-      <li>Automatic session restore preserving open tabs and unsaved drafts</li>
-      <li>Touchscreen-friendly canvas with zoom, pan, and customizable defaults</li>
-      <li>Open and export PNG, JPEG, WebP, and BMP images</li>
+      <li>Stylus tablet pressure sensitivity, dual Primary/Secondary swatches, Custom Palette, and customizable keyboard shortcuts</li>
+      <li>Tabbed canvases with tab overview, cursor coordinate HUD, edge resize handles, Spacebar panning, printing, and atomic session restore</li>
+      <li>Open and export OpenRaster (.ora), PNG, JPEG, WebP, and BMP images</li>
     </ul>
   </description>
   <developer id="io.github.spondle">
@@ -37,6 +39,7 @@
     <control>pointing</control>
     <control>keyboard</control>
     <control>touch</control>
+    <control>tablet</control>
   </supports>
   <content_rating type="oars-1.1" />
   <releases>

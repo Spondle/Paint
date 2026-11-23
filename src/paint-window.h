@@ -3,6 +3,8 @@
 #include <adwaita.h>
 
 #include "paint-canvas.h"
+#include "paint-preferences.h"
+#include "paint-session.h"
 
 G_BEGIN_DECLS
 
@@ -17,8 +19,10 @@ void paint_window_open_file (PaintWindow *self, GFile *file);
 void paint_window_apply_preferences (PaintWindow *self);
 void paint_window_apply_startup_sizing (PaintWindow *self);
 void paint_window_save_window_state (PaintWindow *self);
-void paint_window_save_all_sessions (AdwApplication *app);
-gboolean paint_window_restore_session (AdwApplication *app);
-void paint_window_clear_session (void);
+
+PaintPreferences *paint_window_get_preferences (PaintWindow *self);
+void paint_window_compute_fit_window_size (PaintWindow *self, int *out_w, int *out_h);
+void paint_window_schedule_startup_fit (PaintWindow *self, gboolean expect_maximize);
+void paint_window_sync_state (PaintWindow *self);
 
 G_END_DECLS

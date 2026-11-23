@@ -1,5 +1,6 @@
 #include "paint-application.h"
 
+#include "paint-i18n.h"
 #include "paint-window.h"
 
 struct _PaintApplication {
@@ -12,9 +13,34 @@ struct _PaintApplication {
 G_DEFINE_FINAL_TYPE (PaintApplication, paint_application, ADW_TYPE_APPLICATION)
 
 static void
+sync_prefs_to_tool_settings (const PaintPreferences *prefs, PaintToolSettings *s)
+{
+  if (!prefs || !s)
+    return;
+  s->size = prefs->default_brush_size;
+  s->pressure_size = prefs->pressure_size;
+  s->pressure_opacity = prefs->pressure_opacity;
+
+  int n_rec = MIN (prefs->n_recent_colors, PAINT_MAX_RECENT_COLORS);
+  s->n_recent_colors = n_rec;
+  for (int i = 0; i < n_rec; i++)
+    s->recent_colors[i] = prefs->recent_colors[i];
+
+  int n_cust = MIN (prefs->n_custom_colors, PAINT_MAX_CUSTOM_COLORS);
+  s->n_custom_colors = n_cust;
+  for (int i = 0; i < n_cust; i++)
+    s->custom_colors[i] = prefs->custom_colors[i];
+}
+
+static void
 on_preferences_changed (const PaintPreferences *prefs, gpointer user_data)
 {
-  GtkApplication *app = GTK_APPLICATION (user_data);
+  PaintApplication *self = PAINT_APPLICATION (user_data);
+  GtkApplication *app = GTK_APPLICATION (self);
+  if (self->tool_settings) {
+    self->tool_settings->pressure_size = prefs->pressure_size;
+    self->tool_settings->pressure_opacity = prefs->pressure_opacity;
+  }
   paint_preferences_apply_accelerators (prefs, app);
   for (GList *l = gtk_application_get_windows (app); l != NULL; l = l->next) {
     if (PAINT_IS_WINDOW (l->data))
@@ -55,10 +81,10 @@ act_about (GSimpleAction *action G_GNUC_UNUSED,
   adw_about_dialog_set_application_name (ADW_ABOUT_DIALOG (about), PAINT_APP_NAME);
   adw_about_dialog_set_application_icon (ADW_ABOUT_DIALOG (about), PAINT_APP_ID);
   adw_about_dialog_set_version (ADW_ABOUT_DIALOG (about), PAINT_APP_VERSION);
-  adw_about_dialog_set_developer_name (ADW_ABOUT_DIALOG (about), "Paint Contributors");
+  adw_about_dialog_set_developer_name (ADW_ABOUT_DIALOG (about), _("Paint Contributors"));
   adw_about_dialog_set_comments (
       ADW_ABOUT_DIALOG (about),
-      "A fast, clean GNOME Paint application built with C, GTK 4, and Libadwaita.");
+      _("A fast, clean GNOME Paint application built with C, GTK 4, and Libadwaita."));
   adw_about_dialog_set_license_type (ADW_ABOUT_DIALOG (about), GTK_LICENSE_GPL_3_0);
   adw_dialog_present (about, GTK_WIDGET (gtk_application_get_active_window (app)));
 }
@@ -97,6 +123,7 @@ act_quit (GSimpleAction *action G_GNUC_UNUSED,
   if (state_win)
     paint_window_save_window_state (state_win);
 
+  paint_session_cancel_autosave ();
   if (self->preferences && self->preferences->restore_session)
     paint_window_save_all_sessions (ADW_APPLICATION (self));
   else
@@ -113,7 +140,7 @@ paint_application_startup (GApplication *app)
   self->preferences = paint_preferences_load ();
   paint_preferences_apply_theme (self->preferences);
   self->tool_settings = paint_tool_settings_new ();
-  self->tool_settings->size = self->preferences->default_brush_size;
+  sync_prefs_to_tool_settings (self->preferences, self->tool_settings);
 
   GdkDisplay *display = gdk_display_get_default ();
   if (display) {

@@ -5,6 +5,8 @@
 
 #include "paint-application.h"
 #include "paint-canvas-page.h"
+#include "paint-dialogs.h"
+#include "paint-i18n.h"
 #include "paint-preferences.h"
 #include "paint-tools.h"
 
@@ -38,8 +40,6 @@ struct _PaintWindow {
 G_DEFINE_FINAL_TYPE (PaintWindow, paint_window, ADW_TYPE_APPLICATION_WINDOW)
 
 /* Forward declarations */
-static void sync_window_state (PaintWindow *self);
-static PaintPreferences *get_app_preferences (PaintWindow *self);
 static void prompt_open_file (PaintWindow *self);
 static void save_current (PaintWindow *self,
                           gboolean save_as,
@@ -86,7 +86,7 @@ refresh_recent_menu (PaintWindow *self)
 {
   g_autoptr (GMenu) menu = g_menu_new ();
   if (self->recent_paths->len == 0) {
-    g_autoptr (GMenuItem) item = g_menu_item_new ("No Recent Images", NULL);
+    g_autoptr (GMenuItem) item = g_menu_item_new (_("No Recent Images"), NULL);
     g_menu_append_item (menu, item);
   } else {
     g_autoptr (GMenu) section = g_menu_new ();
@@ -99,7 +99,7 @@ refresh_recent_menu (PaintWindow *self)
                                                g_variant_new_string (p));
       g_menu_append_item (section, item);
     }
-    g_menu_append_section (menu, "Recent Images", G_MENU_MODEL (section));
+    g_menu_append_section (menu, _("Recent Images"), G_MENU_MODEL (section));
   }
   adw_split_button_set_menu_model (self->open_btn, G_MENU_MODEL (menu));
 }
@@ -144,17 +144,17 @@ update_tab_metadata (AdwTabPage *tab_page, PaintCanvasPage *page)
 
   PaintDocument *doc = paint_canvas_get_document (paint_canvas_page_get_canvas (page));
   GFile *file = paint_document_get_file (doc);
-  g_autofree char *path = file ? g_file_get_path (file) : g_strdup ("Untitled Canvas");
-  adw_tab_page_set_tooltip (tab_page, path ? path : "Untitled Canvas");
+  g_autofree char *path = file ? g_file_get_parse_name (file) : g_strdup (_("Untitled Canvas"));
+  adw_tab_page_set_tooltip (tab_page, path ? path : _("Untitled Canvas"));
 }
 
-static void
-sync_window_state (PaintWindow *self)
+void
+paint_window_sync_state (PaintWindow *self)
 {
   AdwTabPage *tab = adw_tab_view_get_selected_page (self->tab_view);
   PaintCanvasPage *page = get_active_canvas_page (self);
   if (!tab || !page) {
-    adw_window_title_set_title (self->window_title, "Paint");
+    adw_window_title_set_title (self->window_title, _("Paint"));
     adw_window_title_set_subtitle (self->window_title, "");
     return;
   }
@@ -184,6 +184,14 @@ sync_window_state (PaintWindow *self)
   if (crop_act)
     g_simple_action_set_enabled (G_SIMPLE_ACTION (crop_act),
                                  paint_canvas_has_selection (canvas));
+  GAction *invert_sel_act = g_action_map_lookup_action (G_ACTION_MAP (self), "invert-selection");
+  if (invert_sel_act)
+    g_simple_action_set_enabled (G_SIMPLE_ACTION (invert_sel_act),
+                                 paint_canvas_has_selection (canvas));
+  GAction *del_sel_act = g_action_map_lookup_action (G_ACTION_MAP (self), "delete-selection");
+  if (del_sel_act)
+    g_simple_action_set_enabled (G_SIMPLE_ACTION (del_sel_act),
+                                 paint_canvas_has_selection (canvas));
   GAction *merge_act = g_action_map_lookup_action (G_ACTION_MAP (self), "merge-layer-down");
   if (merge_act)
     g_simple_action_set_enabled (G_SIMPLE_ACTION (merge_act),
@@ -199,7 +207,7 @@ sync_window_state (PaintWindow *self)
                                                paint_document_get_height (doc));
   g_autofree char *layers_str = g_strdup_printf ("%d", paint_document_get_n_layers (doc));
   GFile *file = paint_document_get_file (doc);
-  g_autofree char *path_str = file ? g_file_get_path (file) : NULL;
+  g_autofree char *path_str = file ? g_file_get_parse_name (file) : NULL;
 
   gtk_button_set_label (self->zoom_pct_btn, zoom_str);
   gtk_label_set_text (self->info_dims_label, dims_str);
@@ -207,8 +215,15 @@ sync_window_state (PaintWindow *self)
     gtk_label_set_text (self->info_layers_label, layers_str);
   gtk_label_set_text (self->info_zoom_label, zoom_str);
   gtk_label_set_text (self->info_bg_label,
-                      paint_document_has_transparent_background (doc) ? "Transparent" : "White");
-  gtk_label_set_text (self->info_path_label, path_str ? path_str : "Not saved yet");
+                      paint_document_has_transparent_background (doc) ? _("Transparent") : _("White"));
+  gtk_label_set_text (self->info_path_label, path_str ? path_str : _("Not saved yet"));
+
+  if (paint_document_get_modified (doc)) {
+    PaintPreferences *prefs = paint_window_get_preferences (self);
+    GtkApplication *app = gtk_window_get_application (GTK_WINDOW (self));
+    if (prefs && prefs->restore_session && app && ADW_IS_APPLICATION (app))
+      paint_session_schedule_autosave (ADW_APPLICATION (app));
+  }
 }
 
 /* ============================================================================
@@ -221,7 +236,8 @@ build_image_filters (void)
   GListStore *filters = g_list_store_new (GTK_TYPE_FILE_FILTER);
 
   g_autoptr (GtkFileFilter) img_filter = gtk_file_filter_new ();
-  gtk_file_filter_set_name (img_filter, "Image Files (PNG, JPEG, WebP, BMP)");
+  gtk_file_filter_set_name (img_filter, _("Image Files (ORA, PNG, JPEG, WebP, BMP)"));
+  gtk_file_filter_add_pattern (img_filter, "*.ora");
   gtk_file_filter_add_pattern (img_filter, "*.png");
   gtk_file_filter_add_pattern (img_filter, "*.jpg");
   gtk_file_filter_add_pattern (img_filter, "*.jpeg");
@@ -229,8 +245,34 @@ build_image_filters (void)
   gtk_file_filter_add_pattern (img_filter, "*.bmp");
   g_list_store_append (filters, img_filter);
 
+  g_autoptr (GtkFileFilter) ora_filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (ora_filter, _("OpenRaster Layered Project (*.ora)"));
+  gtk_file_filter_add_pattern (ora_filter, "*.ora");
+  g_list_store_append (filters, ora_filter);
+
+  g_autoptr (GtkFileFilter) png_filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (png_filter, _("PNG Image (*.png)"));
+  gtk_file_filter_add_pattern (png_filter, "*.png");
+  g_list_store_append (filters, png_filter);
+
+  g_autoptr (GtkFileFilter) jpg_filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (jpg_filter, _("JPEG Image (*.jpg, *.jpeg)"));
+  gtk_file_filter_add_pattern (jpg_filter, "*.jpg");
+  gtk_file_filter_add_pattern (jpg_filter, "*.jpeg");
+  g_list_store_append (filters, jpg_filter);
+
+  g_autoptr (GtkFileFilter) webp_filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (webp_filter, _("WebP Image (*.webp)"));
+  gtk_file_filter_add_pattern (webp_filter, "*.webp");
+  g_list_store_append (filters, webp_filter);
+
+  g_autoptr (GtkFileFilter) bmp_filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (bmp_filter, _("BMP Image (*.bmp)"));
+  gtk_file_filter_add_pattern (bmp_filter, "*.bmp");
+  g_list_store_append (filters, bmp_filter);
+
   g_autoptr (GtkFileFilter) all_filter = gtk_file_filter_new ();
-  gtk_file_filter_set_name (all_filter, "All Files");
+  gtk_file_filter_set_name (all_filter, _("All Files"));
   gtk_file_filter_add_pattern (all_filter, "*");
   g_list_store_append (filters, all_filter);
 
@@ -251,7 +293,7 @@ static void
 prompt_open_file (PaintWindow *self)
 {
   g_autoptr (GtkFileDialog) dialog = gtk_file_dialog_new ();
-  gtk_file_dialog_set_title (dialog, "Open Image");
+  gtk_file_dialog_set_title (dialog, _("Open Image"));
   g_autoptr (GListModel) filters = build_image_filters ();
   gtk_file_dialog_set_filters (dialog, filters);
   gtk_file_dialog_open (dialog, GTK_WINDOW (self), NULL, on_open_dialog_finish, self);
@@ -263,9 +305,9 @@ paint_window_open_file (PaintWindow *self, GFile *file)
   g_autoptr (GError) error = NULL;
   PaintDocument *doc = paint_document_new_from_file (file, &error);
   if (!doc) {
-    AdwDialog *err = adw_alert_dialog_new ("Could Not Open Image",
-                                           error ? error->message : "Unknown error");
-    adw_alert_dialog_add_response (ADW_ALERT_DIALOG (err), "ok", "OK");
+    AdwDialog *err = adw_alert_dialog_new (_("Could Not Open Image"),
+                                           error ? error->message : _("Unknown error"));
+    adw_alert_dialog_add_response (ADW_ALERT_DIALOG (err), "ok", _("OK"));
     adw_dialog_present (err, GTK_WIDGET (self));
     return;
   }
@@ -280,7 +322,7 @@ paint_window_open_file (PaintWindow *self, GFile *file)
         !paint_document_get_file (cur_doc) &&
         !paint_document_can_undo (cur_doc)) {
       paint_canvas_set_document (canvas, doc);
-      sync_window_state (self);
+      paint_window_sync_state (self);
       return;
     }
   }
@@ -288,20 +330,123 @@ paint_window_open_file (PaintWindow *self, GFile *file)
   paint_window_add_new_tab (self, doc);
 }
 
+static void
+import_file_as_layer (PaintWindow *self, GFile *file)
+{
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (!page || !file)
+    return;
+  g_autoptr (GError) err = NULL;
+  g_autoptr (GdkTexture) tex = paint_io_load_file_as_texture (file, &err);
+  if (!tex) {
+    AdwDialog *dlg = adw_alert_dialog_new (_("Could Not Import Image"),
+                                           err ? err->message : _("Unsupported image file."));
+    adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dlg), "ok", _("OK"));
+    adw_dialog_present (dlg, GTK_WIDGET (self));
+    return;
+  }
+  g_autofree char *name = paint_io_layer_name_from_file (file);
+  paint_canvas_add_layer_from_texture (paint_canvas_page_get_canvas (page), name, tex);
+}
+
 typedef struct {
   PaintWindow *window;
   PaintDocument *doc;
+  GFile *target_file;
   void (*callback) (gboolean ok, gpointer data);
   gpointer callback_data;
 } SaveContext;
 
 static void
+save_context_free (SaveContext *ctx)
+{
+  g_clear_object (&ctx->target_file);
+  g_free (ctx);
+}
+
+static void
 show_save_error (PaintWindow *self, const GError *error)
 {
-  AdwDialog *err = adw_alert_dialog_new ("Could Not Save Image",
-                                         error ? error->message : "Unknown error");
-  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (err), "ok", "OK");
+  AdwDialog *err = adw_alert_dialog_new (_("Could Not Save Image"),
+                                         error ? error->message : _("Unknown error"));
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (err), "ok", _("OK"));
   adw_dialog_present (err, GTK_WIDGET (self));
+}
+
+static void
+execute_save_to_file (SaveContext *ctx, GFile *file)
+{
+  gboolean ok = FALSE;
+  g_autoptr (GError) error = NULL;
+  if (paint_document_save_to_file (ctx->doc, file, &error)) {
+    record_recent_file (ctx->window, paint_document_get_file (ctx->doc));
+    paint_window_sync_state (ctx->window);
+    ok = TRUE;
+  } else {
+    show_save_error (ctx->window, error);
+  }
+  if (ctx->callback)
+    ctx->callback (ok, ctx->callback_data);
+  save_context_free (ctx);
+}
+
+static void open_save_file_dialog (SaveContext *ctx, const char *suggested_name);
+
+static void
+on_flatten_warning_response (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  SaveContext *ctx = user_data;
+  const char *choice = adw_alert_dialog_choose_finish (ADW_ALERT_DIALOG (source), res);
+  if (g_strcmp0 (choice, "flatten") == 0) {
+    g_autoptr (GFile) f = g_steal_pointer (&ctx->target_file);
+    execute_save_to_file (ctx, f);
+  } else if (g_strcmp0 (choice, "save-ora") == 0) {
+    GFile *orig = ctx->target_file ? ctx->target_file : paint_document_get_file (ctx->doc);
+    g_autofree char *base = orig ? g_file_get_basename (orig) : g_strdup ("Untitled");
+    char *dot = strrchr (base, '.');
+    if (dot && dot != base)
+      *dot = '\0';
+    g_autofree char *ora_name = g_strconcat (base, ".ora", NULL);
+    g_clear_object (&ctx->target_file);
+    open_save_file_dialog (ctx, ora_name);
+  } else {
+    if (ctx->callback)
+      ctx->callback (FALSE, ctx->callback_data);
+    save_context_free (ctx);
+  }
+}
+
+static void
+save_with_flatten_check (SaveContext *ctx, GFile *file)
+{
+  if (paint_document_has_layer_structure (ctx->doc) && !paint_io_is_ora_file (file)) {
+    ctx->target_file = g_object_ref (file);
+    g_autofree char *base = g_file_get_basename (file);
+    g_autofree char *body = g_strdup_printf (
+        _("This canvas has multiple layers or layer settings. Saving as “%s” will flatten layers in the saved file. Save as OpenRaster (.ora) to keep layers editable."),
+        base ? base : "image");
+
+    AdwDialog *dlg = adw_alert_dialog_new (_("Save Flat Image?"), body);
+    adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dlg),
+                                    "cancel", _("Cancel"),
+                                    "flatten", _("Save Flattened"),
+                                    "save-ora", _("Save as .ora…"),
+                                    NULL);
+    adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dlg),
+                                              "save-ora",
+                                              ADW_RESPONSE_SUGGESTED);
+    adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dlg), "save-ora");
+    adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dlg), "cancel");
+    adw_alert_dialog_set_prefer_wide_layout (ADW_ALERT_DIALOG (dlg), TRUE);
+    adw_alert_dialog_choose (ADW_ALERT_DIALOG (dlg),
+                             GTK_WIDGET (ctx->window),
+                             NULL,
+                             on_flatten_warning_response,
+                             ctx);
+    return;
+  }
+
+  execute_save_to_file (ctx, file);
 }
 
 static void
@@ -310,22 +455,26 @@ on_save_dialog_finish (GObject *source, GAsyncResult *res, gpointer user_data)
   SaveContext *ctx = user_data;
   GtkFileDialog *dialog = GTK_FILE_DIALOG (source);
   g_autoptr (GFile) file = gtk_file_dialog_save_finish (dialog, res, NULL);
-  gboolean ok = FALSE;
 
-  if (file) {
-    g_autoptr (GError) error = NULL;
-    if (paint_document_save_to_file (ctx->doc, file, &error)) {
-      record_recent_file (ctx->window, paint_document_get_file (ctx->doc));
-      sync_window_state (ctx->window);
-      ok = TRUE;
-    } else {
-      show_save_error (ctx->window, error);
-    }
+  if (!file) {
+    if (ctx->callback)
+      ctx->callback (FALSE, ctx->callback_data);
+    save_context_free (ctx);
+    return;
   }
 
-  if (ctx->callback)
-    ctx->callback (ok, ctx->callback_data);
-  g_free (ctx);
+  save_with_flatten_check (ctx, file);
+}
+
+static void
+open_save_file_dialog (SaveContext *ctx, const char *suggested_name)
+{
+  g_autoptr (GtkFileDialog) dialog = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (dialog, _("Save Image"));
+  gtk_file_dialog_set_initial_name (dialog, suggested_name);
+  g_autoptr (GListModel) filters = build_image_filters ();
+  gtk_file_dialog_set_filters (dialog, filters);
+  gtk_file_dialog_save (dialog, GTK_WINDOW (ctx->window), NULL, on_save_dialog_finish, ctx);
 }
 
 static void
@@ -345,28 +494,6 @@ save_current (PaintWindow *self,
   PaintCanvas *canvas = paint_canvas_page_get_canvas (page);
   paint_canvas_commit_active_overlays (canvas);
   PaintDocument *doc = paint_canvas_get_document (canvas);
-  GFile *existing = paint_document_get_file (doc);
-  if (!save_as && existing) {
-    g_autoptr (GError) error = NULL;
-    if (paint_document_save_to_file (doc, existing, &error)) {
-      record_recent_file (self, paint_document_get_file (doc));
-      sync_window_state (self);
-      if (cb)
-        cb (TRUE, user_data);
-    } else {
-      show_save_error (self, error);
-      if (cb)
-        cb (FALSE, user_data);
-    }
-    return;
-  }
-
-  g_autoptr (GtkFileDialog) dialog = gtk_file_dialog_new ();
-  gtk_file_dialog_set_title (dialog, "Save Image");
-  g_autofree char *init_name = existing ? g_file_get_basename (existing) : g_strdup ("Untitled.png");
-  gtk_file_dialog_set_initial_name (dialog, init_name);
-  g_autoptr (GListModel) filters = build_image_filters ();
-  gtk_file_dialog_set_filters (dialog, filters);
 
   SaveContext *ctx = g_new0 (SaveContext, 1);
   ctx->window = self;
@@ -374,7 +501,21 @@ save_current (PaintWindow *self,
   ctx->callback = cb;
   ctx->callback_data = user_data;
 
-  gtk_file_dialog_save (dialog, GTK_WINDOW (self), NULL, on_save_dialog_finish, ctx);
+  GFile *existing = paint_document_get_file (doc);
+  if (!save_as && existing) {
+    save_with_flatten_check (ctx, existing);
+    return;
+  }
+
+  g_autofree char *init_name = NULL;
+  if (existing) {
+    init_name = g_file_get_basename (existing);
+  } else {
+    init_name = g_strdup (paint_document_has_layer_structure (doc)
+                            ? "Untitled.ora"
+                            : "Untitled.png");
+  }
+  open_save_file_dialog (ctx, init_name);
 }
 
 /* ============================================================================
@@ -428,16 +569,16 @@ static AdwDialog *
 create_single_save_changes_dialog (PaintDocument *doc)
 {
   GFile *file = paint_document_get_file (doc);
-  g_autofree char *name = file ? g_file_get_basename (file) : g_strdup ("Untitled Canvas");
+  g_autofree char *name = file ? g_file_get_basename (file) : g_strdup (_("Untitled Canvas"));
   g_autofree char *body = g_strdup_printf (
-      "“%s” contains unsaved changes. Changes which are not saved will be permanently lost.",
+      _("“%s” contains unsaved changes. Changes which are not saved will be permanently lost."),
       name);
 
-  AdwDialog *dlg = adw_alert_dialog_new ("Save Changes?", body);
+  AdwDialog *dlg = adw_alert_dialog_new (_("Save Changes?"), body);
   adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dlg),
-                                  "cancel", "Cancel",
-                                  "discard", "Discard",
-                                  "save", file ? "Save" : "Save…",
+                                  "cancel", _("Cancel"),
+                                  "discard", _("Discard"),
+                                  "save", file ? _("Save") : _("Save…"),
                                   NULL);
   adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dlg),
                                             "discard",
@@ -525,11 +666,11 @@ static char *
 format_folder_for_display (GFile *file)
 {
   if (!file)
-    return g_strdup ("Not saved yet");
+    return g_strdup (_("Not saved yet"));
 
   g_autoptr (GFile) parent = g_file_get_parent (file);
   if (!parent)
-    return g_strdup ("Not saved yet");
+    return g_strdup (_("Not saved yet"));
 
   g_autofree char *path = g_file_get_path (parent);
   if (!path)
@@ -638,8 +779,8 @@ on_discard_window_response (GObject *source, GAsyncResult *res, gpointer user_da
   window_close_context_free (ctx);
 }
 
-static PaintPreferences *
-get_app_preferences (PaintWindow *self)
+PaintPreferences *
+paint_window_get_preferences (PaintWindow *self)
 {
   GtkApplication *app = self ? gtk_window_get_application (GTK_WINDOW (self)) : NULL;
   if (!app)
@@ -649,10 +790,10 @@ get_app_preferences (PaintWindow *self)
   return NULL;
 }
 
-static void
-compute_fit_window_size (PaintWindow *self, int *out_w, int *out_h)
+void
+paint_window_compute_fit_window_size (PaintWindow *self, int *out_w, int *out_h)
 {
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   int doc_w = prefs ? prefs->default_width : PAINT_DEFAULT_CANVAS_WIDTH;
   int doc_h = prefs ? prefs->default_height : PAINT_DEFAULT_CANVAS_HEIGHT;
 
@@ -725,7 +866,7 @@ on_startup_fit_tick (GtkWidget *widget,
                          self->startup_fit_attempts < 15;
   gboolean fitted = paint_canvas_page_zoom_fit (page);
   if (fitted)
-    sync_window_state (self);
+    paint_window_sync_state (self);
 
   if ((!fitted || cur_w != self->startup_fit_last_w ||
        cur_h != self->startup_fit_last_h || max_pending) &&
@@ -739,8 +880,8 @@ on_startup_fit_tick (GtkWidget *widget,
   return G_SOURCE_REMOVE;
 }
 
-static void
-schedule_startup_fit (PaintWindow *self, gboolean expect_maximize)
+void
+paint_window_schedule_startup_fit (PaintWindow *self, gboolean expect_maximize)
 {
   if (self->startup_fit_tick_id != 0) {
     gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->startup_fit_tick_id);
@@ -756,14 +897,34 @@ schedule_startup_fit (PaintWindow *self, gboolean expect_maximize)
                                                             NULL);
 }
 
+static void
+sync_tool_settings_colors_to_prefs (PaintWindow *self)
+{
+  PaintPreferences *prefs = paint_window_get_preferences (self);
+  if (!prefs || !self->shared_settings)
+    return;
+
+  int n_rec = CLAMP (self->shared_settings->n_recent_colors, 0, PAINT_PREFS_MAX_RECENT_COLORS);
+  prefs->n_recent_colors = n_rec;
+  for (int i = 0; i < n_rec; i++)
+    prefs->recent_colors[i] = self->shared_settings->recent_colors[i];
+
+  int n_cust = CLAMP (self->shared_settings->n_custom_colors, 0, PAINT_PREFS_MAX_CUSTOM_COLORS);
+  prefs->n_custom_colors = n_cust;
+  for (int i = 0; i < n_cust; i++)
+    prefs->custom_colors[i] = self->shared_settings->custom_colors[i];
+}
+
 void
 paint_window_save_window_state (PaintWindow *self)
 {
   if (!self)
     return;
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   if (!prefs)
     return;
+
+  sync_tool_settings_colors_to_prefs (self);
 
   gboolean maximized = gtk_window_is_maximized (GTK_WINDOW (self));
   gboolean fullscreen = gtk_window_is_fullscreen (GTK_WINDOW (self));
@@ -784,7 +945,7 @@ paint_window_apply_startup_sizing (PaintWindow *self)
 {
   if (!self)
     return;
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   PaintStartupWindowMode mode = prefs ? prefs->startup_window_mode : PAINT_WINDOW_SIZE_REMEMBER;
   gboolean expect_maximize = FALSE;
 
@@ -792,7 +953,7 @@ paint_window_apply_startup_sizing (PaintWindow *self)
   case PAINT_WINDOW_SIZE_FIT_CANVAS: {
     int w = PAINT_DEFAULT_WINDOW_WIDTH;
     int h = PAINT_DEFAULT_WINDOW_HEIGHT;
-    compute_fit_window_size (self, &w, &h);
+    paint_window_compute_fit_window_size (self, &w, &h);
     gtk_window_set_default_size (GTK_WINDOW (self), w, h);
     break;
   }
@@ -819,313 +980,7 @@ paint_window_apply_startup_sizing (PaintWindow *self)
   }
 
   if (prefs && prefs->fit_canvas_on_startup)
-    schedule_startup_fit (self, expect_maximize);
-}
-
-static char *
-session_dir_path (void)
-{
-  return g_build_filename (g_get_user_state_dir (), "paint", "session", NULL);
-}
-
-void
-paint_window_clear_session (void)
-{
-  g_autofree char *dir = session_dir_path ();
-  if (!g_file_test (dir, G_FILE_TEST_IS_DIR))
-    return;
-
-  GDir *d = g_dir_open (dir, 0, NULL);
-  if (d) {
-    const char *name;
-    while ((name = g_dir_read_name (d)) != NULL) {
-      g_autofree char *full = g_build_filename (dir, name, NULL);
-      g_unlink (full);
-    }
-    g_dir_close (d);
-  }
-}
-
-void
-paint_window_save_all_sessions (AdwApplication *app)
-{
-  paint_window_clear_session ();
-
-  g_autofree char *dir = session_dir_path ();
-  g_mkdir_with_parents (dir, 0755);
-
-  g_autoptr (GKeyFile) kf = g_key_file_new ();
-  int win_idx = 0;
-
-  for (GList *l = gtk_application_get_windows (GTK_APPLICATION (app)); l != NULL; l = l->next) {
-    if (!PAINT_IS_WINDOW (l->data))
-      continue;
-    PaintWindow *win = PAINT_WINDOW (l->data);
-    int n_pages = adw_tab_view_get_n_pages (win->tab_view);
-    if (n_pages == 0)
-      continue;
-
-    g_autofree char *win_grp = g_strdup_printf ("Window.%d", win_idx);
-    PaintPreferences *prefs = get_app_preferences (win);
-    gboolean is_max = gtk_window_is_maximized (GTK_WINDOW (win));
-    gboolean is_fs = gtk_window_is_fullscreen (GTK_WINDOW (win));
-    g_key_file_set_boolean (kf, win_grp, "Maximized", is_max);
-    int w_width = (!is_max && !is_fs)
-                    ? gtk_widget_get_width (GTK_WIDGET (win))
-                    : (prefs ? prefs->last_window_width : 0);
-    int w_height = (!is_max && !is_fs)
-                     ? gtk_widget_get_height (GTK_WIDGET (win))
-                     : (prefs ? prefs->last_window_height : 0);
-    if (w_width >= 360 && w_height >= 300) {
-      g_key_file_set_integer (kf, win_grp, "Width", w_width);
-      g_key_file_set_integer (kf, win_grp, "Height", w_height);
-    }
-
-    AdwTabPage *selected = adw_tab_view_get_selected_page (win->tab_view);
-    int active_idx = 0;
-    int saved_tabs = 0;
-
-    for (int i = 0; i < n_pages; i++) {
-      AdwTabPage *tab = adw_tab_view_get_nth_page (win->tab_view, i);
-      GtkWidget *child = adw_tab_page_get_child (tab);
-      if (!PAINT_IS_CANVAS_PAGE (child))
-        continue;
-      if (tab == selected)
-        active_idx = saved_tabs;
-
-      PaintCanvasPage *page = PAINT_CANVAS_PAGE (child);
-      PaintCanvas *canvas = paint_canvas_page_get_canvas (page);
-      paint_canvas_commit_active_overlays (canvas);
-      PaintDocument *doc = paint_canvas_get_document (canvas);
-
-      g_autofree char *tab_grp = g_strdup_printf ("Tab.%d.%d", win_idx, saved_tabs);
-      GFile *orig_file = paint_document_get_file (doc);
-      gboolean modified = paint_document_get_modified (doc);
-
-      if (orig_file) {
-        g_autofree char *orig_path = g_file_get_path (orig_file);
-        if (orig_path)
-          g_key_file_set_string (kf, tab_grp, "FilePath", orig_path);
-      }
-
-      int n_layers = paint_document_get_n_layers (doc);
-      gboolean multi_or_custom = (n_layers > 1) ||
-                                 !paint_document_layer_get_visible (doc, 0) ||
-                                 paint_document_layer_get_opacity (doc, 0) < 0.999 ||
-                                 paint_document_layer_get_blend_mode (doc, 0) != PAINT_BLEND_NORMAL;
-      if (multi_or_custom) {
-        g_key_file_set_integer (kf, tab_grp, "LayerCount", n_layers);
-        g_key_file_set_integer (kf, tab_grp, "ActiveLayer", paint_document_get_active_layer (doc));
-        for (int li = 0; li < n_layers; li++) {
-          g_autofree char *draft_name = g_strdup_printf ("draft-%d-%d-L%d.png", win_idx, saved_tabs, li);
-          g_autofree char *draft_path = g_build_filename (dir, draft_name, NULL);
-          cairo_surface_t *lsurf = paint_document_layer_get_surface (doc, li);
-          if (lsurf && cairo_surface_write_to_png (lsurf, draft_path) == CAIRO_STATUS_SUCCESS) {
-            g_autofree char *k_file = g_strdup_printf ("Layer.%d.File", li);
-            g_autofree char *k_name = g_strdup_printf ("Layer.%d.Name", li);
-            g_autofree char *k_vis = g_strdup_printf ("Layer.%d.Visible", li);
-            g_autofree char *k_op = g_strdup_printf ("Layer.%d.Opacity", li);
-            g_autofree char *k_blend = g_strdup_printf ("Layer.%d.BlendMode", li);
-            g_key_file_set_string (kf, tab_grp, k_file, draft_name);
-            g_key_file_set_string (kf, tab_grp, k_name, paint_document_layer_get_name (doc, li));
-            g_key_file_set_boolean (kf, tab_grp, k_vis, paint_document_layer_get_visible (doc, li));
-            g_key_file_set_double (kf, tab_grp, k_op, paint_document_layer_get_opacity (doc, li));
-            g_key_file_set_integer (kf, tab_grp, k_blend, (int) paint_document_layer_get_blend_mode (doc, li));
-          }
-        }
-      } else if (modified || !orig_file) {
-        g_autofree char *draft_name = g_strdup_printf ("draft-%d-%d.png", win_idx, saved_tabs);
-        g_autofree char *draft_path = g_build_filename (dir, draft_name, NULL);
-        if (cairo_surface_write_to_png (paint_document_get_surface (doc), draft_path) == CAIRO_STATUS_SUCCESS)
-          g_key_file_set_string (kf, tab_grp, "DraftFile", draft_name);
-      }
-
-      g_key_file_set_boolean (kf, tab_grp, "Modified", modified);
-      g_key_file_set_double (kf, tab_grp, "Zoom", paint_canvas_get_zoom (canvas));
-      saved_tabs++;
-    }
-
-    g_key_file_set_integer (kf, win_grp, "TabCount", saved_tabs);
-    g_key_file_set_integer (kf, win_grp, "ActiveTab", active_idx);
-    win_idx++;
-  }
-
-  g_key_file_set_integer (kf, "Session", "WindowCount", win_idx);
-  g_autofree char *ini_path = g_build_filename (dir, "session.ini", NULL);
-  g_key_file_save_to_file (kf, ini_path, NULL);
-}
-
-gboolean
-paint_window_restore_session (AdwApplication *app)
-{
-  g_autofree char *dir = session_dir_path ();
-  g_autofree char *ini_path = g_build_filename (dir, "session.ini", NULL);
-  g_autoptr (GKeyFile) kf = g_key_file_new ();
-  if (!g_key_file_load_from_file (kf, ini_path, G_KEY_FILE_NONE, NULL))
-    return FALSE;
-
-  int win_count = g_key_file_get_integer (kf, "Session", "WindowCount", NULL);
-  if (win_count <= 0)
-    return FALSE;
-
-  gboolean restored_any = FALSE;
-  for (int w = 0; w < win_count; w++) {
-    g_autofree char *win_grp = g_strdup_printf ("Window.%d", w);
-    int tab_count = g_key_file_get_integer (kf, win_grp, "TabCount", NULL);
-    if (tab_count <= 0)
-      continue;
-
-    PaintWindow *win = paint_window_new_empty (app);
-
-    for (int t = 0; t < tab_count; t++) {
-      g_autofree char *tab_grp = g_strdup_printf ("Tab.%d.%d", w, t);
-      g_autofree char *file_path = g_key_file_get_string (kf, tab_grp, "FilePath", NULL);
-      g_autofree char *draft_name = g_key_file_get_string (kf, tab_grp, "DraftFile", NULL);
-      gboolean modified = g_key_file_get_boolean (kf, tab_grp, "Modified", NULL);
-      double zoom = g_key_file_has_key (kf, tab_grp, "Zoom", NULL)
-                      ? g_key_file_get_double (kf, tab_grp, "Zoom", NULL)
-                      : 1.0;
-
-      g_autoptr (GFile) orig_file = file_path ? g_file_new_for_path (file_path) : NULL;
-      PaintDocument *doc = NULL;
-      int layer_count = g_key_file_has_key (kf, tab_grp, "LayerCount", NULL)
-                          ? g_key_file_get_integer (kf, tab_grp, "LayerCount", NULL)
-                          : 0;
-      if (layer_count >= 1) {
-        g_autofree char *l0_file_name = g_key_file_get_string (kf, tab_grp, "Layer.0.File", NULL);
-        if (l0_file_name) {
-          g_autofree char *l0_path = g_build_filename (dir, l0_file_name, NULL);
-          g_autoptr (GFile) l0_file = g_file_new_for_path (l0_path);
-          doc = paint_document_new_from_draft (l0_file, orig_file, modified, NULL);
-        }
-        if (doc) {
-          g_autofree char *l0_name = g_key_file_get_string (kf, tab_grp, "Layer.0.Name", NULL);
-          if (l0_name)
-            paint_document_layer_set_name (doc, 0, l0_name);
-          gboolean l0_vis = g_key_file_has_key (kf, tab_grp, "Layer.0.Visible", NULL)
-                              ? g_key_file_get_boolean (kf, tab_grp, "Layer.0.Visible", NULL)
-                              : TRUE;
-          paint_document_layer_set_visible (doc, 0, l0_vis);
-          double l0_op = g_key_file_has_key (kf, tab_grp, "Layer.0.Opacity", NULL)
-                           ? g_key_file_get_double (kf, tab_grp, "Layer.0.Opacity", NULL)
-                           : 1.0;
-          paint_document_layer_set_opacity (doc, 0, l0_op);
-          int l0_blend = g_key_file_has_key (kf, tab_grp, "Layer.0.BlendMode", NULL)
-                           ? g_key_file_get_integer (kf, tab_grp, "Layer.0.BlendMode", NULL)
-                           : PAINT_BLEND_NORMAL;
-          paint_document_layer_set_blend_mode (
-              doc, 0, (PaintBlendMode) CLAMP (l0_blend, 0, PAINT_BLEND_LIGHTEN));
-
-          for (int li = 1; li < layer_count; li++) {
-            g_autofree char *k_file = g_strdup_printf ("Layer.%d.File", li);
-            g_autofree char *k_name = g_strdup_printf ("Layer.%d.Name", li);
-            g_autofree char *k_vis = g_strdup_printf ("Layer.%d.Visible", li);
-            g_autofree char *k_op = g_strdup_printf ("Layer.%d.Opacity", li);
-            g_autofree char *k_blend = g_strdup_printf ("Layer.%d.BlendMode", li);
-
-            g_autofree char *lfile_name = g_key_file_get_string (kf, tab_grp, k_file, NULL);
-            g_autofree char *lname = g_key_file_get_string (kf, tab_grp, k_name, NULL);
-            gboolean lvis = g_key_file_has_key (kf, tab_grp, k_vis, NULL)
-                              ? g_key_file_get_boolean (kf, tab_grp, k_vis, NULL)
-                              : TRUE;
-            double lop = g_key_file_has_key (kf, tab_grp, k_op, NULL)
-                           ? g_key_file_get_double (kf, tab_grp, k_op, NULL)
-                           : 1.0;
-            int lblend = g_key_file_has_key (kf, tab_grp, k_blend, NULL)
-                           ? g_key_file_get_integer (kf, tab_grp, k_blend, NULL)
-                           : PAINT_BLEND_NORMAL;
-
-            if (lfile_name) {
-              g_autofree char *lpath = g_build_filename (dir, lfile_name, NULL);
-              g_autoptr (GFile) lfile = g_file_new_for_path (lpath);
-              paint_document_append_restored_layer (
-                  doc,
-                  lname ? lname : "Layer",
-                  lfile,
-                  lvis,
-                  lop,
-                  (PaintBlendMode) CLAMP (lblend, 0, PAINT_BLEND_LIGHTEN));
-            }
-          }
-
-          int active_layer = g_key_file_has_key (kf, tab_grp, "ActiveLayer", NULL)
-                               ? g_key_file_get_integer (kf, tab_grp, "ActiveLayer", NULL)
-                               : 0;
-          paint_document_finish_session_restore (doc, active_layer, modified);
-        }
-      } else if (draft_name) {
-        g_autofree char *draft_path = g_build_filename (dir, draft_name, NULL);
-        g_autoptr (GFile) draft_file = g_file_new_for_path (draft_path);
-        doc = paint_document_new_from_draft (draft_file, orig_file, modified, NULL);
-      } else if (orig_file && g_file_query_exists (orig_file, NULL)) {
-        doc = paint_document_new_from_file (orig_file, NULL);
-      }
-
-      if (doc) {
-        AdwTabPage *tab = paint_window_add_new_tab (win, doc);
-        GtkWidget *child = adw_tab_page_get_child (tab);
-        if (PAINT_IS_CANVAS_PAGE (child))
-          paint_canvas_set_zoom (paint_canvas_page_get_canvas (PAINT_CANVAS_PAGE (child)), zoom);
-      }
-    }
-
-    if (adw_tab_view_get_n_pages (win->tab_view) == 0) {
-      gtk_window_destroy (GTK_WINDOW (win));
-      continue;
-    }
-
-    int active = g_key_file_get_integer (kf, win_grp, "ActiveTab", NULL);
-    int n_pages = adw_tab_view_get_n_pages (win->tab_view);
-    if (active >= 0 && active < n_pages)
-      adw_tab_view_set_selected_page (win->tab_view,
-                                      adw_tab_view_get_nth_page (win->tab_view, active));
-
-    PaintPreferences *prefs = get_app_preferences (win);
-    PaintStartupWindowMode mode = prefs ? prefs->startup_window_mode : PAINT_WINDOW_SIZE_REMEMBER;
-    gboolean expect_maximize = FALSE;
-
-    switch (mode) {
-    case PAINT_WINDOW_SIZE_FIT_CANVAS: {
-      int fit_w = PAINT_DEFAULT_WINDOW_WIDTH;
-      int fit_h = PAINT_DEFAULT_WINDOW_HEIGHT;
-      compute_fit_window_size (win, &fit_w, &fit_h);
-      gtk_window_set_default_size (GTK_WINDOW (win), fit_w, fit_h);
-      break;
-    }
-    case PAINT_WINDOW_SIZE_DEFAULT:
-      gtk_window_set_default_size (GTK_WINDOW (win),
-                                   PAINT_DEFAULT_WINDOW_WIDTH,
-                                   PAINT_DEFAULT_WINDOW_HEIGHT);
-      break;
-    case PAINT_WINDOW_SIZE_REMEMBER:
-    default: {
-      int win_w = g_key_file_get_integer (kf, win_grp, "Width", NULL);
-      int win_h = g_key_file_get_integer (kf, win_grp, "Height", NULL);
-      if (win_w < 360 || win_h < 300) {
-        win_w = prefs ? prefs->last_window_width : PAINT_DEFAULT_WINDOW_WIDTH;
-        win_h = prefs ? prefs->last_window_height : PAINT_DEFAULT_WINDOW_HEIGHT;
-      }
-      if (win_w >= 360 && win_h >= 300)
-        gtk_window_set_default_size (GTK_WINDOW (win), win_w, win_h);
-      gboolean win_max = g_key_file_has_key (kf, win_grp, "Maximized", NULL)
-                           ? g_key_file_get_boolean (kf, win_grp, "Maximized", NULL)
-                           : (prefs ? prefs->last_window_maximized : FALSE);
-      if (win_max) {
-        gtk_window_maximize (GTK_WINDOW (win));
-        expect_maximize = TRUE;
-      }
-      break;
-    }
-    }
-
-    sync_window_state (win);
-    if (prefs && prefs->fit_canvas_on_startup)
-      schedule_startup_fit (win, expect_maximize);
-    gtk_window_present (GTK_WINDOW (win));
-    restored_any = TRUE;
-  }
-
-  return restored_any;
+    paint_window_schedule_startup_fit (self, expect_maximize);
 }
 
 static gboolean
@@ -1133,7 +988,7 @@ on_window_close_request (GtkWindow *window, gpointer user_data G_GNUC_UNUSED)
 {
   PaintWindow *self = PAINT_WINDOW (window);
   GtkApplication *app = gtk_window_get_application (window);
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
 
   guint open_paint_windows = 0;
   if (app) {
@@ -1144,6 +999,7 @@ on_window_close_request (GtkWindow *window, gpointer user_data G_GNUC_UNUSED)
   }
 
   if (prefs && prefs->restore_session && open_paint_windows <= 1) {
+    paint_session_cancel_autosave ();
     paint_window_save_window_state (self);
     paint_window_save_all_sessions (ADW_APPLICATION (app));
     return FALSE;
@@ -1186,12 +1042,12 @@ on_window_close_request (GtkWindow *window, gpointer user_data G_GNUC_UNUSED)
     g_ptr_array_add (ctx->items, item);
   } else {
     dlg = adw_alert_dialog_new (
-        "Save Changes?",
-        "Open canvases contain unsaved changes. Changes which are not saved will be permanently lost.");
+        _("Save Changes?"),
+        _("Open canvases contain unsaved changes. Changes which are not saved will be permanently lost."));
     adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dlg),
-                                    "cancel", "Cancel",
-                                    "discard", "Discard All",
-                                    "save", "Save",
+                                    "cancel", _("Cancel"),
+                                    "discard", _("Discard All"),
+                                    "save", _("Save"),
                                     NULL);
     adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dlg),
                                               "discard",
@@ -1213,7 +1069,7 @@ on_window_close_request (GtkWindow *window, gpointer user_data G_GNUC_UNUSED)
           paint_canvas_page_get_canvas (PAINT_CANVAS_PAGE (adw_tab_page_get_child (tab))));
       GFile *file = paint_document_get_file (doc);
       g_autofree char *raw_title = file ? g_file_get_basename (file)
-                                        : g_strdup ("Untitled Canvas (new)");
+                                        : g_strdup (_("Untitled Canvas (new)"));
       g_autofree char *raw_sub = format_folder_for_display (file);
       g_autofree char *title = g_markup_escape_text (raw_title, -1);
       g_autofree char *sub = g_markup_escape_text (raw_sub, -1);
@@ -1247,230 +1103,6 @@ on_window_close_request (GtkWindow *window, gpointer user_data G_GNUC_UNUSED)
                            on_discard_window_response,
                            ctx);
   return TRUE;
-}
-
-/* ============================================================================
- * Clear & Resize Dialogs
- * ============================================================================ */
-
-static void
-on_clear_dialog_response (GObject *source, GAsyncResult *res, gpointer user_data)
-{
-  PaintWindow *self = PAINT_WINDOW (user_data);
-  if (g_strcmp0 (adw_alert_dialog_choose_finish (ADW_ALERT_DIALOG (source), res), "clear") == 0) {
-    PaintCanvasPage *page = get_active_canvas_page (self);
-    if (page)
-      paint_canvas_clear (paint_canvas_page_get_canvas (page));
-  }
-}
-
-static void
-confirm_clear_canvas (PaintWindow *self)
-{
-  PaintCanvasPage *page = get_active_canvas_page (self);
-  if (!page)
-    return;
-  PaintDocument *doc = paint_canvas_get_document (paint_canvas_page_get_canvas (page));
-  const char *body = paint_document_has_transparent_background (doc)
-                       ? "This will clear the entire canvas to transparent. You can still undo this action."
-                       : "This will fill the entire canvas with the background color. You can still undo this action.";
-  AdwDialog *dlg = adw_alert_dialog_new ("Clear Canvas?", body);
-  adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dlg),
-                                  "cancel", "Cancel",
-                                  "clear", "Clear",
-                                  NULL);
-  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dlg),
-                                            "clear",
-                                            ADW_RESPONSE_DESTRUCTIVE);
-  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dlg), "cancel");
-  adw_alert_dialog_choose (ADW_ALERT_DIALOG (dlg),
-                           GTK_WIDGET (self),
-                           NULL,
-                           on_clear_dialog_response,
-                           self);
-}
-
-typedef struct {
-  PaintCanvas *canvas;
-  AdwDialog *dialog;
-  AdwComboRow *mode_row;
-  AdwSwitchRow *aspect_row;
-  AdwSpinRow *w_row;
-  AdwSpinRow *h_row;
-  GtkWidget *apply_btn;
-  double aspect_ratio;
-  gboolean updating;
-} ResizeContext;
-
-static void
-on_resize_mode_changed (GObject *obj G_GNUC_UNUSED,
-                        GParamSpec *pspec G_GNUC_UNUSED,
-                        gpointer user_data)
-{
-  ResizeContext *ctx = user_data;
-  guint mode = adw_combo_row_get_selected (ctx->mode_row);
-  if (ctx->apply_btn)
-    gtk_button_set_label (GTK_BUTTON (ctx->apply_btn), (mode == 1) ? "Scale" : "Resize");
-  if (mode == 1 && !adw_switch_row_get_active (ctx->aspect_row)) {
-    ctx->updating = TRUE;
-    adw_switch_row_set_active (ctx->aspect_row, TRUE);
-    ctx->updating = FALSE;
-  }
-}
-
-static void
-on_resize_width_changed (GObject *obj G_GNUC_UNUSED,
-                         GParamSpec *pspec G_GNUC_UNUSED,
-                         gpointer user_data)
-{
-  ResizeContext *ctx = user_data;
-  if (ctx->updating || !adw_switch_row_get_active (ctx->aspect_row))
-    return;
-  ctx->updating = TRUE;
-  double w = adw_spin_row_get_value (ctx->w_row);
-  double h = CLAMP (round (w / ctx->aspect_ratio), 1.0, 8192.0);
-  adw_spin_row_set_value (ctx->h_row, h);
-  ctx->updating = FALSE;
-}
-
-static void
-on_resize_height_changed (GObject *obj G_GNUC_UNUSED,
-                          GParamSpec *pspec G_GNUC_UNUSED,
-                          gpointer user_data)
-{
-  ResizeContext *ctx = user_data;
-  if (ctx->updating || !adw_switch_row_get_active (ctx->aspect_row))
-    return;
-  ctx->updating = TRUE;
-  double h = adw_spin_row_get_value (ctx->h_row);
-  double w = CLAMP (round (h * ctx->aspect_ratio), 1.0, 8192.0);
-  adw_spin_row_set_value (ctx->w_row, w);
-  ctx->updating = FALSE;
-}
-
-static void
-on_resize_preset_clicked (GtkButton *btn, gpointer user_data)
-{
-  ResizeContext *ctx = user_data;
-  int w = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (btn), "preset-w"));
-  int h = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (btn), "preset-h"));
-  ctx->updating = TRUE;
-  adw_spin_row_set_value (ctx->w_row, (double) w);
-  adw_spin_row_set_value (ctx->h_row, (double) h);
-  ctx->updating = FALSE;
-}
-
-static void
-on_resize_apply (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
-{
-  ResizeContext *ctx = user_data;
-  int w = (int) lround (adw_spin_row_get_value (ctx->w_row));
-  int h = (int) lround (adw_spin_row_get_value (ctx->h_row));
-  if (adw_combo_row_get_selected (ctx->mode_row) == 1)
-    paint_canvas_scale (ctx->canvas, w, h);
-  else
-    paint_canvas_resize (ctx->canvas, w, h);
-  adw_dialog_close (ctx->dialog);
-}
-
-static void
-show_resize_dialog (PaintWindow *self)
-{
-  PaintCanvasPage *page = get_active_canvas_page (self);
-  if (!page)
-    return;
-  PaintCanvas *canvas = paint_canvas_page_get_canvas (page);
-  PaintDocument *doc = paint_canvas_get_document (canvas);
-  int orig_w = paint_document_get_width (doc);
-  int orig_h = paint_document_get_height (doc);
-
-  AdwDialog *dialog = adw_dialog_new ();
-  adw_dialog_set_title (dialog, "Resize & Scale");
-  adw_dialog_set_content_width (dialog, 360);
-
-  GtkWidget *toolbar = adw_toolbar_view_new ();
-  GtkWidget *header = adw_header_bar_new ();
-  adw_header_bar_set_show_start_title_buttons (ADW_HEADER_BAR (header), FALSE);
-  adw_header_bar_set_show_end_title_buttons (ADW_HEADER_BAR (header), FALSE);
-
-  GtkWidget *cancel_btn = gtk_button_new_with_label ("Cancel");
-  g_signal_connect_swapped (cancel_btn, "clicked", G_CALLBACK (adw_dialog_close), dialog);
-  adw_header_bar_pack_start (ADW_HEADER_BAR (header), cancel_btn);
-
-  GtkWidget *apply_btn = gtk_button_new_with_label ("Resize");
-  gtk_widget_add_css_class (apply_btn, "suggested-action");
-  adw_header_bar_pack_end (ADW_HEADER_BAR (header), apply_btn);
-  adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (toolbar), header);
-
-  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 14);
-  gtk_widget_set_margin_top (content, 16);
-  gtk_widget_set_margin_bottom (content, 16);
-  gtk_widget_set_margin_start (content, 16);
-  gtk_widget_set_margin_end (content, 16);
-
-  GtkWidget *group = adw_preferences_group_new ();
-
-  static const char *const MODES[] = { "Crop / Pad Canvas", "Scale Image", NULL };
-  GtkWidget *mode_row = adw_combo_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (mode_row), "Mode");
-  g_autoptr (GtkStringList) mode_model = gtk_string_list_new (MODES);
-  adw_combo_row_set_model (ADW_COMBO_ROW (mode_row), G_LIST_MODEL (mode_model));
-  adw_preferences_group_add (ADW_PREFERENCES_GROUP (group), mode_row);
-
-  GtkWidget *aspect_row = adw_switch_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (aspect_row), "Keep Aspect Ratio");
-  adw_preferences_group_add (ADW_PREFERENCES_GROUP (group), aspect_row);
-
-  GtkWidget *w_row = adw_spin_row_new_with_range (1.0, 8192.0, 16.0);
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (w_row), "Width (px)");
-  adw_spin_row_set_value (ADW_SPIN_ROW (w_row), (double) orig_w);
-  adw_preferences_group_add (ADW_PREFERENCES_GROUP (group), w_row);
-
-  GtkWidget *h_row = adw_spin_row_new_with_range (1.0, 8192.0, 16.0);
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (h_row), "Height (px)");
-  adw_spin_row_set_value (ADW_SPIN_ROW (h_row), (double) orig_h);
-  adw_preferences_group_add (ADW_PREFERENCES_GROUP (group), h_row);
-  gtk_box_append (GTK_BOX (content), group);
-
-  ResizeContext *ctx = g_new0 (ResizeContext, 1);
-  ctx->canvas = canvas;
-  ctx->dialog = dialog;
-  ctx->mode_row = ADW_COMBO_ROW (mode_row);
-  ctx->aspect_row = ADW_SWITCH_ROW (aspect_row);
-  ctx->w_row = ADW_SPIN_ROW (w_row);
-  ctx->h_row = ADW_SPIN_ROW (h_row);
-  ctx->apply_btn = apply_btn;
-  ctx->aspect_ratio = (double) MAX (1, orig_w) / (double) MAX (1, orig_h);
-  g_object_set_data_full (G_OBJECT (dialog), "resize-ctx", ctx, g_free);
-
-  g_signal_connect (mode_row, "notify::selected", G_CALLBACK (on_resize_mode_changed), ctx);
-  g_signal_connect (w_row, "notify::value", G_CALLBACK (on_resize_width_changed), ctx);
-  g_signal_connect (h_row, "notify::value", G_CALLBACK (on_resize_height_changed), ctx);
-
-  static const int PRESETS[][2] = {
-    { PAINT_DEFAULT_CANVAS_WIDTH, PAINT_DEFAULT_CANVAS_HEIGHT },
-    { 800, 500 },
-    { 1024, 1024 },
-    { 1280, 720 },
-  };
-  GtkWidget *presets = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
-  gtk_widget_set_halign (presets, GTK_ALIGN_CENTER);
-  for (gsize i = 0; i < G_N_ELEMENTS (PRESETS); i++) {
-    g_autofree char *lbl = g_strdup_printf ("%d×%d", PRESETS[i][0], PRESETS[i][1]);
-    GtkWidget *pbtn = gtk_button_new_with_label (lbl);
-    gtk_widget_add_css_class (pbtn, "pill");
-    g_object_set_data (G_OBJECT (pbtn), "preset-w", GINT_TO_POINTER (PRESETS[i][0]));
-    g_object_set_data (G_OBJECT (pbtn), "preset-h", GINT_TO_POINTER (PRESETS[i][1]));
-    g_signal_connect (pbtn, "clicked", G_CALLBACK (on_resize_preset_clicked), ctx);
-    gtk_box_append (GTK_BOX (presets), pbtn);
-  }
-  gtk_box_append (GTK_BOX (content), presets);
-
-  g_signal_connect (apply_btn, "clicked", G_CALLBACK (on_resize_apply), ctx);
-
-  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), content);
-  adw_dialog_set_child (dialog, toolbar);
-  adw_dialog_present (dialog, GTK_WIDGET (self));
 }
 
 /* ============================================================================
@@ -1513,6 +1145,105 @@ static void act_save_as (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUS
   save_current (PAINT_WINDOW (d), TRUE, NULL, NULL);
 }
 
+static void
+on_export_done (GFile *exported_file, gpointer user_data)
+{
+  PaintWindow *self = PAINT_WINDOW (user_data);
+  if (exported_file)
+    record_recent_file (self, exported_file);
+}
+
+static void act_export_image (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (!page)
+    return;
+  PaintCanvas *canvas = paint_canvas_page_get_canvas (page);
+  paint_canvas_commit_active_overlays (canvas);
+  paint_dialog_show_export (GTK_WIDGET (self),
+                            paint_canvas_get_document (canvas),
+                            on_export_done,
+                            self);
+}
+
+static void
+on_print_draw_page (GtkPrintOperation *op G_GNUC_UNUSED,
+                    GtkPrintContext *context,
+                    int page_nr G_GNUC_UNUSED,
+                    gpointer user_data)
+{
+  cairo_surface_t *surf = user_data;
+  if (!surf || !context)
+    return;
+
+  cairo_t *cr = gtk_print_context_get_cairo_context (context);
+  double pw = gtk_print_context_get_width (context);
+  double ph = gtk_print_context_get_height (context);
+  int sw = cairo_image_surface_get_width (surf);
+  int sh = cairo_image_surface_get_height (surf);
+  if (sw <= 0 || sh <= 0 || pw <= 0.0 || ph <= 0.0)
+    return;
+
+  double scale = MIN (pw / (double) sw, ph / (double) sh);
+  double dx = (pw - (double) sw * scale) * 0.5;
+  double dy = (ph - (double) sh * scale) * 0.5;
+
+  cairo_save (cr);
+  cairo_translate (cr, dx, dy);
+  cairo_scale (cr, scale, scale);
+  cairo_set_source_surface (cr, surf, 0.0, 0.0);
+  cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BEST);
+  cairo_paint (cr);
+  cairo_restore (cr);
+}
+
+static void act_print (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (!page)
+    return;
+
+  PaintCanvas *canvas = paint_canvas_page_get_canvas (page);
+  paint_canvas_commit_active_overlays (canvas);
+  PaintDocument *doc = paint_canvas_get_document (canvas);
+  cairo_surface_t *src = doc ? paint_document_get_surface (doc) : NULL;
+  if (!src)
+    return;
+
+  int w = cairo_image_surface_get_width (src);
+  int h = cairo_image_surface_get_height (src);
+  cairo_surface_t *snapshot = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
+  cairo_t *cr = cairo_create (snapshot);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_surface (cr, src, 0.0, 0.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+
+  g_autoptr (GtkPrintOperation) op = gtk_print_operation_new ();
+  gtk_print_operation_set_n_pages (op, 1);
+  gtk_print_operation_set_use_full_page (op, FALSE);
+  g_object_set_data_full (G_OBJECT (op),
+                          "print-snapshot",
+                          snapshot,
+                          (GDestroyNotify) cairo_surface_destroy);
+  g_signal_connect (op, "draw-page", G_CALLBACK (on_print_draw_page), snapshot);
+
+  g_autoptr (GError) err = NULL;
+  GtkPrintOperationResult res = gtk_print_operation_run (
+      op,
+      GTK_PRINT_OPERATION_ACTION_PRINT_DIALOG,
+      GTK_WINDOW (self),
+      &err);
+  if (res == GTK_PRINT_OPERATION_RESULT_ERROR) {
+    AdwDialog *dlg = adw_alert_dialog_new (_("Could Not Print Image"),
+                                           err ? err->message : _("Unknown printing error."));
+    adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dlg), "ok", _("OK"));
+    adw_dialog_present (dlg, GTK_WIDGET (self));
+  }
+}
+
 static void act_undo (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
   PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
@@ -1529,19 +1260,25 @@ static void act_redo (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED,
 
 static void act_clear (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
-  confirm_clear_canvas (PAINT_WINDOW (d));
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (page)
+    paint_dialog_confirm_clear (GTK_WIDGET (self), paint_canvas_page_get_canvas (page));
 }
 
 static void act_resize (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
-  show_resize_dialog (PAINT_WINDOW (d));
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (page)
+    paint_dialog_show_resize (GTK_WIDGET (self), paint_canvas_page_get_canvas (page));
 }
 
 static gboolean
 forward_editable_action (PaintWindow *self, const char *action_name)
 {
   GtkWidget *focus = gtk_window_get_focus (GTK_WINDOW (self));
-  if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus))) {
+  if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus) || GTK_IS_TEXT_VIEW (focus))) {
     gtk_widget_activate_action (focus, action_name, NULL);
     return TRUE;
   }
@@ -1563,6 +1300,21 @@ static void act_copy (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED,
   }
 }
 
+static void act_copy_merged (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  if (forward_editable_action (self, "clipboard.copy"))
+    return;
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (!page)
+    return;
+  g_autoptr (GdkTexture) tex = paint_canvas_copy_merged_selection (paint_canvas_page_get_canvas (page));
+  if (tex) {
+    GdkClipboard *cb = gtk_widget_get_clipboard (GTK_WIDGET (self));
+    gdk_clipboard_set_texture (cb, tex);
+  }
+}
+
 static void act_cut (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
   PaintWindow *self = PAINT_WINDOW (d);
@@ -1578,9 +1330,15 @@ static void act_cut (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, 
   }
 }
 
+typedef enum {
+  PASTE_FLOAT,
+  PASTE_NEW_TAB,
+  PASTE_AS_LAYER
+} PasteTarget;
+
 typedef struct {
   PaintWindow *window;
-  gboolean new_tab;
+  PasteTarget target;
 } PasteCtx;
 
 static void
@@ -1589,10 +1347,17 @@ on_clipboard_read_texture_finish (GObject *source, GAsyncResult *res, gpointer u
   PasteCtx *ctx = user_data;
   g_autoptr (GdkTexture) tex = gdk_clipboard_read_texture_finish (GDK_CLIPBOARD (source), res, NULL);
   if (tex) {
-    if (ctx->new_tab) {
+    if (ctx->target == PASTE_NEW_TAB) {
       PaintDocument *doc = paint_document_new_from_texture (tex);
       if (doc)
         paint_window_add_new_tab (ctx->window, doc);
+    } else if (ctx->target == PASTE_AS_LAYER) {
+      PaintCanvasPage *page = get_active_canvas_page (ctx->window);
+      if (page) {
+        paint_canvas_add_layer_from_texture (paint_canvas_page_get_canvas (page),
+                                             _("Pasted Layer"),
+                                             tex);
+      }
     } else {
       PaintCanvasPage *page = get_active_canvas_page (ctx->window);
       if (page) {
@@ -1606,12 +1371,12 @@ on_clipboard_read_texture_finish (GObject *source, GAsyncResult *res, gpointer u
 }
 
 static void
-request_clipboard_paste (PaintWindow *self, gboolean new_tab)
+request_clipboard_paste (PaintWindow *self, PasteTarget target)
 {
   GdkClipboard *cb = gtk_widget_get_clipboard (GTK_WIDGET (self));
   PasteCtx *ctx = g_new0 (PasteCtx, 1);
   ctx->window = g_object_ref (self);
-  ctx->new_tab = new_tab;
+  ctx->target = target;
   gdk_clipboard_read_texture_async (cb, NULL, on_clipboard_read_texture_finish, ctx);
 }
 
@@ -1620,12 +1385,17 @@ static void act_paste (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED
   PaintWindow *self = PAINT_WINDOW (d);
   if (forward_editable_action (self, "clipboard.paste"))
     return;
-  request_clipboard_paste (self, FALSE);
+  request_clipboard_paste (self, PASTE_FLOAT);
+}
+
+static void act_paste_as_layer (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  request_clipboard_paste (PAINT_WINDOW (d), PASTE_AS_LAYER);
 }
 
 static void act_paste_new_tab (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
-  request_clipboard_paste (PAINT_WINDOW (d), TRUE);
+  request_clipboard_paste (PAINT_WINDOW (d), PASTE_NEW_TAB);
 }
 
 static void act_select_all (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
@@ -1652,6 +1422,13 @@ static void act_crop_selection (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GN
   PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
   if (page)
     paint_canvas_crop_to_selection (paint_canvas_page_get_canvas (page));
+}
+
+static void act_invert_selection (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_invert_selection (paint_canvas_page_get_canvas (page));
 }
 
 static void act_rotate_cw (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
@@ -1682,6 +1459,88 @@ static void act_flip_vertical (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNU
     paint_canvas_flip (paint_canvas_page_get_canvas (page), FALSE);
 }
 
+static void act_trim_transparent (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_trim_transparent (paint_canvas_page_get_canvas (page));
+}
+
+static void
+apply_filter_sharpen_cb (cairo_surface_t *surf,
+                         const cairo_rectangle_int_t *rect,
+                         cairo_surface_t *mask,
+                         gboolean alpha_lock,
+                         gpointer user_data G_GNUC_UNUSED)
+{
+  paint_filter_sharpen (surf, rect, mask, alpha_lock, 0.8);
+}
+
+static void
+apply_filter_invert_cb (cairo_surface_t *surf,
+                        const cairo_rectangle_int_t *rect,
+                        cairo_surface_t *mask,
+                        gboolean alpha_lock,
+                        gpointer user_data G_GNUC_UNUSED)
+{
+  paint_filter_invert (surf, rect, mask, alpha_lock);
+}
+
+static void
+apply_filter_grayscale_cb (cairo_surface_t *surf,
+                           const cairo_rectangle_int_t *rect,
+                           cairo_surface_t *mask,
+                           gboolean alpha_lock,
+                           gpointer user_data G_GNUC_UNUSED)
+{
+  paint_filter_grayscale (surf, rect, mask, alpha_lock);
+}
+
+static void act_filter_brightness_contrast (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (page)
+    paint_dialog_show_brightness_contrast (GTK_WIDGET (self), paint_canvas_page_get_canvas (page));
+}
+
+static void act_filter_hsl (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (page)
+    paint_dialog_show_hsl (GTK_WIDGET (self), paint_canvas_page_get_canvas (page));
+}
+
+static void act_filter_blur (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  if (page)
+    paint_dialog_show_gaussian_blur (GTK_WIDGET (self), paint_canvas_page_get_canvas (page));
+}
+
+static void act_filter_sharpen (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_apply_filter (paint_canvas_page_get_canvas (page), apply_filter_sharpen_cb, NULL);
+}
+
+static void act_filter_invert (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_apply_filter (paint_canvas_page_get_canvas (page), apply_filter_invert_cb, NULL);
+}
+
+static void act_filter_grayscale (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_apply_filter (paint_canvas_page_get_canvas (page), apply_filter_grayscale_cb, NULL);
+}
+
 static void act_zoom_fit (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
   PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
@@ -1695,7 +1554,7 @@ static void act_toggle_pixel_grid_state (GSimpleAction *action, GVariant *value,
   gboolean show = g_variant_get_boolean (value);
   g_simple_action_set_state (action, value);
 
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   if (prefs) {
     prefs->show_pixel_grid = show;
     paint_preferences_save (prefs);
@@ -1796,6 +1655,28 @@ static void act_flatten_layers (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GN
     paint_canvas_flatten_layers (paint_canvas_page_get_canvas (page));
 }
 
+static void
+on_import_layer_dialog_finish (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  PaintWindow *self = PAINT_WINDOW (user_data);
+  GtkFileDialog *dialog = GTK_FILE_DIALOG (source);
+  g_autoptr (GFile) file = gtk_file_dialog_open_finish (dialog, res, NULL);
+  if (file)
+    import_file_as_layer (self, file);
+  g_object_unref (self);
+}
+
+static void act_import_layer (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  g_autoptr (GtkFileDialog) dialog = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (dialog, _("Import Image as Layer"));
+  g_autoptr (GListModel) filters = build_image_filters ();
+  gtk_file_dialog_set_filters (dialog, filters);
+  gtk_file_dialog_open (dialog, GTK_WINDOW (self), NULL,
+                        on_import_layer_dialog_finish, g_object_ref (self));
+}
+
 static void act_toggle_fullscreen (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
   GtkWindow *win = GTK_WINDOW (d);
@@ -1815,7 +1696,7 @@ static void act_tool_select (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_
 {
   PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
   if (page)
-    paint_canvas_page_select_tool (page, "select");
+    paint_canvas_page_select_last_select (page);
 }
 
 static void act_tool_brush (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
@@ -1874,6 +1755,72 @@ static void act_tool_shape (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_U
     paint_canvas_page_select_last_shape (page);
 }
 
+static void act_tool_gradient (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_page_select_tool (page, "gradient");
+}
+
+static void act_tool_blur (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_page_select_tool (page, "blur");
+}
+
+static void act_tool_pixelate (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
+  if (page)
+    paint_canvas_page_select_tool (page, "pixelate");
+}
+
+static void
+sync_all_color_pickers (PaintWindow *self)
+{
+  GtkApplication *app = gtk_window_get_application (GTK_WINDOW (self));
+  if (app) {
+    for (GList *l = gtk_application_get_windows (app); l != NULL; l = l->next) {
+      if (!PAINT_IS_WINDOW (l->data))
+        continue;
+      PaintWindow *win = PAINT_WINDOW (l->data);
+      int n = adw_tab_view_get_n_pages (win->tab_view);
+      for (int i = 0; i < n; i++) {
+        GtkWidget *child = adw_tab_page_get_child (adw_tab_view_get_nth_page (win->tab_view, i));
+        if (PAINT_IS_CANVAS_PAGE (child)) {
+          paint_canvas_page_sync_color_picker (PAINT_CANVAS_PAGE (child));
+          gtk_widget_queue_draw (GTK_WIDGET (paint_canvas_page_get_canvas (PAINT_CANVAS_PAGE (child))));
+        }
+      }
+    }
+    return;
+  }
+
+  int n = adw_tab_view_get_n_pages (self->tab_view);
+  for (int i = 0; i < n; i++) {
+    GtkWidget *child = adw_tab_page_get_child (adw_tab_view_get_nth_page (self->tab_view, i));
+    if (PAINT_IS_CANVAS_PAGE (child)) {
+      paint_canvas_page_sync_color_picker (PAINT_CANVAS_PAGE (child));
+      gtk_widget_queue_draw (GTK_WIDGET (paint_canvas_page_get_canvas (PAINT_CANVAS_PAGE (child))));
+    }
+  }
+}
+
+static void act_swap_colors (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  paint_tool_settings_swap_colors (self->shared_settings);
+  sync_all_color_pickers (self);
+}
+
+static void act_reset_colors (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
+{
+  PaintWindow *self = PAINT_WINDOW (d);
+  paint_tool_settings_reset_colors (self->shared_settings);
+  sync_all_color_pickers (self);
+}
+
 static void act_brush_smaller (GSimpleAction *a G_GNUC_UNUSED, GVariant *p G_GNUC_UNUSED, gpointer d)
 {
   PaintCanvasPage *page = get_active_canvas_page (PAINT_WINDOW (d));
@@ -1900,7 +1847,7 @@ on_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
     return FALSE;
 
   GtkWidget *focus = gtk_window_get_focus (GTK_WINDOW (self));
-  if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus)))
+  if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus) || GTK_IS_TEXT_VIEW (focus)))
     return FALSE;
 
   PaintCanvasPage *page = get_active_canvas_page (self);
@@ -1956,7 +1903,7 @@ on_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
     }
   }
 
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   const char *matched_action = paint_preferences_match_local_keybind (prefs, keyval, state);
   if (matched_action) {
     if (g_str_has_prefix (matched_action, "app.")) {
@@ -1971,6 +1918,17 @@ on_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
   return FALSE;
 }
 
+static void
+clear_all_space_pan (PaintWindow *self)
+{
+  int n = adw_tab_view_get_n_pages (self->tab_view);
+  for (int i = 0; i < n; i++) {
+    GtkWidget *child = adw_tab_page_get_child (adw_tab_view_get_nth_page (self->tab_view, i));
+    if (PAINT_IS_CANVAS_PAGE (child))
+      paint_canvas_page_set_space_pan (PAINT_CANVAS_PAGE (child), FALSE);
+  }
+}
+
 static gboolean
 on_alt_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
                     guint keyval,
@@ -1981,11 +1939,23 @@ on_alt_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
   PaintWindow *self = PAINT_WINDOW (user_data);
   if (keyval == GDK_KEY_Alt_L || keyval == GDK_KEY_Alt_R) {
     GtkWidget *focus = gtk_window_get_focus (GTK_WINDOW (self));
-    if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus)))
+    if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus) || GTK_IS_TEXT_VIEW (focus)))
       return FALSE;
     PaintCanvasPage *page = get_active_canvas_page (self);
     if (page)
       paint_canvas_set_alt_eyedropper (paint_canvas_page_get_canvas (page), TRUE);
+  } else if (keyval == GDK_KEY_space) {
+    GtkWidget *focus = gtk_window_get_focus (GTK_WINDOW (self));
+    if (focus && (GTK_IS_EDITABLE (focus) || GTK_IS_TEXT (focus) || GTK_IS_TEXT_VIEW (focus)))
+      return FALSE;
+    PaintCanvasPage *page = get_active_canvas_page (self);
+    PaintCanvas *canvas = page ? paint_canvas_page_get_canvas (page) : NULL;
+    if (canvas && paint_canvas_is_drawing (canvas))
+      return FALSE;
+    if (page) {
+      paint_canvas_page_set_space_pan (page, TRUE);
+      return TRUE;
+    }
   }
   return FALSE;
 }
@@ -2002,6 +1972,8 @@ on_alt_key_released (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
     PaintCanvasPage *page = get_active_canvas_page (self);
     if (page)
       paint_canvas_set_alt_eyedropper (paint_canvas_page_get_canvas (page), FALSE);
+  } else if (keyval == GDK_KEY_space) {
+    clear_all_space_pan (self);
   }
 }
 
@@ -2015,6 +1987,7 @@ on_window_is_active_changed (GObject *obj,
     PaintCanvasPage *page = get_active_canvas_page (self);
     if (page)
       paint_canvas_set_alt_eyedropper (paint_canvas_page_get_canvas (page), FALSE);
+    clear_all_space_pan (self);
   }
 }
 
@@ -2032,20 +2005,20 @@ build_zoom_row (PaintWindow *self)
   GtkWidget *zoom_out = gtk_button_new_from_icon_name ("zoom-out-symbolic");
   gtk_widget_add_css_class (zoom_out, "circular");
   gtk_widget_add_css_class (zoom_out, "flat");
-  gtk_widget_set_tooltip_text (zoom_out, "Zoom Out (Ctrl+-)");
+  gtk_widget_set_tooltip_text (zoom_out, _("Zoom Out (Ctrl+-)"));
   gtk_actionable_set_action_name (GTK_ACTIONABLE (zoom_out), "win.zoom-out");
 
   GtkWidget *pct = gtk_button_new_with_label ("100%");
   gtk_widget_add_css_class (pct, "flat");
   gtk_widget_add_css_class (pct, "paint-zoom-label");
-  gtk_widget_set_tooltip_text (pct, "Reset Zoom (Ctrl+0)");
+  gtk_widget_set_tooltip_text (pct, _("Reset Zoom (Ctrl+0)"));
   gtk_actionable_set_action_name (GTK_ACTIONABLE (pct), "win.zoom-reset");
   self->zoom_pct_btn = GTK_BUTTON (pct);
 
   GtkWidget *zoom_in = gtk_button_new_from_icon_name ("zoom-in-symbolic");
   gtk_widget_add_css_class (zoom_in, "circular");
   gtk_widget_add_css_class (zoom_in, "flat");
-  gtk_widget_set_tooltip_text (zoom_in, "Zoom In (Ctrl++)");
+  gtk_widget_set_tooltip_text (zoom_in, _("Zoom In (Ctrl++)"));
   gtk_actionable_set_action_name (GTK_ACTIONABLE (zoom_in), "win.zoom-in");
 
   gtk_box_append (GTK_BOX (row), zoom_out);
@@ -2059,10 +2032,7 @@ build_primary_menu (PaintWindow *self)
 {
   g_autoptr (GMenu) menu = g_menu_new ();
 
-  GApplication *app = g_application_get_default ();
-  PaintPreferences *prefs = (app && PAINT_IS_APPLICATION (app))
-                              ? paint_application_get_preferences (PAINT_APPLICATION (app))
-                              : NULL;
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   if (prefs) {
     g_autoptr (GMenu) theme_section = g_menu_new ();
     g_autoptr (GMenuItem) theme_item = g_menu_item_new (NULL, NULL);
@@ -2078,59 +2048,80 @@ build_primary_menu (PaintWindow *self)
   g_menu_append_section (menu, NULL, G_MENU_MODEL (zoom_section));
 
   g_autoptr (GMenu) file_section = g_menu_new ();
-  g_menu_append (file_section, "New Window", "app.new-window");
-  g_menu_append (file_section, "Save", "win.save");
-  g_menu_append (file_section, "Save As…", "win.save-as");
+  g_menu_append (file_section, _("New Window"), "app.new-window");
+  g_menu_append (file_section, _("Save"), "win.save");
+  g_menu_append (file_section, _("Save As…"), "win.save-as");
+  g_menu_append (file_section, _("Export Image…"), "win.export-image");
+  g_menu_append (file_section, _("Print…"), "win.print");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (file_section));
 
   g_autoptr (GMenu) actions_section = g_menu_new ();
 
   g_autoptr (GMenu) edit_sub = g_menu_new ();
-  g_menu_append (edit_sub, "Copy", "win.copy");
-  g_menu_append (edit_sub, "Cut", "win.cut");
-  g_menu_append (edit_sub, "Paste", "win.paste");
-  g_menu_append (edit_sub, "Paste as New Canvas", "win.paste-new-tab");
-  g_menu_append (edit_sub, "Select All", "win.select-all");
-  g_menu_append_submenu (actions_section, "Edit", G_MENU_MODEL (edit_sub));
+  g_menu_append (edit_sub, _("Copy"), "win.copy");
+  g_menu_append (edit_sub, _("Copy Merged"), "win.copy-merged");
+  g_menu_append (edit_sub, _("Cut"), "win.cut");
+  g_menu_append (edit_sub, _("Paste"), "win.paste");
+  g_menu_append (edit_sub, _("Paste as New Layer"), "win.paste-as-layer");
+  g_menu_append (edit_sub, _("Paste as New Canvas"), "win.paste-new-tab");
+  g_menu_append (edit_sub, _("Select All"), "win.select-all");
+  g_menu_append (edit_sub, _("Invert Selection"), "win.invert-selection");
+  g_menu_append_submenu (actions_section, _("Edit"), G_MENU_MODEL (edit_sub));
 
   g_autoptr (GMenu) canvas_sub = g_menu_new ();
   g_autoptr (GMenu) resize_sec = g_menu_new ();
-  g_menu_append (resize_sec, "Resize & Scale…", "win.resize-canvas");
+  g_menu_append (resize_sec, _("Resize & Scale…"), "win.resize-canvas");
   g_menu_append_section (canvas_sub, NULL, G_MENU_MODEL (resize_sec));
 
   g_autoptr (GMenu) transform_sec = g_menu_new ();
-  g_menu_append (transform_sec, "Rotate Right 90°", "win.rotate-cw");
-  g_menu_append (transform_sec, "Rotate Left 90°", "win.rotate-ccw");
-  g_menu_append (transform_sec, "Flip Horizontal", "win.flip-horizontal");
-  g_menu_append (transform_sec, "Flip Vertical", "win.flip-vertical");
-  g_menu_append (transform_sec, "Crop to Selection", "win.crop-selection");
+  g_menu_append (transform_sec, _("Rotate Right 90°"), "win.rotate-cw");
+  g_menu_append (transform_sec, _("Rotate Left 90°"), "win.rotate-ccw");
+  g_menu_append (transform_sec, _("Flip Horizontal"), "win.flip-horizontal");
+  g_menu_append (transform_sec, _("Flip Vertical"), "win.flip-vertical");
+  g_menu_append (transform_sec, _("Crop to Selection"), "win.crop-selection");
+  g_menu_append (transform_sec, _("Trim Transparent"), "win.trim-transparent");
   g_menu_append_section (canvas_sub, NULL, G_MENU_MODEL (transform_sec));
 
   g_autoptr (GMenu) clear_sec = g_menu_new ();
-  g_menu_append (clear_sec, "Clear Canvas", "win.clear");
+  g_menu_append (clear_sec, _("Clear Canvas"), "win.clear");
   g_menu_append_section (canvas_sub, NULL, G_MENU_MODEL (clear_sec));
 
   g_autoptr (GMenu) layers_sec = g_menu_new ();
-  g_menu_append (layers_sec, "New Layer", "win.new-layer");
-  g_menu_append (layers_sec, "Merge Layer Down", "win.merge-layer-down");
-  g_menu_append (layers_sec, "Flatten Layers", "win.flatten-layers");
-  g_menu_append_section (canvas_sub, "Layers", G_MENU_MODEL (layers_sec));
-  g_menu_append_submenu (actions_section, "Canvas", G_MENU_MODEL (canvas_sub));
+  g_menu_append (layers_sec, _("New Layer"), "win.new-layer");
+  g_menu_append (layers_sec, _("Import Image as Layer…"), "win.import-layer");
+  g_menu_append (layers_sec, _("Merge Layer Down"), "win.merge-layer-down");
+  g_menu_append (layers_sec, _("Flatten Layers"), "win.flatten-layers");
+  g_menu_append_section (canvas_sub, _("Layers"), G_MENU_MODEL (layers_sec));
+  g_menu_append_submenu (actions_section, _("Canvas"), G_MENU_MODEL (canvas_sub));
+
+  g_autoptr (GMenu) filters_sub = g_menu_new ();
+  g_autoptr (GMenu) adjust_sec = g_menu_new ();
+  g_menu_append (adjust_sec, _("Brightness & Contrast…"), "win.filter-brightness-contrast");
+  g_menu_append (adjust_sec, _("Hue & Saturation…"), "win.filter-hsl");
+  g_menu_append (adjust_sec, _("Gaussian Blur…"), "win.filter-blur");
+  g_menu_append_section (filters_sub, NULL, G_MENU_MODEL (adjust_sec));
+
+  g_autoptr (GMenu) effects_sec = g_menu_new ();
+  g_menu_append (effects_sec, _("Sharpen"), "win.filter-sharpen");
+  g_menu_append (effects_sec, _("Invert Colors"), "win.filter-invert");
+  g_menu_append (effects_sec, _("Grayscale"), "win.filter-grayscale");
+  g_menu_append_section (filters_sub, NULL, G_MENU_MODEL (effects_sec));
+  g_menu_append_submenu (actions_section, _("Filters"), G_MENU_MODEL (filters_sub));
 
   g_autoptr (GMenu) view_sub = g_menu_new ();
-  g_menu_append (view_sub, "Fit to Window", "win.zoom-fit");
-  g_menu_append (view_sub, "Layers", "win.toggle-layers");
-  g_menu_append (view_sub, "Pixel Grid", "win.toggle-pixel-grid");
-  g_menu_append (view_sub, "Toggle Toolbar", "win.toggle-toolbar");
-  g_menu_append (view_sub, "Fullscreen", "win.toggle-fullscreen");
-  g_menu_append_submenu (actions_section, "View", G_MENU_MODEL (view_sub));
+  g_menu_append (view_sub, _("Fit to Window"), "win.zoom-fit");
+  g_menu_append (view_sub, _("Layers"), "win.toggle-layers");
+  g_menu_append (view_sub, _("Pixel Grid"), "win.toggle-pixel-grid");
+  g_menu_append (view_sub, _("Toggle Toolbar"), "win.toggle-toolbar");
+  g_menu_append (view_sub, _("Fullscreen"), "win.toggle-fullscreen");
+  g_menu_append_submenu (actions_section, _("View"), G_MENU_MODEL (view_sub));
 
   g_menu_append_section (menu, NULL, G_MENU_MODEL (actions_section));
 
   g_autoptr (GMenu) app_section = g_menu_new ();
-  g_menu_append (app_section, "Preferences", "app.preferences");
-  g_menu_append (app_section, "Keyboard Shortcuts", "app.shortcuts");
-  g_menu_append (app_section, "About Paint", "app.about");
+  g_menu_append (app_section, _("Preferences"), "app.preferences");
+  g_menu_append (app_section, _("Keyboard Shortcuts"), "app.shortcuts");
+  g_menu_append (app_section, _("About Paint"), "app.about");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (app_section));
 
   GtkWidget *popover = gtk_popover_menu_new_from_model (G_MENU_MODEL (menu));
@@ -2171,7 +2162,7 @@ build_info_popover (PaintWindow *self)
   gtk_widget_set_margin_start (box, 12);
   gtk_widget_set_margin_end (box, 12);
 
-  GtkWidget *heading = gtk_label_new ("Canvas Properties");
+  GtkWidget *heading = gtk_label_new (_("Canvas Properties"));
   gtk_widget_add_css_class (heading, "heading");
   gtk_widget_set_halign (heading, GTK_ALIGN_START);
   gtk_box_append (GTK_BOX (box), heading);
@@ -2180,16 +2171,16 @@ build_info_popover (PaintWindow *self)
   gtk_grid_set_column_spacing (GTK_GRID (grid), 18);
   gtk_grid_set_row_spacing (GTK_GRID (grid), 6);
 
-  self->info_dims_label = add_info_row (GTK_GRID (grid), 0, "Dimensions");
-  self->info_layers_label = add_info_row (GTK_GRID (grid), 1, "Layers");
-  self->info_zoom_label = add_info_row (GTK_GRID (grid), 2, "Zoom");
-  self->info_bg_label = add_info_row (GTK_GRID (grid), 3, "Background");
-  self->info_path_label = add_info_row (GTK_GRID (grid), 4, "Location");
+  self->info_dims_label = add_info_row (GTK_GRID (grid), 0, _("Dimensions"));
+  self->info_layers_label = add_info_row (GTK_GRID (grid), 1, _("Layers"));
+  self->info_zoom_label = add_info_row (GTK_GRID (grid), 2, _("Zoom"));
+  self->info_bg_label = add_info_row (GTK_GRID (grid), 3, _("Background"));
+  self->info_path_label = add_info_row (GTK_GRID (grid), 4, _("Location"));
   gtk_label_set_max_width_chars (self->info_path_label, 28);
   gtk_label_set_ellipsize (self->info_path_label, PANGO_ELLIPSIZE_END);
   gtk_box_append (GTK_BOX (box), grid);
 
-  GtkWidget *resize_btn = gtk_button_new_with_label ("Resize & Scale…");
+  GtkWidget *resize_btn = gtk_button_new_with_label (_("Resize & Scale…"));
   gtk_actionable_set_action_name (GTK_ACTIONABLE (resize_btn), "win.resize-canvas");
   g_signal_connect_swapped (resize_btn, "clicked", G_CALLBACK (gtk_popover_popdown), pop);
   gtk_box_append (GTK_BOX (box), resize_btn);
@@ -2202,45 +2193,43 @@ static GtkWidget *
 build_header_bar (PaintWindow *self)
 {
   GtkWidget *header = adw_header_bar_new ();
-  self->window_title = ADW_WINDOW_TITLE (adw_window_title_new ("Untitled Canvas", "640 × 380 · 100%"));
+  self->window_title = ADW_WINDOW_TITLE (adw_window_title_new (_("Untitled Canvas"), "640 × 380 · 100%"));
   adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), GTK_WIDGET (self->window_title));
 
-  /* Start: Open split button + New Tab button (Text Editor / Ptyxis style) */
   self->open_btn = ADW_SPLIT_BUTTON (adw_split_button_new ());
-  adw_split_button_set_label (self->open_btn, "Open");
-  gtk_widget_set_tooltip_text (GTK_WIDGET (self->open_btn), "Open Image (Ctrl+O)");
-  adw_split_button_set_dropdown_tooltip (self->open_btn, "Recent Images");
+  adw_split_button_set_label (self->open_btn, _("Open"));
+  gtk_widget_set_tooltip_text (GTK_WIDGET (self->open_btn), _("Open Image (Ctrl+O)"));
+  adw_split_button_set_dropdown_tooltip (self->open_btn, _("Recent Images"));
   g_signal_connect_swapped (self->open_btn, "clicked", G_CALLBACK (prompt_open_file), self);
   refresh_recent_menu (self);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), GTK_WIDGET (self->open_btn));
 
   GtkWidget *new_btn = gtk_button_new_from_icon_name ("tab-new-symbolic");
-  gtk_widget_set_tooltip_text (new_btn, "New Canvas (Ctrl+N)");
+  gtk_widget_set_tooltip_text (new_btn, _("New Canvas (Ctrl+N)"));
   gtk_actionable_set_action_name (GTK_ACTIONABLE (new_btn), "win.new-tab");
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), new_btn);
 
-  /* End: Primary Menu, Tab Overview grid, Info popover */
   GtkWidget *menu_btn = gtk_menu_button_new ();
   gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (menu_btn), "open-menu-symbolic");
   gtk_menu_button_set_primary (GTK_MENU_BUTTON (menu_btn), TRUE);
-  gtk_widget_set_tooltip_text (menu_btn, "Main Menu (F10)");
+  gtk_widget_set_tooltip_text (menu_btn, _("Main Menu (F10)"));
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (menu_btn), build_primary_menu (self));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), menu_btn);
 
   GtkWidget *overview_btn = gtk_button_new_from_icon_name ("view-grid-symbolic");
-  gtk_widget_set_tooltip_text (overview_btn, "Tab Overview (Ctrl+Shift+O)");
+  gtk_widget_set_tooltip_text (overview_btn, _("Tab Overview (Ctrl+Shift+O)"));
   gtk_actionable_set_action_name (GTK_ACTIONABLE (overview_btn), "win.tab-overview");
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), overview_btn);
 
   GtkWidget *info_btn = gtk_menu_button_new ();
   gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (info_btn), "info-outline-symbolic");
-  gtk_widget_set_tooltip_text (info_btn, "Canvas Details");
+  gtk_widget_set_tooltip_text (info_btn, _("Canvas Details"));
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (info_btn), build_info_popover (self));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), info_btn);
 
   GtkWidget *layers_btn = gtk_toggle_button_new ();
   gtk_button_set_icon_name (GTK_BUTTON (layers_btn), "layers-symbolic");
-  gtk_widget_set_tooltip_text (layers_btn, "Layers (Ctrl+L)");
+  gtk_widget_set_tooltip_text (layers_btn, _("Layers (Ctrl+L)"));
   gtk_actionable_set_action_name (GTK_ACTIONABLE (layers_btn), "win.toggle-layers");
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), layers_btn);
 
@@ -2258,13 +2247,28 @@ on_selected_page_changed (GObject *obj G_GNUC_UNUSED,
                           GParamSpec *pspec G_GNUC_UNUSED,
                           gpointer user_data)
 {
-  sync_window_state (PAINT_WINDOW (user_data));
+  PaintWindow *self = PAINT_WINDOW (user_data);
+  clear_all_space_pan (self);
+  paint_window_sync_state (self);
 }
 
 static void
 on_page_state_changed (PaintCanvasPage *page G_GNUC_UNUSED, gpointer user_data)
 {
-  sync_window_state (PAINT_WINDOW (user_data));
+  PaintWindow *self = PAINT_WINDOW (user_data);
+  sync_tool_settings_colors_to_prefs (self);
+  paint_window_sync_state (self);
+}
+
+static void
+on_page_palette_changed (PaintCanvasPage *page G_GNUC_UNUSED, gpointer user_data)
+{
+  PaintWindow *self = PAINT_WINDOW (user_data);
+  sync_tool_settings_colors_to_prefs (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
+  if (prefs)
+    paint_preferences_save (prefs);
+  sync_all_color_pickers (self);
 }
 
 static AdwTabView *
@@ -2307,9 +2311,10 @@ on_tab_page_attached (AdwTabView *view G_GNUC_UNUSED,
   GtkWidget *child = adw_tab_page_get_child (tab_page);
   if (PAINT_IS_CANVAS_PAGE (child)) {
     g_signal_connect (child, "state-changed", G_CALLBACK (on_page_state_changed), self);
+    g_signal_connect (child, "palette-changed", G_CALLBACK (on_page_palette_changed), self);
     update_tab_metadata (tab_page, PAINT_CANVAS_PAGE (child));
   }
-  sync_window_state (self);
+  paint_window_sync_state (self);
 }
 
 static void
@@ -2320,10 +2325,42 @@ on_tab_page_detached (AdwTabView *view G_GNUC_UNUSED,
 {
   PaintWindow *self = PAINT_WINDOW (user_data);
   GtkWidget *child = adw_tab_page_get_child (tab_page);
-  if (PAINT_IS_CANVAS_PAGE (child))
+  if (PAINT_IS_CANVAS_PAGE (child)) {
     g_signal_handlers_disconnect_by_func (child, G_CALLBACK (on_page_state_changed), self);
-  sync_window_state (self);
+    g_signal_handlers_disconnect_by_func (child, G_CALLBACK (on_page_palette_changed), self);
+  }
+  paint_window_sync_state (self);
   g_idle_add (close_if_empty_after_detach_idle, self);
+}
+
+typedef struct {
+  PaintWindow *window;
+  GPtrArray *files; /* owned GFile* */
+} DropPromptCtx;
+
+static void
+drop_prompt_ctx_free (DropPromptCtx *ctx)
+{
+  if (!ctx)
+    return;
+  g_clear_pointer (&ctx->files, g_ptr_array_unref);
+  g_clear_object (&ctx->window);
+  g_free (ctx);
+}
+
+static void
+on_drop_prompt_response (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  DropPromptCtx *ctx = user_data;
+  const char *choice = adw_alert_dialog_choose_finish (ADW_ALERT_DIALOG (source), res);
+  if (g_strcmp0 (choice, "add-layer") == 0) {
+    for (guint i = 0; i < ctx->files->len; i++)
+      import_file_as_layer (ctx->window, G_FILE (g_ptr_array_index (ctx->files, i)));
+  } else if (g_strcmp0 (choice, "new-tab") == 0) {
+    for (guint i = 0; i < ctx->files->len; i++)
+      paint_window_open_file (ctx->window, G_FILE (g_ptr_array_index (ctx->files, i)));
+  }
+  drop_prompt_ctx_free (ctx);
 }
 
 static gboolean
@@ -2342,18 +2379,64 @@ on_files_dropped (GtkDropTarget *target G_GNUC_UNUSED,
   if (!files)
     return FALSE;
 
+  gboolean has_non_ora = FALSE;
+  g_autoptr (GPtrArray) list = g_ptr_array_new_with_free_func (g_object_unref);
   for (GSList *l = files; l != NULL; l = l->next) {
-    if (G_IS_FILE (l->data))
-      paint_window_open_file (self, G_FILE (l->data));
+    if (G_IS_FILE (l->data)) {
+      GFile *f = G_FILE (l->data);
+      g_ptr_array_add (list, g_object_ref (f));
+      if (!paint_io_is_ora_file (f))
+        has_non_ora = TRUE;
+    }
   }
   g_slist_free (files);
+  if (list->len == 0)
+    return FALSE;
+
+  PaintCanvasPage *page = get_active_canvas_page (self);
+  PaintDocument *doc = page ? paint_canvas_get_document (paint_canvas_page_get_canvas (page)) : NULL;
+  gboolean non_blank = doc &&
+                       (paint_document_get_modified (doc) ||
+                        paint_document_get_file (doc) != NULL ||
+                        paint_document_can_undo (doc) ||
+                        paint_document_get_n_layers (doc) > 1);
+
+  if (non_blank && has_non_ora) {
+    DropPromptCtx *ctx = g_new0 (DropPromptCtx, 1);
+    ctx->window = g_object_ref (self);
+    ctx->files = g_ptr_array_ref (list);
+
+    AdwDialog *dlg = adw_alert_dialog_new (
+        _("Add Dropped Image as Layer?"),
+        _("Would you like to add the dropped image as a new layer in the current canvas, "
+          "or open it in a new tab?"));
+    adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dlg),
+                                    "cancel", _("Cancel"),
+                                    "new-tab", _("Open in New Tab"),
+                                    "add-layer", _("Add as Layer"),
+                                    NULL);
+    adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dlg),
+                                              "add-layer",
+                                              ADW_RESPONSE_SUGGESTED);
+    adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dlg), "add-layer");
+    adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dlg), "cancel");
+    adw_alert_dialog_choose (ADW_ALERT_DIALOG (dlg),
+                             GTK_WIDGET (self),
+                             NULL,
+                             on_drop_prompt_response,
+                             ctx);
+    return TRUE;
+  }
+
+  for (guint i = 0; i < list->len; i++)
+    paint_window_open_file (self, G_FILE (g_ptr_array_index (list, i)));
   return TRUE;
 }
 
 void
 paint_window_apply_preferences (PaintWindow *self)
 {
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   if (!prefs)
     return;
 
@@ -2379,7 +2462,7 @@ paint_window_apply_preferences (PaintWindow *self)
 AdwTabPage *
 paint_window_add_new_tab (PaintWindow *self, PaintDocument *doc)
 {
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   if (!doc && prefs)
     doc = paint_document_new (prefs->default_width, prefs->default_height);
 
@@ -2434,19 +2517,31 @@ paint_window_init (PaintWindow *self)
     { "open-recent", act_open_recent, "s", NULL, NULL, { 0 } },
     { "save", act_save, NULL, NULL, NULL, { 0 } },
     { "save-as", act_save_as, NULL, NULL, NULL, { 0 } },
+    { "export-image", act_export_image, NULL, NULL, NULL, { 0 } },
+    { "print", act_print, NULL, NULL, NULL, { 0 } },
     { "undo", act_undo, NULL, NULL, NULL, { 0 } },
     { "redo", act_redo, NULL, NULL, NULL, { 0 } },
     { "copy", act_copy, NULL, NULL, NULL, { 0 } },
+    { "copy-merged", act_copy_merged, NULL, NULL, NULL, { 0 } },
     { "cut", act_cut, NULL, NULL, NULL, { 0 } },
     { "paste", act_paste, NULL, NULL, NULL, { 0 } },
+    { "paste-as-layer", act_paste_as_layer, NULL, NULL, NULL, { 0 } },
     { "paste-new-tab", act_paste_new_tab, NULL, NULL, NULL, { 0 } },
     { "select-all", act_select_all, NULL, NULL, NULL, { 0 } },
+    { "invert-selection", act_invert_selection, NULL, NULL, NULL, { 0 } },
     { "delete-selection", act_delete_selection, NULL, NULL, NULL, { 0 } },
     { "crop-selection", act_crop_selection, NULL, NULL, NULL, { 0 } },
     { "rotate-cw", act_rotate_cw, NULL, NULL, NULL, { 0 } },
     { "rotate-ccw", act_rotate_ccw, NULL, NULL, NULL, { 0 } },
     { "flip-horizontal", act_flip_horizontal, NULL, NULL, NULL, { 0 } },
     { "flip-vertical", act_flip_vertical, NULL, NULL, NULL, { 0 } },
+    { "trim-transparent", act_trim_transparent, NULL, NULL, NULL, { 0 } },
+    { "filter-brightness-contrast", act_filter_brightness_contrast, NULL, NULL, NULL, { 0 } },
+    { "filter-hsl", act_filter_hsl, NULL, NULL, NULL, { 0 } },
+    { "filter-blur", act_filter_blur, NULL, NULL, NULL, { 0 } },
+    { "filter-sharpen", act_filter_sharpen, NULL, NULL, NULL, { 0 } },
+    { "filter-invert", act_filter_invert, NULL, NULL, NULL, { 0 } },
+    { "filter-grayscale", act_filter_grayscale, NULL, NULL, NULL, { 0 } },
     { "clear", act_clear, NULL, NULL, NULL, { 0 } },
     { "resize-canvas", act_resize, NULL, NULL, NULL, { 0 } },
     { "zoom-in", act_zoom_in, NULL, NULL, NULL, { 0 } },
@@ -2456,6 +2551,7 @@ paint_window_init (PaintWindow *self)
     { "toggle-pixel-grid", NULL, NULL, "true", act_toggle_pixel_grid_state, { 0 } },
     { "toggle-layers", NULL, NULL, "false", act_toggle_layers_state, { 0 } },
     { "new-layer", act_new_layer, NULL, NULL, NULL, { 0 } },
+    { "import-layer", act_import_layer, NULL, NULL, NULL, { 0 } },
     { "duplicate-layer", act_duplicate_layer, NULL, NULL, NULL, { 0 } },
     { "merge-layer-down", act_merge_layer_down, NULL, NULL, NULL, { 0 } },
     { "flatten-layers", act_flatten_layers, NULL, NULL, NULL, { 0 } },
@@ -2471,8 +2567,13 @@ paint_window_init (PaintWindow *self)
     { "tool-eyedropper", act_tool_eyedropper, NULL, NULL, NULL, { 0 } },
     { "tool-transparent", act_tool_transparent, NULL, NULL, NULL, { 0 } },
     { "tool-shape", act_tool_shape, NULL, NULL, NULL, { 0 } },
+    { "tool-gradient", act_tool_gradient, NULL, NULL, NULL, { 0 } },
+    { "tool-blur", act_tool_blur, NULL, NULL, NULL, { 0 } },
+    { "tool-pixelate", act_tool_pixelate, NULL, NULL, NULL, { 0 } },
     { "brush-smaller", act_brush_smaller, NULL, NULL, NULL, { 0 } },
     { "brush-larger", act_brush_larger, NULL, NULL, NULL, { 0 } },
+    { "swap-colors", act_swap_colors, NULL, NULL, NULL, { 0 } },
+    { "reset-colors", act_reset_colors, NULL, NULL, NULL, { 0 } },
   };
 
   GApplication *app = g_application_get_default ();
@@ -2482,7 +2583,7 @@ paint_window_init (PaintWindow *self)
   self->recent_paths = g_ptr_array_new_with_free_func (g_free);
   load_recent_files (self);
 
-  gtk_window_set_title (GTK_WINDOW (self), "Paint");
+  gtk_window_set_title (GTK_WINDOW (self), _("Paint"));
   gtk_window_set_icon_name (GTK_WINDOW (self), PAINT_APP_ID);
   gtk_window_set_default_size (GTK_WINDOW (self),
                                PAINT_DEFAULT_WINDOW_WIDTH,
@@ -2493,7 +2594,7 @@ paint_window_init (PaintWindow *self)
                                    G_N_ELEMENTS (win_actions),
                                    self);
 
-  PaintPreferences *prefs = get_app_preferences (self);
+  PaintPreferences *prefs = paint_window_get_preferences (self);
   if (prefs) {
     GAction *grid_act = g_action_map_lookup_action (G_ACTION_MAP (self), "toggle-pixel-grid");
     if (grid_act)

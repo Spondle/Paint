@@ -6,6 +6,16 @@
     <file>icons/symbolic/apps/io.github.spondle.Paint-symbolic.svg</file>
     <file>icons/scalable/actions/tool-eraser-symbolic.svg</file>
     <file>icons/scalable/actions/tool-fill-symbolic.svg</file>
+    <file>icons/scalable/actions/layer-alpha-lock-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-select-ellipse-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-select-lasso-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-select-wand-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-gradient-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-gradient-linear-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-gradient-radial-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-blur-symbolic.svg</file>
+    <file>icons/scalable/actions/tool-pixelate-symbolic.svg</file>
+    <file>icons/scalable/actions/color-swap-symbolic.svg</file>
     <file>icons/scalable/actions/tool-transparent-symbolic.svg</file>
     <file>icons/scalable/actions/tool-transparent-fill-symbolic.svg</file>
     <file>icons/scalable/actions/tool-line-symbolic.svg</file>

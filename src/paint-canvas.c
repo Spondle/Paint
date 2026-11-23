@@ -1,12 +1,11 @@
 #include "paint-canvas.h"
 
 #include <math.h>
-#include <pango/pangocairo.h>
 #include <stdint.h>
 #include <string.h>
 
-#define MAX_UNDO_STEPS 40
-#define UNDO_TILE_SIZE 256
+#include "paint-document-private.h"
+
 #define VIEWPORT_OVERSCAN 256
 #define MIN_VP_CACHE_DIM 1024
 #define MAX_OVERVIEW_DIM 2048
@@ -15,2178 +14,6 @@ static const double ZOOM_STEPS[] = {
   0.05, 0.06, 0.08, 0.10, 0.125, 0.16, 0.20, 0.25, 0.33, 0.40, 0.50, 0.60,
   0.75, 0.90, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0
 };
-
-/* ============================================================================
- * Tiled / Full-Surface Undo Snapshots
- * ============================================================================ */
-
-typedef struct {
-  char *name;
-  cairo_surface_t *surface; /* ARGB32, doc->width x doc->height */
-  gboolean visible;
-  double opacity;           /* 0.0 .. 1.0 */
-  PaintBlendMode blend_mode;
-} PaintLayer;
-
-typedef struct {
-  char *name;
-  gboolean visible;
-  double opacity;
-  PaintBlendMode blend_mode;
-  int width;
-  int height;
-  int stride;
-  GBytes *pixels;
-} UndoLayerSnapshot;
-
-typedef struct {
-  int x;
-  int y;
-  int w;
-  int h;
-  GBytes *pixels; /* packed row-major w * 4 bytes */
-} UndoTile;
-
-static PaintLayer *
-paint_layer_new (const char *name,
-                 cairo_surface_t *surface,
-                 gboolean visible,
-                 double opacity,
-                 PaintBlendMode blend_mode)
-{
-  PaintLayer *layer = g_new0 (PaintLayer, 1);
-  layer->name = g_strdup (name ? name : "Layer");
-  layer->surface = surface;
-  layer->visible = visible;
-  layer->opacity = CLAMP (opacity, 0.0, 1.0);
-  layer->blend_mode = blend_mode;
-  return layer;
-}
-
-static void
-paint_layer_free (gpointer ptr)
-{
-  PaintLayer *layer = ptr;
-  if (!layer)
-    return;
-  g_free (layer->name);
-  g_clear_pointer (&layer->surface, cairo_surface_destroy);
-  g_free (layer);
-}
-
-static UndoLayerSnapshot *
-undo_layer_snapshot_new (const PaintLayer *layer)
-{
-  cairo_surface_flush (layer->surface);
-  int w = cairo_image_surface_get_width (layer->surface);
-  int h = cairo_image_surface_get_height (layer->surface);
-  int stride = cairo_image_surface_get_stride (layer->surface);
-  const unsigned char *data = cairo_image_surface_get_data (layer->surface);
-
-  UndoLayerSnapshot *snap = g_new0 (UndoLayerSnapshot, 1);
-  snap->name = g_strdup (layer->name);
-  snap->visible = layer->visible;
-  snap->opacity = layer->opacity;
-  snap->blend_mode = layer->blend_mode;
-  snap->width = w;
-  snap->height = h;
-  snap->stride = stride;
-  snap->pixels = g_bytes_new (data, (gsize) stride * (gsize) h);
-  return snap;
-}
-
-static void
-undo_layer_snapshot_free (gpointer ptr)
-{
-  UndoLayerSnapshot *snap = ptr;
-  if (!snap)
-    return;
-  g_free (snap->name);
-  g_clear_pointer (&snap->pixels, g_bytes_unref);
-  g_free (snap);
-}
-
-static PaintLayer *
-undo_layer_snapshot_restore (const UndoLayerSnapshot *snap)
-{
-  cairo_surface_t *surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                         snap->width,
-                                                         snap->height);
-  gsize len = 0;
-  const unsigned char *src = g_bytes_get_data (snap->pixels, &len);
-  unsigned char *dst = cairo_image_surface_get_data (surface);
-  int dst_stride = cairo_image_surface_get_stride (surface);
-
-  if (dst_stride == snap->stride) {
-    memcpy (dst, src, len);
-  } else {
-    int copy_bytes = MIN (dst_stride, snap->stride);
-    for (int y = 0; y < snap->height; y++)
-      memcpy (dst + y * dst_stride, src + y * snap->stride, (gsize) copy_bytes);
-  }
-  cairo_surface_mark_dirty (surface);
-  return paint_layer_new (snap->name, surface, snap->visible, snap->opacity, snap->blend_mode);
-}
-
-static void
-undo_tile_free (gpointer ptr)
-{
-  UndoTile *t = ptr;
-  if (!t)
-    return;
-  g_clear_pointer (&t->pixels, g_bytes_unref);
-  g_free (t);
-}
-
-typedef struct {
-  int width;
-  int height;
-  gboolean is_full;
-  GdkRGBA background_color;
-  GPtrArray *layer_snaps; /* element-type: UndoLayerSnapshot* */
-  int active_layer_index;
-  int next_layer_num;
-  gboolean is_opacity_step;
-  int opacity_layer_idx;
-  int layer_index;        /* for tiled steps */
-  GPtrArray *tiles;       /* element-type: UndoTile* */
-  GHashTable *saved_keys; /* key: uint32 packed (ty << 16) | tx */
-} UndoStep;
-
-static void
-undo_step_free (gpointer ptr)
-{
-  UndoStep *step = ptr;
-  if (!step)
-    return;
-  g_clear_pointer (&step->layer_snaps, g_ptr_array_unref);
-  g_clear_pointer (&step->tiles, g_ptr_array_unref);
-  g_clear_pointer (&step->saved_keys, g_hash_table_unref);
-  g_free (step);
-}
-
-static UndoTile *
-capture_rect_tile (cairo_surface_t *surface, int x, int y, int w, int h)
-{
-  cairo_surface_flush (surface);
-  int stride = cairo_image_surface_get_stride (surface);
-  const unsigned char *src = cairo_image_surface_get_data (surface);
-  gsize row_bytes = (gsize) w * 4;
-  unsigned char *buf = g_malloc (row_bytes * (gsize) h);
-
-  for (int row = 0; row < h; row++) {
-    const unsigned char *src_row = src + (gsize) (y + row) * (gsize) stride + (gsize) x * 4;
-    memcpy (buf + (gsize) row * row_bytes, src_row, row_bytes);
-  }
-
-  UndoTile *t = g_new0 (UndoTile, 1);
-  t->x = x;
-  t->y = y;
-  t->w = w;
-  t->h = h;
-  t->pixels = g_bytes_new_take (buf, row_bytes * (gsize) h);
-  return t;
-}
-
-static void
-restore_rect_tile (cairo_surface_t *surface, const UndoTile *t)
-{
-  int stride = cairo_image_surface_get_stride (surface);
-  unsigned char *dst = cairo_image_surface_get_data (surface);
-  gsize len = 0;
-  const unsigned char *src = g_bytes_get_data (t->pixels, &len);
-  gsize row_bytes = (gsize) t->w * 4;
-
-  for (int row = 0; row < t->h; row++) {
-    unsigned char *dst_row = dst + (gsize) (t->y + row) * (gsize) stride + (gsize) t->x * 4;
-    memcpy (dst_row, src + (gsize) row * row_bytes, row_bytes);
-  }
-}
-
-static UndoStep *
-undo_step_new_tiled (int width, int height, int layer_index)
-{
-  UndoStep *step = g_new0 (UndoStep, 1);
-  step->width = width;
-  step->height = height;
-  step->is_full = FALSE;
-  step->layer_index = layer_index;
-  step->tiles = g_ptr_array_new_with_free_func (undo_tile_free);
-  step->saved_keys = g_hash_table_new (g_direct_hash, g_direct_equal);
-  return step;
-}
-
-static void
-undo_step_capture_rect (UndoStep *step,
-                        cairo_surface_t *surface,
-                        int rx,
-                        int ry,
-                        int rw,
-                        int rh)
-{
-  int x0 = MAX (0, rx);
-  int y0 = MAX (0, ry);
-  int x1 = MIN (step->width, rx + rw);
-  int y1 = MIN (step->height, ry + rh);
-  if (x0 >= x1 || y0 >= y1)
-    return;
-
-  int tx0 = x0 / UNDO_TILE_SIZE;
-  int ty0 = y0 / UNDO_TILE_SIZE;
-  int tx1 = (x1 - 1) / UNDO_TILE_SIZE;
-  int ty1 = (y1 - 1) / UNDO_TILE_SIZE;
-
-  for (int ty = ty0; ty <= ty1; ty++) {
-    for (int tx = tx0; tx <= tx1; tx++) {
-      guint key = (((guint) ty) << 16) | (guint) tx;
-      if (g_hash_table_contains (step->saved_keys, GUINT_TO_POINTER (key)))
-        continue;
-      g_hash_table_add (step->saved_keys, GUINT_TO_POINTER (key));
-
-      int tile_x = tx * UNDO_TILE_SIZE;
-      int tile_y = ty * UNDO_TILE_SIZE;
-      int tile_w = MIN (UNDO_TILE_SIZE, step->width - tile_x);
-      int tile_h = MIN (UNDO_TILE_SIZE, step->height - tile_y);
-      g_ptr_array_add (step->tiles, capture_rect_tile (surface, tile_x, tile_y, tile_w, tile_h));
-    }
-  }
-}
-
-/* ============================================================================
- * PaintDocument
- * ============================================================================ */
-
-struct _PaintDocument {
-  int width;
-  int height;
-  GdkRGBA background_color;
-  cairo_surface_t *surface;           /* non-owning alias to visible composite */
-  cairo_surface_t *composite_surface; /* owned when multi-layer/opacity/blend/hole active */
-  GPtrArray *layers;                  /* element-type: PaintLayer* (bottom -> top) */
-  int active_layer_index;
-  int next_layer_num;
-  guint64 layers_revision;
-
-  gboolean has_active_hole;
-  cairo_rectangle_int_t active_hole;
-
-  GFile *file;
-  gboolean modified;
-  GPtrArray *undo_stack; /* element-type: UndoStep* */
-  GPtrArray *redo_stack; /* element-type: UndoStep* */
-
-  UndoStep *active_stroke_undo;
-  gboolean pre_stroke_modified;
-  double stroke_start_x;
-  double stroke_start_y;
-  double prev_stroke_x;
-  double prev_stroke_y;
-  double prev2_stroke_x;
-  double prev2_stroke_y;
-
-  gboolean all_dirty;
-  gboolean has_dirty_rect;
-  cairo_rectangle_int_t dirty_rect;
-};
-
-static UndoStep *
-undo_step_new_full_doc (const PaintDocument *doc)
-{
-  UndoStep *step = g_new0 (UndoStep, 1);
-  step->width = doc->width;
-  step->height = doc->height;
-  step->is_full = TRUE;
-  step->background_color = doc->background_color;
-  step->active_layer_index = doc->active_layer_index;
-  step->next_layer_num = doc->next_layer_num;
-  step->layer_snaps = g_ptr_array_new_with_free_func (undo_layer_snapshot_free);
-  for (guint i = 0; i < doc->layers->len; i++) {
-    const PaintLayer *layer = g_ptr_array_index (doc->layers, i);
-    g_ptr_array_add (step->layer_snaps, undo_layer_snapshot_new (layer));
-  }
-  return step;
-}
-
-static PaintLayer *
-get_active_layer (const PaintDocument *doc)
-{
-  if (!doc || !doc->layers || doc->layers->len == 0)
-    return NULL;
-  int idx = CLAMP (doc->active_layer_index, 0, (int) doc->layers->len - 1);
-  return g_ptr_array_index (doc->layers, (guint) idx);
-}
-
-static GdkRGBA
-get_active_layer_clear_color (const PaintDocument *doc)
-{
-  if (doc && doc->active_layer_index == 0)
-    return doc->background_color;
-  return (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
-}
-
-static cairo_operator_t
-blend_mode_to_cairo (PaintBlendMode mode)
-{
-  switch (mode) {
-  case PAINT_BLEND_MULTIPLY:
-    return CAIRO_OPERATOR_MULTIPLY;
-  case PAINT_BLEND_SCREEN:
-    return CAIRO_OPERATOR_SCREEN;
-  case PAINT_BLEND_OVERLAY:
-    return CAIRO_OPERATOR_OVERLAY;
-  case PAINT_BLEND_DARKEN:
-    return CAIRO_OPERATOR_DARKEN;
-  case PAINT_BLEND_LIGHTEN:
-    return CAIRO_OPERATOR_LIGHTEN;
-  case PAINT_BLEND_NORMAL:
-  default:
-    return CAIRO_OPERATOR_OVER;
-  }
-}
-
-static gboolean
-needs_composite_surface (const PaintDocument *doc)
-{
-  if (!doc || !doc->layers || doc->layers->len != 1 || doc->has_active_hole)
-    return TRUE;
-  const PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
-  return !l0->visible || l0->opacity < 0.999 || l0->blend_mode != PAINT_BLEND_NORMAL;
-}
-
-static void
-composite_region_into (const PaintDocument *doc,
-                       cairo_surface_t *dst,
-                       int rx,
-                       int ry,
-                       int rw,
-                       int rh)
-{
-  int x0 = CLAMP (rx, 0, doc->width);
-  int y0 = CLAMP (ry, 0, doc->height);
-  int x1 = CLAMP (rx + rw, 0, doc->width);
-  int y1 = CLAMP (ry + rh, 0, doc->height);
-  int cw = x1 - x0;
-  int ch = y1 - y0;
-  if (cw <= 0 || ch <= 0)
-    return;
-
-  cairo_t *cr = cairo_create (dst);
-  cairo_rectangle (cr, (double) x0, (double) y0, (double) cw, (double) ch);
-  cairo_clip (cr);
-  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
-  cairo_paint (cr);
-
-  for (guint i = 0; i < doc->layers->len; i++) {
-    const PaintLayer *layer = g_ptr_array_index (doc->layers, i);
-    if (!layer->visible || layer->opacity <= 0.001)
-      continue;
-
-    cairo_save (cr);
-    if (doc->has_active_hole && (int) i == doc->active_layer_index) {
-      int hx0 = MAX (x0, doc->active_hole.x);
-      int hy0 = MAX (y0, doc->active_hole.y);
-      int hx1 = MIN (x1, doc->active_hole.x + doc->active_hole.width);
-      int hy1 = MIN (y1, doc->active_hole.y + doc->active_hole.height);
-      if (hx1 > hx0 && hy1 > hy0) {
-        if (i == 0 && doc->background_color.alpha > 0.0f) {
-          cairo_save (cr);
-          cairo_rectangle (cr, (double) hx0, (double) hy0,
-                           (double) (hx1 - hx0), (double) (hy1 - hy0));
-          cairo_clip (cr);
-          cairo_set_source_rgba (cr,
-                                 doc->background_color.red,
-                                 doc->background_color.green,
-                                 doc->background_color.blue,
-                                 doc->background_color.alpha);
-          cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-          cairo_paint (cr);
-          cairo_restore (cr);
-        }
-
-        cairo_set_fill_rule (cr, CAIRO_FILL_RULE_EVEN_ODD);
-        cairo_rectangle (cr, (double) x0, (double) y0, (double) cw, (double) ch);
-        cairo_rectangle (cr, (double) hx0, (double) hy0,
-                         (double) (hx1 - hx0), (double) (hy1 - hy0));
-        cairo_clip (cr);
-      }
-    }
-
-    cairo_set_operator (cr, blend_mode_to_cairo (layer->blend_mode));
-    cairo_set_source_surface (cr, layer->surface, 0.0, 0.0);
-    if (layer->opacity >= 0.999)
-      cairo_paint (cr);
-    else
-      cairo_paint_with_alpha (cr, layer->opacity);
-    cairo_restore (cr);
-  }
-  cairo_destroy (cr);
-}
-
-static void mark_all_dirty (PaintDocument *doc);
-
-static void
-recomposite_all (PaintDocument *doc)
-{
-  if (!doc || !doc->layers || doc->layers->len == 0)
-    return;
-
-  if (!needs_composite_surface (doc)) {
-    g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-    PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
-    doc->surface = l0->surface;
-    return;
-  }
-
-  if (!doc->composite_surface ||
-      cairo_image_surface_get_width (doc->composite_surface) != doc->width ||
-      cairo_image_surface_get_height (doc->composite_surface) != doc->height) {
-    g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-    doc->composite_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                         doc->width,
-                                                         doc->height);
-  }
-  doc->surface = doc->composite_surface;
-  composite_region_into (doc, doc->composite_surface, 0, 0, doc->width, doc->height);
-}
-
-static void
-recomposite_rect (PaintDocument *doc, int rx, int ry, int rw, int rh)
-{
-  if (!doc || !doc->layers || doc->layers->len == 0)
-    return;
-
-  if (needs_composite_surface (doc)) {
-    if (!doc->composite_surface ||
-        cairo_image_surface_get_width (doc->composite_surface) != doc->width ||
-        cairo_image_surface_get_height (doc->composite_surface) != doc->height) {
-      recomposite_all (doc);
-      mark_all_dirty (doc);
-      return;
-    }
-    doc->surface = doc->composite_surface;
-    composite_region_into (doc, doc->composite_surface, rx, ry, rw, rh);
-  } else if (doc->composite_surface) {
-    recomposite_all (doc);
-    mark_all_dirty (doc);
-  } else {
-    PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
-    doc->surface = l0->surface;
-  }
-}
-
-static void
-mark_all_dirty (PaintDocument *doc)
-{
-  doc->all_dirty = TRUE;
-  doc->has_dirty_rect = FALSE;
-}
-
-static void
-mark_rect_dirty (PaintDocument *doc, int x, int y, int w, int h)
-{
-  if (doc->all_dirty)
-    return;
-  int x0 = MAX (0, x);
-  int y0 = MAX (0, y);
-  int x1 = MIN (doc->width, x + w);
-  int y1 = MIN (doc->height, y + h);
-  if (x0 >= x1 || y0 >= y1)
-    return;
-
-  if (!doc->has_dirty_rect) {
-    doc->dirty_rect = (cairo_rectangle_int_t) { x0, y0, x1 - x0, y1 - y0 };
-    doc->has_dirty_rect = TRUE;
-  } else {
-    int ux0 = MIN (doc->dirty_rect.x, x0);
-    int uy0 = MIN (doc->dirty_rect.y, y0);
-    int ux1 = MAX (doc->dirty_rect.x + doc->dirty_rect.width, x1);
-    int uy1 = MAX (doc->dirty_rect.y + doc->dirty_rect.height, y1);
-    doc->dirty_rect = (cairo_rectangle_int_t) { ux0, uy0, ux1 - ux0, uy1 - uy0 };
-  }
-}
-
-static void
-push_undo_step (PaintDocument *doc, UndoStep *step)
-{
-  g_ptr_array_add (doc->undo_stack, step);
-  if (doc->undo_stack->len > MAX_UNDO_STEPS)
-    g_ptr_array_remove_index (doc->undo_stack, 0);
-  g_ptr_array_set_size (doc->redo_stack, 0);
-}
-
-static cairo_surface_t *
-create_blank_surface (int width, int height, const GdkRGBA *bg)
-{
-  cairo_surface_t *surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, width, height);
-  cairo_t *cr = cairo_create (surface);
-  cairo_set_source_rgba (cr, bg->red, bg->green, bg->blue, bg->alpha);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-  return surface;
-}
-
-static PaintDocument *
-paint_document_new_with_background (int width, int height, const GdkRGBA *bg)
-{
-  PaintDocument *doc = g_new0 (PaintDocument, 1);
-  doc->width = MAX (1, width);
-  doc->height = MAX (1, height);
-  doc->background_color = *bg;
-  doc->layers = g_ptr_array_new_with_free_func (paint_layer_free);
-  cairo_surface_t *bg_surf = create_blank_surface (doc->width, doc->height, &doc->background_color);
-  g_ptr_array_add (doc->layers,
-                   paint_layer_new ("Background", bg_surf, TRUE, 1.0, PAINT_BLEND_NORMAL));
-  doc->active_layer_index = 0;
-  doc->next_layer_num = 1;
-  doc->layers_revision = 1;
-  doc->surface = bg_surf;
-  doc->undo_stack = g_ptr_array_new_with_free_func (undo_step_free);
-  doc->redo_stack = g_ptr_array_new_with_free_func (undo_step_free);
-  doc->all_dirty = TRUE;
-  return doc;
-}
-
-PaintDocument *
-paint_document_new (int width, int height)
-{
-  GdkRGBA white = { 1.0f, 1.0f, 1.0f, 1.0f };
-  return paint_document_new_with_background (width, height, &white);
-}
-
-PaintDocument *
-paint_document_new_transparent (int width, int height)
-{
-  GdkRGBA transparent = { 0.0f, 0.0f, 0.0f, 0.0f };
-  return paint_document_new_with_background (width, height, &transparent);
-}
-
-static gboolean
-surface_has_transparency (cairo_surface_t *surface)
-{
-  if (!surface || cairo_surface_get_type (surface) != CAIRO_SURFACE_TYPE_IMAGE)
-    return FALSE;
-  if (cairo_image_surface_get_format (surface) != CAIRO_FORMAT_ARGB32)
-    return FALSE;
-
-  cairo_surface_flush (surface);
-  int w = cairo_image_surface_get_width (surface);
-  int h = cairo_image_surface_get_height (surface);
-  int stride = cairo_image_surface_get_stride (surface);
-  const unsigned char *data = cairo_image_surface_get_data (surface);
-
-  for (int y = 0; y < h; y++) {
-    const uint32_t *row = (const uint32_t *) (data + (gsize) y * (gsize) stride);
-    for (int x = 0; x < w; x++) {
-      if (((row[x] >> 24) & 0xFFU) < 255U)
-        return TRUE;
-    }
-  }
-  return FALSE;
-}
-
-typedef struct {
-  const guint8 *data;
-  gsize size;
-  gsize offset;
-} PngReadCursor;
-
-static cairo_status_t
-cairo_read_from_bytes (void *closure, unsigned char *out, unsigned int length)
-{
-  PngReadCursor *cursor = closure;
-  if (cursor->offset + length > cursor->size)
-    return CAIRO_STATUS_READ_ERROR;
-  memcpy (out, cursor->data + cursor->offset, length);
-  cursor->offset += length;
-  return CAIRO_STATUS_SUCCESS;
-}
-
-static cairo_status_t
-cairo_write_to_byte_array (void *closure, const unsigned char *data, unsigned int length)
-{
-  GByteArray *arr = closure;
-  g_byte_array_append (arr, data, length);
-  return CAIRO_STATUS_SUCCESS;
-}
-
-PaintDocument *
-paint_document_new_from_file (GFile *file, GError **error)
-{
-  g_return_val_if_fail (G_IS_FILE (file), NULL);
-
-  g_autofree char *path = g_file_get_path (file);
-  g_autofree char *lower = path ? g_ascii_strdown (path, -1) : NULL;
-  cairo_surface_t *loaded = NULL;
-
-  if (lower && g_str_has_suffix (lower, ".png")) {
-    loaded = cairo_image_surface_create_from_png (path);
-    if (cairo_surface_status (loaded) != CAIRO_STATUS_SUCCESS) {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to read PNG image: %s",
-                   cairo_status_to_string (cairo_surface_status (loaded)));
-      cairo_surface_destroy (loaded);
-      return NULL;
-    }
-  } else {
-    g_autoptr (GdkTexture) texture = gdk_texture_new_from_file (file, error);
-    if (!texture)
-      return NULL;
-    g_autoptr (GBytes) png_bytes = gdk_texture_save_to_png_bytes (texture);
-    gsize size = 0;
-    const guint8 *ptr = g_bytes_get_data (png_bytes, &size);
-    PngReadCursor cursor = { ptr, size, 0 };
-    loaded = cairo_image_surface_create_from_png_stream (cairo_read_from_bytes, &cursor);
-    if (cairo_surface_status (loaded) != CAIRO_STATUS_SUCCESS) {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to decode image surface");
-      cairo_surface_destroy (loaded);
-      return NULL;
-    }
-  }
-
-  int w = cairo_image_surface_get_width (loaded);
-  int h = cairo_image_surface_get_height (loaded);
-  gboolean has_alpha = surface_has_transparency (loaded);
-  PaintDocument *doc = has_alpha ? paint_document_new_transparent (w, h)
-                                 : paint_document_new (w, h);
-  PaintLayer *l0 = get_active_layer (doc);
-  cairo_t *cr = cairo_create (l0->surface);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, loaded, 0, 0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-  cairo_surface_destroy (loaded);
-
-  doc->file = g_object_ref (file);
-  doc->modified = FALSE;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  return doc;
-}
-
-PaintDocument *
-paint_document_new_from_draft (GFile *draft_file,
-                               GFile *original_file,
-                               gboolean modified,
-                               GError **error)
-{
-  PaintDocument *doc = paint_document_new_from_file (draft_file, error);
-  if (!doc)
-    return NULL;
-  g_set_object (&doc->file, original_file);
-  doc->modified = modified;
-  return doc;
-}
-
-void
-paint_document_free (PaintDocument *doc)
-{
-  if (!doc)
-    return;
-  g_clear_pointer (&doc->active_stroke_undo, undo_step_free);
-  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-  doc->surface = NULL;
-  g_clear_pointer (&doc->layers, g_ptr_array_unref);
-  g_clear_object (&doc->file);
-  g_clear_pointer (&doc->undo_stack, g_ptr_array_unref);
-  g_clear_pointer (&doc->redo_stack, g_ptr_array_unref);
-  g_free (doc);
-}
-
-int
-paint_document_get_width (const PaintDocument *doc)
-{
-  return doc->width;
-}
-
-int
-paint_document_get_height (const PaintDocument *doc)
-{
-  return doc->height;
-}
-
-cairo_surface_t *
-paint_document_get_surface (const PaintDocument *doc)
-{
-  return doc->surface;
-}
-
-GFile *
-paint_document_get_file (const PaintDocument *doc)
-{
-  return doc->file;
-}
-
-gboolean
-paint_document_get_modified (const PaintDocument *doc)
-{
-  return doc->modified;
-}
-
-void
-paint_document_set_modified (PaintDocument *doc, gboolean modified)
-{
-  doc->modified = modified;
-}
-
-gboolean
-paint_document_has_transparent_background (const PaintDocument *doc)
-{
-  return doc && doc->background_color.alpha < 0.5f;
-}
-
-gboolean
-paint_document_can_undo (const PaintDocument *doc)
-{
-  return doc->undo_stack->len > 0 || doc->active_stroke_undo != NULL;
-}
-
-gboolean
-paint_document_can_redo (const PaintDocument *doc)
-{
-  return doc->redo_stack->len > 0;
-}
-
-static UndoStep *
-apply_undo_step (PaintDocument *doc, const UndoStep *step)
-{
-  if (step->is_full) {
-    UndoStep *reverse = undo_step_new_full_doc (doc);
-    doc->has_active_hole = FALSE;
-    doc->active_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
-    g_ptr_array_set_size (doc->layers, 0);
-    for (guint i = 0; i < step->layer_snaps->len; i++) {
-      const UndoLayerSnapshot *snap = g_ptr_array_index (step->layer_snaps, i);
-      g_ptr_array_add (doc->layers, undo_layer_snapshot_restore (snap));
-    }
-    doc->width = step->width;
-    doc->height = step->height;
-    doc->background_color = step->background_color;
-    doc->active_layer_index = CLAMP (step->active_layer_index, 0, MAX (0, (int) doc->layers->len - 1));
-    doc->next_layer_num = step->next_layer_num;
-    g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-    recomposite_all (doc);
-    doc->layers_revision++;
-    mark_all_dirty (doc);
-    return reverse;
-  }
-
-  int idx = CLAMP (step->layer_index, 0, MAX (0, (int) doc->layers->len - 1));
-  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) idx);
-  UndoStep *reverse = undo_step_new_tiled (doc->width, doc->height, idx);
-  for (guint i = 0; i < step->tiles->len; i++) {
-    const UndoTile *t = g_ptr_array_index (step->tiles, i);
-    g_ptr_array_add (reverse->tiles, capture_rect_tile (layer->surface, t->x, t->y, t->w, t->h));
-    restore_rect_tile (layer->surface, t);
-    recomposite_rect (doc, t->x, t->y, t->w, t->h);
-    mark_rect_dirty (doc, t->x, t->y, t->w, t->h);
-  }
-  cairo_surface_mark_dirty (layer->surface);
-  if (doc->active_layer_index != idx) {
-    doc->active_layer_index = idx;
-    doc->layers_revision++;
-  }
-  return reverse;
-}
-
-gboolean
-paint_document_undo (PaintDocument *doc)
-{
-  if (doc->active_stroke_undo) {
-    push_undo_step (doc, doc->active_stroke_undo);
-    doc->active_stroke_undo = NULL;
-  }
-  if (doc->undo_stack->len == 0)
-    return FALSE;
-
-  guint last = doc->undo_stack->len - 1;
-  const UndoStep *step = g_ptr_array_index (doc->undo_stack, last);
-  g_ptr_array_add (doc->redo_stack, apply_undo_step (doc, step));
-  g_ptr_array_remove_index (doc->undo_stack, last);
-  doc->modified = TRUE;
-  return TRUE;
-}
-
-gboolean
-paint_document_redo (PaintDocument *doc)
-{
-  if (doc->redo_stack->len == 0)
-    return FALSE;
-
-  guint last = doc->redo_stack->len - 1;
-  const UndoStep *step = g_ptr_array_index (doc->redo_stack, last);
-  g_ptr_array_add (doc->undo_stack, apply_undo_step (doc, step));
-  g_ptr_array_remove_index (doc->redo_stack, last);
-  doc->modified = TRUE;
-  return TRUE;
-}
-
-static void
-compute_stroke_bounds (double x0,
-                       double y0,
-                       double x1,
-                       double y1,
-                       double stroke_size,
-                       int *rx,
-                       int *ry,
-                       int *rw,
-                       int *rh)
-{
-  int pad = (int) ceil (stroke_size / 2.0) + 4;
-  double min_x = MIN (x0, x1);
-  double max_x = MAX (x0, x1);
-  double min_y = MIN (y0, y1);
-  double max_y = MAX (y0, y1);
-
-  *rx = (int) floor (min_x) - pad;
-  *ry = (int) floor (min_y) - pad;
-  *rw = (int) ceil (max_x - min_x) + pad * 2 + 2;
-  *rh = (int) ceil (max_y - min_y) + pad * 2 + 2;
-}
-
-static void
-compute_tool_stroke_bounds (const PaintTool *tool,
-                            const PaintToolSettings *settings,
-                            double x0,
-                            double y0,
-                            double x1,
-                            double y1,
-                            int *rx,
-                            int *ry,
-                            int *rw,
-                            int *rh)
-{
-  if (tool && tool->get_bounds) {
-    double bx0, by0, bx1, by1;
-    tool->get_bounds (tool, x0, y0, x1, y1, settings, &bx0, &by0, &bx1, &by1);
-    *rx = (int) floor (bx0) - 4;
-    *ry = (int) floor (by0) - 4;
-    *rw = (int) ceil (bx1 - bx0) + 10;
-    *rh = (int) ceil (by1 - by0) + 10;
-    return;
-  }
-
-  double stroke_size = (tool && tool->uses_brush_size) ? settings->size : 1.0;
-  compute_stroke_bounds (x0, y0, x1, y1, stroke_size, rx, ry, rw, rh);
-}
-
-void
-paint_document_begin_stroke (PaintDocument *doc,
-                             double x,
-                             double y,
-                             const PaintTool *tool,
-                             PaintToolSettings *settings)
-{
-  if (doc->active_stroke_undo) {
-    push_undo_step (doc, doc->active_stroke_undo);
-    doc->active_stroke_undo = NULL;
-  }
-
-  PaintLayer *active = get_active_layer (doc);
-  if (!active)
-    return;
-
-  doc->pre_stroke_modified = doc->modified;
-  doc->stroke_start_x = x;
-  doc->stroke_start_y = y;
-  doc->prev_stroke_x = x;
-  doc->prev_stroke_y = y;
-  doc->prev2_stroke_x = x;
-  doc->prev2_stroke_y = y;
-
-  GdkRGBA prev_bg = settings->background_color;
-  settings->background_color = get_active_layer_clear_color (doc);
-
-  if (tool->draw_preview) {
-    cairo_t *cr = cairo_create (active->surface);
-    tool->begin_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    settings->background_color = prev_bg;
-    return;
-  }
-
-  if (tool->uses_brush_size) {
-    int rx, ry, rw, rh;
-    compute_stroke_bounds (x, y, x, y, settings->size, &rx, &ry, &rw, &rh);
-
-    doc->active_stroke_undo = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
-    undo_step_capture_rect (doc->active_stroke_undo, active->surface, rx, ry, rw, rh);
-
-    cairo_t *cr = cairo_create (active->surface);
-    tool->begin_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    recomposite_rect (doc, rx, ry, rw, rh);
-    mark_rect_dirty (doc, rx, ry, rw, rh);
-  } else {
-    push_undo_step (doc, undo_step_new_full_doc (doc));
-    cairo_t *cr = cairo_create (active->surface);
-    tool->begin_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    recomposite_all (doc);
-    mark_all_dirty (doc);
-  }
-
-  settings->background_color = prev_bg;
-  doc->modified = TRUE;
-}
-
-void
-paint_document_continue_stroke (PaintDocument *doc,
-                                double x,
-                                double y,
-                                const PaintTool *tool,
-                                PaintToolSettings *settings)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active)
-    return;
-
-  GdkRGBA prev_bg = settings->background_color;
-  settings->background_color = get_active_layer_clear_color (doc);
-
-  if (tool->draw_preview) {
-    cairo_t *cr = cairo_create (active->surface);
-    tool->continue_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    settings->background_color = prev_bg;
-    return;
-  }
-
-  if (tool->uses_brush_size) {
-    if (!doc->active_stroke_undo)
-      doc->active_stroke_undo = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
-
-    int pad = (int) ceil (settings->size / 2.0) + 4;
-    double min_x = MIN (MIN (doc->prev2_stroke_x, doc->prev_stroke_x), x);
-    double max_x = MAX (MAX (doc->prev2_stroke_x, doc->prev_stroke_x), x);
-    double min_y = MIN (MIN (doc->prev2_stroke_y, doc->prev_stroke_y), y);
-    double max_y = MAX (MAX (doc->prev2_stroke_y, doc->prev_stroke_y), y);
-
-    int rx = (int) floor (min_x) - pad;
-    int ry = (int) floor (min_y) - pad;
-    int rw = (int) ceil (max_x - min_x) + pad * 2 + 2;
-    int rh = (int) ceil (max_y - min_y) + pad * 2 + 2;
-
-    undo_step_capture_rect (doc->active_stroke_undo, active->surface, rx, ry, rw, rh);
-
-    cairo_t *cr = cairo_create (active->surface);
-    tool->continue_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    recomposite_rect (doc, rx, ry, rw, rh);
-    mark_rect_dirty (doc, rx, ry, rw, rh);
-
-    doc->prev2_stroke_x = doc->prev_stroke_x;
-    doc->prev2_stroke_y = doc->prev_stroke_y;
-    doc->prev_stroke_x = x;
-    doc->prev_stroke_y = y;
-  } else {
-    cairo_t *cr = cairo_create (active->surface);
-    tool->continue_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    recomposite_all (doc);
-    mark_all_dirty (doc);
-  }
-
-  settings->background_color = prev_bg;
-  doc->modified = TRUE;
-}
-
-void
-paint_document_end_stroke (PaintDocument *doc,
-                           double x,
-                           double y,
-                           const PaintTool *tool,
-                           PaintToolSettings *settings)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active)
-    return;
-
-  GdkRGBA prev_bg = settings->background_color;
-  settings->background_color = get_active_layer_clear_color (doc);
-
-  if (tool->draw_preview) {
-    int rx, ry, rw, rh;
-    compute_tool_stroke_bounds (tool, settings, doc->stroke_start_x, doc->stroke_start_y,
-                                x, y, &rx, &ry, &rw, &rh);
-
-    UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
-    undo_step_capture_rect (step, active->surface, rx, ry, rw, rh);
-
-    cairo_t *cr = cairo_create (active->surface);
-    tool->end_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    recomposite_rect (doc, rx, ry, rw, rh);
-    mark_rect_dirty (doc, rx, ry, rw, rh);
-
-    push_undo_step (doc, step);
-    settings->background_color = prev_bg;
-    doc->modified = TRUE;
-    return;
-  }
-
-  if (tool->uses_brush_size) {
-    int rx, ry, rw, rh;
-    compute_stroke_bounds (doc->prev_stroke_x, doc->prev_stroke_y, x, y,
-                           settings->size, &rx, &ry, &rw, &rh);
-
-    if (doc->active_stroke_undo)
-      undo_step_capture_rect (doc->active_stroke_undo, active->surface, rx, ry, rw, rh);
-
-    cairo_t *cr = cairo_create (active->surface);
-    tool->end_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    recomposite_rect (doc, rx, ry, rw, rh);
-    mark_rect_dirty (doc, rx, ry, rw, rh);
-
-    if (doc->active_stroke_undo) {
-      push_undo_step (doc, doc->active_stroke_undo);
-      doc->active_stroke_undo = NULL;
-    }
-  } else {
-    cairo_t *cr = cairo_create (active->surface);
-    tool->end_stroke (tool, cr, x, y, settings);
-    cairo_destroy (cr);
-    recomposite_all (doc);
-    mark_all_dirty (doc);
-  }
-
-  settings->background_color = prev_bg;
-  doc->modified = TRUE;
-}
-
-void
-paint_document_cancel_stroke (PaintDocument *doc)
-{
-  if (!doc || !doc->active_stroke_undo)
-    return;
-
-  UndoStep *step = doc->active_stroke_undo;
-  doc->active_stroke_undo = NULL;
-
-  int idx = CLAMP (step->layer_index, 0, MAX (0, (int) doc->layers->len - 1));
-  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) idx);
-
-  for (guint i = 0; i < step->tiles->len; i++) {
-    const UndoTile *t = g_ptr_array_index (step->tiles, i);
-    restore_rect_tile (layer->surface, t);
-    recomposite_rect (doc, t->x, t->y, t->w, t->h);
-    mark_rect_dirty (doc, t->x, t->y, t->w, t->h);
-  }
-  cairo_surface_mark_dirty (layer->surface);
-  undo_step_free (step);
-  doc->modified = doc->pre_stroke_modified;
-}
-
-static void
-flush_active_stroke_undo (PaintDocument *doc)
-{
-  if (doc->active_stroke_undo) {
-    push_undo_step (doc, doc->active_stroke_undo);
-    doc->active_stroke_undo = NULL;
-  }
-}
-
-void
-paint_document_clear (PaintDocument *doc)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active)
-    return;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  GdkRGBA clr = get_active_layer_clear_color (doc);
-  cairo_t *cr = cairo_create (active->surface);
-  cairo_set_source_rgba (cr, clr.red, clr.green, clr.blue, clr.alpha);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-
-  recomposite_all (doc);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-void
-paint_document_clear_transparent (PaintDocument *doc)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active)
-    return;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-  if (doc->active_layer_index == 0)
-    doc->background_color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
-
-  cairo_t *cr = cairo_create (active->surface);
-  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-
-  recomposite_all (doc);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-void
-paint_document_resize (PaintDocument *doc, int new_width, int new_height)
-{
-  int w = MAX (1, new_width);
-  int h = MAX (1, new_height);
-  if (w == doc->width && h == doc->height)
-    return;
-
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  GdkRGBA transparent = { 0.0f, 0.0f, 0.0f, 0.0f };
-  for (guint i = 0; i < doc->layers->len; i++) {
-    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
-    const GdkRGBA *pad_bg = (i == 0) ? &doc->background_color : &transparent;
-    cairo_surface_t *new_surface = create_blank_surface (w, h, pad_bg);
-    cairo_t *cr = cairo_create (new_surface);
-    cairo_rectangle (cr, 0.0, 0.0, (double) MIN (w, doc->width), (double) MIN (h, doc->height));
-    cairo_clip (cr);
-    cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_surface (cr, layer->surface, 0, 0);
-    cairo_paint (cr);
-    cairo_destroy (cr);
-    cairo_surface_destroy (layer->surface);
-    layer->surface = new_surface;
-  }
-
-  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-  doc->width = w;
-  doc->height = h;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-void
-paint_document_scale (PaintDocument *doc, int new_width, int new_height)
-{
-  int w = MAX (1, new_width);
-  int h = MAX (1, new_height);
-  if (w == doc->width && h == doc->height)
-    return;
-
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  double sx = (double) w / (double) doc->width;
-  double sy = (double) h / (double) doc->height;
-  for (guint i = 0; i < doc->layers->len; i++) {
-    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
-    cairo_surface_t *new_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
-    cairo_t *cr = cairo_create (new_surface);
-    cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-    cairo_scale (cr, sx, sy);
-    cairo_set_source_surface (cr, layer->surface, 0.0, 0.0);
-    cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BEST);
-    cairo_paint (cr);
-    cairo_destroy (cr);
-    cairo_surface_destroy (layer->surface);
-    layer->surface = new_surface;
-  }
-
-  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-  doc->width = w;
-  doc->height = h;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-void
-paint_document_crop (PaintDocument *doc, int x, int y, int w, int h)
-{
-  int x0 = CLAMP (x, 0, doc->width);
-  int y0 = CLAMP (y, 0, doc->height);
-  int x1 = CLAMP (x + w, 0, doc->width);
-  int y1 = CLAMP (y + h, 0, doc->height);
-  int cw = x1 - x0;
-  int ch = y1 - y0;
-  if (cw <= 0 || ch <= 0)
-    return;
-  if (x0 == 0 && y0 == 0 && cw == doc->width && ch == doc->height)
-    return;
-
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  for (guint i = 0; i < doc->layers->len; i++) {
-    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
-    cairo_surface_t *new_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, cw, ch);
-    cairo_t *cr = cairo_create (new_surface);
-    cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_surface (cr, layer->surface, (double) -x0, (double) -y0);
-    cairo_paint (cr);
-    cairo_destroy (cr);
-    cairo_surface_destroy (layer->surface);
-    layer->surface = new_surface;
-  }
-
-  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-  doc->width = cw;
-  doc->height = ch;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-cairo_surface_t *
-paint_surface_rotate_90 (cairo_surface_t *src, gboolean clockwise)
-{
-  cairo_surface_flush (src);
-  int w = cairo_image_surface_get_width (src);
-  int h = cairo_image_surface_get_height (src);
-  int s_stride = cairo_image_surface_get_stride (src);
-  const uint32_t *s_px = (const uint32_t *) cairo_image_surface_get_data (src);
-  int s_stride_px = s_stride / 4;
-
-  cairo_surface_t *dst = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, h, w);
-  int d_stride = cairo_image_surface_get_stride (dst);
-  uint32_t *d_px = (uint32_t *) cairo_image_surface_get_data (dst);
-  int d_stride_px = d_stride / 4;
-
-  for (int y = 0; y < h; y++) {
-    const uint32_t *srow = s_px + (gsize) y * (gsize) s_stride_px;
-    for (int x = 0; x < w; x++) {
-      int dx = clockwise ? (h - 1 - y) : y;
-      int dy = clockwise ? x : (w - 1 - x);
-      d_px[(gsize) dy * (gsize) d_stride_px + dx] = srow[x];
-    }
-  }
-  cairo_surface_mark_dirty (dst);
-  return dst;
-}
-
-cairo_surface_t *
-paint_surface_flip (cairo_surface_t *src, gboolean horizontal)
-{
-  cairo_surface_flush (src);
-  int w = cairo_image_surface_get_width (src);
-  int h = cairo_image_surface_get_height (src);
-  int s_stride = cairo_image_surface_get_stride (src);
-  const uint32_t *s_px = (const uint32_t *) cairo_image_surface_get_data (src);
-  int s_stride_px = s_stride / 4;
-
-  cairo_surface_t *dst = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
-  int d_stride = cairo_image_surface_get_stride (dst);
-  uint32_t *d_px = (uint32_t *) cairo_image_surface_get_data (dst);
-  int d_stride_px = d_stride / 4;
-
-  for (int y = 0; y < h; y++) {
-    int dy = horizontal ? y : (h - 1 - y);
-    const uint32_t *srow = s_px + (gsize) y * (gsize) s_stride_px;
-    uint32_t *drow = d_px + (gsize) dy * (gsize) d_stride_px;
-    if (horizontal) {
-      for (int x = 0; x < w; x++)
-        drow[w - 1 - x] = srow[x];
-    } else {
-      memcpy (drow, srow, (gsize) w * 4);
-    }
-  }
-  cairo_surface_mark_dirty (dst);
-  return dst;
-}
-
-void
-paint_document_rotate_90 (PaintDocument *doc, gboolean clockwise)
-{
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  for (guint i = 0; i < doc->layers->len; i++) {
-    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
-    cairo_surface_t *rot = paint_surface_rotate_90 (layer->surface, clockwise);
-    cairo_surface_destroy (layer->surface);
-    layer->surface = rot;
-  }
-
-  g_clear_pointer (&doc->composite_surface, cairo_surface_destroy);
-  PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
-  doc->width = cairo_image_surface_get_width (l0->surface);
-  doc->height = cairo_image_surface_get_height (l0->surface);
-  doc->layers_revision++;
-  recomposite_all (doc);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-void
-paint_document_flip (PaintDocument *doc, gboolean horizontal)
-{
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  for (guint i = 0; i < doc->layers->len; i++) {
-    PaintLayer *layer = g_ptr_array_index (doc->layers, i);
-    cairo_surface_t *flipped = paint_surface_flip (layer->surface, horizontal);
-    cairo_surface_destroy (layer->surface);
-    layer->surface = flipped;
-  }
-
-  recomposite_all (doc);
-  doc->modified = TRUE;
-  mark_all_dirty (doc);
-}
-
-gboolean
-paint_document_pick_color (const PaintDocument *doc,
-                           double x,
-                           double y,
-                           GdkRGBA *out_color)
-{
-  if (!doc || !doc->surface || !out_color)
-    return FALSE;
-
-  int px = (int) floor (x);
-  int py = (int) floor (y);
-  if (px < 0 || px >= doc->width || py < 0 || py >= doc->height)
-    return FALSE;
-
-  cairo_surface_flush (doc->surface);
-  int stride = cairo_image_surface_get_stride (doc->surface);
-  const unsigned char *data = cairo_image_surface_get_data (doc->surface);
-  uint32_t argb = ((const uint32_t *) (data + (gsize) py * (gsize) stride))[px];
-
-  uint8_t a = (uint8_t) ((argb >> 24) & 0xFFU);
-  uint8_t r = (uint8_t) ((argb >> 16) & 0xFFU);
-  uint8_t g = (uint8_t) ((argb >> 8) & 0xFFU);
-  uint8_t b = (uint8_t) (argb & 0xFFU);
-
-  if (a == 0) {
-    *out_color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
-  } else {
-    *out_color = (GdkRGBA) {
-      CLAMP ((float) r / (float) a, 0.0f, 1.0f),
-      CLAMP ((float) g / (float) a, 0.0f, 1.0f),
-      CLAMP ((float) b / (float) a, 0.0f, 1.0f),
-      (float) a / 255.0f
-    };
-  }
-  return TRUE;
-}
-
-void
-paint_document_shift_preview_start (PaintDocument *doc,
-                                    PaintToolSettings *settings,
-                                    double new_x0,
-                                    double new_y0)
-{
-  if (!doc)
-    return;
-  doc->stroke_start_x = new_x0;
-  doc->stroke_start_y = new_y0;
-  if (settings && settings->history_points && settings->history_points->len > 0) {
-    PaintPoint *pt = &g_array_index (settings->history_points, PaintPoint, 0);
-    pt->x = new_x0;
-    pt->y = new_y0;
-  }
-}
-
-cairo_surface_t *
-paint_document_copy_rect (const PaintDocument *doc, int x, int y, int w, int h)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active || !active->surface)
-    return NULL;
-  int x0 = CLAMP (x, 0, doc->width);
-  int y0 = CLAMP (y, 0, doc->height);
-  int x1 = CLAMP (x + w, 0, doc->width);
-  int y1 = CLAMP (y + h, 0, doc->height);
-  int cw = x1 - x0;
-  int ch = y1 - y0;
-  if (cw <= 0 || ch <= 0)
-    return NULL;
-
-  cairo_surface_t *copy = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, cw, ch);
-  cairo_t *cr = cairo_create (copy);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, active->surface, (double) -x0, (double) -y0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-  return copy;
-}
-
-static void
-fill_layer_rect_with_clear_color (const PaintDocument *doc,
-                                  PaintLayer *layer,
-                                  int x0,
-                                  int y0,
-                                  int w,
-                                  int h)
-{
-  GdkRGBA clr = get_active_layer_clear_color (doc);
-  cairo_t *cr = cairo_create (layer->surface);
-  cairo_rectangle (cr, (double) x0, (double) y0, (double) w, (double) h);
-  cairo_clip (cr);
-  cairo_set_source_rgba (cr, clr.red, clr.green, clr.blue, clr.alpha);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-}
-
-void
-paint_document_clear_rect (PaintDocument *doc, int x, int y, int w, int h)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active)
-    return;
-  int x0 = CLAMP (x, 0, doc->width);
-  int y0 = CLAMP (y, 0, doc->height);
-  int x1 = CLAMP (x + w, 0, doc->width);
-  int y1 = CLAMP (y + h, 0, doc->height);
-  if (x1 <= x0 || y1 <= y0)
-    return;
-
-  flush_active_stroke_undo (doc);
-  UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
-  undo_step_capture_rect (step, active->surface, x0, y0, x1 - x0, y1 - y0);
-  fill_layer_rect_with_clear_color (doc, active, x0, y0, x1 - x0, y1 - y0);
-  recomposite_rect (doc, x0, y0, x1 - x0, y1 - y0);
-  mark_rect_dirty (doc, x0, y0, x1 - x0, y1 - y0);
-  push_undo_step (doc, step);
-  doc->modified = TRUE;
-}
-
-void
-paint_document_blit_surface (PaintDocument *doc, cairo_surface_t *src, int x, int y)
-{
-  paint_document_commit_move (doc, NULL, src, x, y);
-}
-
-void
-paint_document_commit_move (PaintDocument *doc,
-                            const cairo_rectangle_int_t *src_hole,
-                            cairo_surface_t *floating,
-                            int dst_x,
-                            int dst_y)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active || (!src_hole && !floating))
-    return;
-
-  flush_active_stroke_undo (doc);
-  gboolean had_hole = doc->has_active_hole;
-  cairo_rectangle_int_t prev_hole = doc->active_hole;
-  doc->has_active_hole = FALSE;
-  doc->active_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
-
-  UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
-
-  int hx0 = 0, hy0 = 0, hw = 0, hh = 0;
-  if (src_hole && src_hole->width > 0 && src_hole->height > 0) {
-    hx0 = CLAMP (src_hole->x, 0, doc->width);
-    hy0 = CLAMP (src_hole->y, 0, doc->height);
-    int hx1 = CLAMP (src_hole->x + src_hole->width, 0, doc->width);
-    int hy1 = CLAMP (src_hole->y + src_hole->height, 0, doc->height);
-    hw = hx1 - hx0;
-    hh = hy1 - hy0;
-    if (hw > 0 && hh > 0)
-      undo_step_capture_rect (step, active->surface, hx0, hy0, hw, hh);
-  }
-
-  int dx0 = 0, dy0 = 0, dw = 0, dh = 0;
-  if (floating) {
-    int fw = cairo_image_surface_get_width (floating);
-    int fh = cairo_image_surface_get_height (floating);
-    dx0 = CLAMP (dst_x, 0, doc->width);
-    dy0 = CLAMP (dst_y, 0, doc->height);
-    int dx1 = CLAMP (dst_x + fw, 0, doc->width);
-    int dy1 = CLAMP (dst_y + fh, 0, doc->height);
-    dw = dx1 - dx0;
-    dh = dy1 - dy0;
-    if (dw > 0 && dh > 0)
-      undo_step_capture_rect (step, active->surface, dx0, dy0, dw, dh);
-  }
-
-  if (hw > 0 && hh > 0) {
-    fill_layer_rect_with_clear_color (doc, active, hx0, hy0, hw, hh);
-    recomposite_rect (doc, hx0, hy0, hw, hh);
-    mark_rect_dirty (doc, hx0, hy0, hw, hh);
-  } else if (had_hole && prev_hole.width > 0 && prev_hole.height > 0) {
-    recomposite_rect (doc, prev_hole.x, prev_hole.y, prev_hole.width, prev_hole.height);
-    mark_rect_dirty (doc, prev_hole.x, prev_hole.y, prev_hole.width, prev_hole.height);
-  }
-  if (floating && dw > 0 && dh > 0) {
-    cairo_t *cr = cairo_create (active->surface);
-    cairo_rectangle (cr, (double) dx0, (double) dy0, (double) dw, (double) dh);
-    cairo_clip (cr);
-    cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
-    cairo_set_source_surface (cr, floating, (double) dst_x, (double) dst_y);
-    cairo_paint (cr);
-    cairo_destroy (cr);
-    recomposite_rect (doc, dx0, dy0, dw, dh);
-    mark_rect_dirty (doc, dx0, dy0, dw, dh);
-  }
-
-  push_undo_step (doc, step);
-  doc->modified = TRUE;
-}
-
-static void
-paint_render_text_layout (cairo_t *cr,
-                          double x,
-                          double y,
-                          const char *text,
-                          const PaintToolSettings *settings,
-                          gboolean draw,
-                          int *out_x,
-                          int *out_y,
-                          int *out_w,
-                          int *out_h)
-{
-  PangoLayout *layout = pango_cairo_create_layout (cr);
-  pango_layout_set_text (layout, text ? text : "", -1);
-
-  PangoFontDescription *desc = pango_font_description_new ();
-  const char *family = (settings->text_font_family && *settings->text_font_family)
-                         ? settings->text_font_family
-                         : "Sans";
-  pango_font_description_set_family (desc, family);
-  pango_font_description_set_weight (desc,
-                                     settings->text_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL);
-  pango_font_description_set_style (desc,
-                                    settings->text_italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
-  double px_size = MAX (6.0, settings->text_font_size);
-  pango_font_description_set_absolute_size (desc, px_size * PANGO_SCALE);
-  pango_layout_set_font_description (layout, desc);
-  pango_font_description_free (desc);
-
-  PangoRectangle ink = { 0 };
-  PangoRectangle logical = { 0 };
-  pango_layout_get_pixel_extents (layout, &ink, &logical);
-  int bx = MIN (ink.x, logical.x);
-  int by = MIN (ink.y, logical.y);
-  int bx1 = MAX (ink.x + ink.width, logical.x + logical.width);
-  int by1 = MAX (ink.y + ink.height, logical.y + logical.height);
-
-  if (out_x)
-    *out_x = (int) floor (x) + bx;
-  if (out_y)
-    *out_y = (int) floor (y) + by;
-  if (out_w)
-    *out_w = MAX (24, bx1 - bx);
-  if (out_h)
-    *out_h = MAX ((int) ceil (px_size * 1.2), by1 - by);
-
-  if (draw && text && *text) {
-    cairo_save (cr);
-    cairo_set_source_rgba (cr,
-                           settings->color.red,
-                           settings->color.green,
-                           settings->color.blue,
-                           settings->color.alpha);
-    cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
-    cairo_move_to (cr, x, y);
-    pango_cairo_show_layout (cr, layout);
-    cairo_restore (cr);
-  }
-  g_object_unref (layout);
-}
-
-void
-paint_document_draw_text (PaintDocument *doc,
-                          double x,
-                          double y,
-                          const char *text,
-                          const PaintToolSettings *settings)
-{
-  PaintLayer *active = get_active_layer (doc);
-  if (!active || !settings || !text || !*text)
-    return;
-
-  flush_active_stroke_undo (doc);
-  int bx, by, bw, bh;
-  cairo_t *cr = cairo_create (active->surface);
-  paint_render_text_layout (cr, x, y, text, settings, FALSE, &bx, &by, &bw, &bh);
-  cairo_destroy (cr);
-
-  int rx = bx - 6;
-  int ry = by - 6;
-  int rw = bw + 12;
-  int rh = bh + 12;
-  UndoStep *step = undo_step_new_tiled (doc->width, doc->height, doc->active_layer_index);
-  undo_step_capture_rect (step, active->surface, rx, ry, rw, rh);
-
-  cr = cairo_create (active->surface);
-  paint_render_text_layout (cr, x, y, text, settings, TRUE, NULL, NULL, NULL, NULL);
-  cairo_destroy (cr);
-
-  recomposite_rect (doc, rx, ry, rw, rh);
-  mark_rect_dirty (doc, rx, ry, rw, rh);
-  push_undo_step (doc, step);
-  doc->modified = TRUE;
-}
-
-static void
-paint_document_set_floating_hole (PaintDocument *doc,
-                                  const cairo_rectangle_int_t *hole)
-{
-  if (!doc)
-    return;
-  gboolean had_hole = doc->has_active_hole;
-  cairo_rectangle_int_t old_hole = doc->active_hole;
-  gboolean had_comp = (doc->composite_surface != NULL);
-
-  if (hole && hole->width > 0 && hole->height > 0) {
-    doc->has_active_hole = TRUE;
-    doc->active_hole = *hole;
-  } else {
-    doc->has_active_hole = FALSE;
-    doc->active_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
-  }
-
-  gboolean want_comp = needs_composite_surface (doc);
-  if (want_comp != had_comp) {
-    recomposite_all (doc);
-    mark_all_dirty (doc);
-    return;
-  }
-
-  if (had_hole && old_hole.width > 0 && old_hole.height > 0) {
-    recomposite_rect (doc, old_hole.x, old_hole.y, old_hole.width, old_hole.height);
-    mark_rect_dirty (doc, old_hole.x, old_hole.y, old_hole.width, old_hole.height);
-  }
-  if (doc->has_active_hole) {
-    recomposite_rect (doc, doc->active_hole.x, doc->active_hole.y,
-                      doc->active_hole.width, doc->active_hole.height);
-    mark_rect_dirty (doc, doc->active_hole.x, doc->active_hole.y,
-                    doc->active_hole.width, doc->active_hole.height);
-  }
-}
-
-int
-paint_document_get_n_layers (const PaintDocument *doc)
-{
-  return (doc && doc->layers) ? (int) doc->layers->len : 0;
-}
-
-int
-paint_document_get_active_layer (const PaintDocument *doc)
-{
-  return doc ? doc->active_layer_index : 0;
-}
-
-void
-paint_document_set_active_layer (PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || doc->layers->len == 0)
-    return;
-  int clamped = CLAMP (index, 0, (int) doc->layers->len - 1);
-  if (doc->active_layer_index == clamped)
-    return;
-  flush_active_stroke_undo (doc);
-  doc->active_layer_index = clamped;
-  doc->layers_revision++;
-}
-
-guint64
-paint_document_get_layers_revision (const PaintDocument *doc)
-{
-  return doc ? doc->layers_revision : 0;
-}
-
-const char *
-paint_document_layer_get_name (const PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return "";
-  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  return layer->name;
-}
-
-void
-paint_document_layer_set_name (PaintDocument *doc, int index, const char *name)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return;
-  const char *trimmed = (name && *name) ? name : "Layer";
-  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  if (g_strcmp0 (layer->name, trimmed) == 0)
-    return;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-  g_free (layer->name);
-  layer->name = g_strdup (trimmed);
-  doc->layers_revision++;
-  doc->modified = TRUE;
-}
-
-gboolean
-paint_document_layer_get_visible (const PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return FALSE;
-  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  return layer->visible;
-}
-
-void
-paint_document_layer_set_visible (PaintDocument *doc, int index, gboolean visible)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return;
-  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  if (layer->visible == visible)
-    return;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-  layer->visible = visible;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-}
-
-double
-paint_document_layer_get_opacity (const PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return 1.0;
-  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  return layer->opacity;
-}
-
-void
-paint_document_layer_set_opacity (PaintDocument *doc, int index, double opacity)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return;
-  double clamped = CLAMP (opacity, 0.0, 1.0);
-  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  if (fabs (layer->opacity - clamped) < 1e-4)
-    return;
-
-  flush_active_stroke_undo (doc);
-  gboolean can_coalesce = FALSE;
-  if (doc->undo_stack->len > 0 && doc->redo_stack->len == 0) {
-    const UndoStep *top = g_ptr_array_index (doc->undo_stack, doc->undo_stack->len - 1);
-    if (top->is_full && top->is_opacity_step && top->opacity_layer_idx == index)
-      can_coalesce = TRUE;
-  }
-  if (!can_coalesce) {
-    UndoStep *step = undo_step_new_full_doc (doc);
-    step->is_opacity_step = TRUE;
-    step->opacity_layer_idx = index;
-    push_undo_step (doc, step);
-  }
-
-  layer->opacity = clamped;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-}
-
-PaintBlendMode
-paint_document_layer_get_blend_mode (const PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return PAINT_BLEND_NORMAL;
-  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  return layer->blend_mode;
-}
-
-void
-paint_document_layer_set_blend_mode (PaintDocument *doc, int index, PaintBlendMode mode)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return;
-  PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  if (layer->blend_mode == mode)
-    return;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-  layer->blend_mode = mode;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-}
-
-cairo_surface_t *
-paint_document_layer_get_surface (const PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return NULL;
-  const PaintLayer *layer = g_ptr_array_index (doc->layers, (guint) index);
-  return layer->surface;
-}
-
-int
-paint_document_add_layer (PaintDocument *doc, const char *name)
-{
-  if (!doc || !doc->layers)
-    return -1;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                      doc->width,
-                                                      doc->height);
-  g_autofree char *auto_name = name ? g_strdup (name)
-                                    : g_strdup_printf ("Layer %d", doc->next_layer_num++);
-  int insert_idx = CLAMP (doc->active_layer_index + 1, 0, (int) doc->layers->len);
-  g_ptr_array_insert (doc->layers,
-                      (guint) insert_idx,
-                      paint_layer_new (auto_name, surf, TRUE, 1.0, PAINT_BLEND_NORMAL));
-  doc->active_layer_index = insert_idx;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-  return insert_idx;
-}
-
-gboolean
-paint_document_duplicate_layer (PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || index < 0 || index >= (int) doc->layers->len)
-    return FALSE;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  const PaintLayer *src = g_ptr_array_index (doc->layers, (guint) index);
-  cairo_surface_t *copy = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                      doc->width,
-                                                      doc->height);
-  cairo_t *cr = cairo_create (copy);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, src->surface, 0.0, 0.0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-
-  g_autofree char *dup_name = g_strdup_printf ("%s Copy", src->name);
-  int insert_idx = index + 1;
-  g_ptr_array_insert (doc->layers,
-                      (guint) insert_idx,
-                      paint_layer_new (dup_name, copy, src->visible, src->opacity, src->blend_mode));
-  doc->active_layer_index = insert_idx;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-  return TRUE;
-}
-
-gboolean
-paint_document_remove_layer (PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || doc->layers->len <= 1 ||
-      index < 0 || index >= (int) doc->layers->len) {
-    return FALSE;
-  }
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  g_ptr_array_remove_index (doc->layers, (guint) index);
-  if (doc->active_layer_index > index)
-    doc->active_layer_index--;
-  doc->active_layer_index = CLAMP (doc->active_layer_index, 0, (int) doc->layers->len - 1);
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-  return TRUE;
-}
-
-gboolean
-paint_document_move_layer (PaintDocument *doc, int from_index, int to_index)
-{
-  if (!doc || !doc->layers ||
-      from_index < 0 || from_index >= (int) doc->layers->len ||
-      to_index < 0 || to_index >= (int) doc->layers->len ||
-      from_index == to_index) {
-    return FALSE;
-  }
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  PaintLayer **arr = (PaintLayer **) doc->layers->pdata;
-  PaintLayer *moved = arr[from_index];
-  if (from_index < to_index) {
-    for (int i = from_index; i < to_index; i++)
-      arr[i] = arr[i + 1];
-  } else {
-    for (int i = from_index; i > to_index; i--)
-      arr[i] = arr[i - 1];
-  }
-  arr[to_index] = moved;
-
-  if (doc->active_layer_index == from_index)
-    doc->active_layer_index = to_index;
-  else if (from_index < doc->active_layer_index && doc->active_layer_index <= to_index)
-    doc->active_layer_index--;
-  else if (to_index <= doc->active_layer_index && doc->active_layer_index < from_index)
-    doc->active_layer_index++;
-
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-  return TRUE;
-}
-
-gboolean
-paint_document_merge_layer_down (PaintDocument *doc, int index)
-{
-  if (!doc || !doc->layers || index <= 0 || index >= (int) doc->layers->len)
-    return FALSE;
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-
-  PaintLayer *top = g_ptr_array_index (doc->layers, (guint) index);
-  PaintLayer *bot = g_ptr_array_index (doc->layers, (guint) (index - 1));
-  if (top->visible && top->opacity > 0.001) {
-    cairo_t *cr = cairo_create (bot->surface);
-    cairo_set_operator (cr, blend_mode_to_cairo (top->blend_mode));
-    cairo_set_source_surface (cr, top->surface, 0.0, 0.0);
-    if (top->opacity >= 0.999)
-      cairo_paint (cr);
-    else
-      cairo_paint_with_alpha (cr, top->opacity);
-    cairo_destroy (cr);
-  }
-
-  g_ptr_array_remove_index (doc->layers, (guint) index);
-  if (doc->active_layer_index >= index)
-    doc->active_layer_index--;
-  doc->active_layer_index = CLAMP (doc->active_layer_index, 0, (int) doc->layers->len - 1);
-
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-  return TRUE;
-}
-
-gboolean
-paint_document_flatten_layers (PaintDocument *doc)
-{
-  if (!doc || !doc->layers || doc->layers->len == 0)
-    return FALSE;
-  const PaintLayer *l0 = g_ptr_array_index (doc->layers, 0);
-  if (doc->layers->len <= 1 && l0->visible && l0->opacity >= 0.999 &&
-      l0->blend_mode == PAINT_BLEND_NORMAL) {
-    return FALSE;
-  }
-
-  flush_active_stroke_undo (doc);
-  push_undo_step (doc, undo_step_new_full_doc (doc));
-  recomposite_all (doc);
-
-  cairo_surface_t *flat_surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                           doc->width,
-                                                           doc->height);
-  cairo_t *cr = cairo_create (flat_surf);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, doc->surface, 0.0, 0.0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-
-  if (surface_has_transparency (flat_surf))
-    doc->background_color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 0.0f };
-
-  g_ptr_array_set_size (doc->layers, 0);
-  g_ptr_array_add (doc->layers,
-                   paint_layer_new ("Background", flat_surf, TRUE, 1.0, PAINT_BLEND_NORMAL));
-  doc->active_layer_index = 0;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  doc->modified = TRUE;
-  return TRUE;
-}
-
-gboolean
-paint_document_append_restored_layer (PaintDocument *doc,
-                                      const char *name,
-                                      GFile *png_file,
-                                      gboolean visible,
-                                      double opacity,
-                                      PaintBlendMode blend_mode)
-{
-  if (!doc || !doc->layers || !png_file)
-    return FALSE;
-  g_autofree char *path = g_file_get_path (png_file);
-  if (!path)
-    return FALSE;
-
-  cairo_surface_t *loaded = cairo_image_surface_create_from_png (path);
-  if (cairo_surface_status (loaded) != CAIRO_STATUS_SUCCESS) {
-    cairo_surface_destroy (loaded);
-    return FALSE;
-  }
-
-  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                      doc->width,
-                                                      doc->height);
-  cairo_t *cr = cairo_create (surf);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, loaded, 0.0, 0.0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-  cairo_surface_destroy (loaded);
-
-  g_ptr_array_add (doc->layers,
-                   paint_layer_new (name, surf, visible, opacity, blend_mode));
-  return TRUE;
-}
-
-void
-paint_document_finish_session_restore (PaintDocument *doc,
-                                       int active_layer,
-                                       gboolean modified)
-{
-  if (!doc || !doc->layers || doc->layers->len == 0)
-    return;
-  g_ptr_array_set_size (doc->undo_stack, 0);
-  g_ptr_array_set_size (doc->redo_stack, 0);
-  doc->active_layer_index = CLAMP (active_layer, 0, (int) doc->layers->len - 1);
-  doc->next_layer_num = MAX (1, (int) doc->layers->len);
-  doc->modified = modified;
-  doc->layers_revision++;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-}
-
-cairo_surface_t *
-paint_surface_from_texture (GdkTexture *texture)
-{
-  if (!texture)
-    return NULL;
-  int w = MAX (1, gdk_texture_get_width (texture));
-  int h = MAX (1, gdk_texture_get_height (texture));
-  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
-  int stride = cairo_image_surface_get_stride (surf);
-  unsigned char *data = cairo_image_surface_get_data (surf);
-  gdk_texture_download (texture, data, (gsize) stride);
-  cairo_surface_mark_dirty (surf);
-  return surf;
-}
-
-GdkTexture *
-paint_texture_from_surface (cairo_surface_t *surface)
-{
-  if (!surface)
-    return NULL;
-  cairo_surface_flush (surface);
-  int w = cairo_image_surface_get_width (surface);
-  int h = cairo_image_surface_get_height (surface);
-  int stride = cairo_image_surface_get_stride (surface);
-  const unsigned char *data = cairo_image_surface_get_data (surface);
-  g_autoptr (GBytes) bytes = g_bytes_new (data, (gsize) stride * (gsize) h);
-  return gdk_memory_texture_new (w, h, GDK_MEMORY_DEFAULT, bytes, (gsize) stride);
-}
-
-PaintDocument *
-paint_document_new_from_texture (GdkTexture *texture)
-{
-  if (!texture)
-    return NULL;
-  cairo_surface_t *loaded = paint_surface_from_texture (texture);
-  int w = cairo_image_surface_get_width (loaded);
-  int h = cairo_image_surface_get_height (loaded);
-  gboolean has_alpha = surface_has_transparency (loaded);
-  PaintDocument *doc = has_alpha ? paint_document_new_transparent (w, h)
-                                 : paint_document_new (w, h);
-  PaintLayer *l0 = get_active_layer (doc);
-  cairo_t *cr = cairo_create (l0->surface);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (cr, loaded, 0.0, 0.0);
-  cairo_paint (cr);
-  cairo_destroy (cr);
-  cairo_surface_destroy (loaded);
-
-  doc->modified = TRUE;
-  recomposite_all (doc);
-  mark_all_dirty (doc);
-  return doc;
-}
-
-gboolean
-paint_document_save_to_file (PaintDocument *doc, GFile *file, GError **error)
-{
-  g_return_val_if_fail (doc != NULL, FALSE);
-  g_return_val_if_fail (G_IS_FILE (file), FALSE);
-
-  g_autofree char *path = g_file_get_path (file);
-  if (!path) {
-    g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                 "Saving to non-local URIs is not supported yet.");
-    return FALSE;
-  }
-
-  g_autofree char *lower = g_ascii_strdown (path, -1);
-  g_autoptr (GFile) target_file = NULL;
-  g_autofree char *target_path = NULL;
-
-  const char *ext = strrchr (lower, '.');
-  if (!ext || g_strcmp0 (ext, ".png") == 0) {
-    if (!ext) {
-      target_path = g_strconcat (path, ".png", NULL);
-      target_file = g_file_new_for_path (target_path);
-    } else {
-      target_path = g_strdup (path);
-      target_file = g_object_ref (file);
-    }
-    cairo_status_t status = cairo_surface_write_to_png (doc->surface, target_path);
-    if (status != CAIRO_STATUS_SUCCESS) {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to save PNG: %s", cairo_status_to_string (status));
-      return FALSE;
-    }
-  } else {
-    target_file = g_object_ref (file);
-    gboolean is_jpeg = (g_strcmp0 (ext, ".jpg") == 0 || g_strcmp0 (ext, ".jpeg") == 0);
-    cairo_surface_t *export_surface = doc->surface;
-    cairo_surface_t *flattened = NULL;
-    if (is_jpeg) {
-      GdkRGBA white = { 1.0f, 1.0f, 1.0f, 1.0f };
-      flattened = create_blank_surface (doc->width, doc->height, &white);
-      cairo_t *fcr = cairo_create (flattened);
-      cairo_set_source_surface (fcr, doc->surface, 0, 0);
-      cairo_paint (fcr);
-      cairo_destroy (fcr);
-      export_surface = flattened;
-    }
-
-    GByteArray *arr = g_byte_array_new ();
-    cairo_status_t status = cairo_surface_write_to_png_stream (export_surface,
-                                                               cairo_write_to_byte_array,
-                                                               arr);
-    g_clear_pointer (&flattened, cairo_surface_destroy);
-    if (status != CAIRO_STATUS_SUCCESS) {
-      g_byte_array_unref (arr);
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to encode image");
-      return FALSE;
-    }
-
-    g_autoptr (GBytes) bytes = g_byte_array_free_to_bytes (arr);
-    g_autoptr (GInputStream) stream = g_memory_input_stream_new_from_bytes (bytes);
-    g_autoptr (GdkPixbuf) pixbuf = gdk_pixbuf_new_from_stream (stream, NULL, error);
-    if (!pixbuf)
-      return FALSE;
-
-    const char *fmt = is_jpeg ? "jpeg" : ext + 1;
-    if (!gdk_pixbuf_save (pixbuf, path, fmt, error, NULL))
-      return FALSE;
-  }
-
-  g_set_object (&doc->file, target_file);
-  doc->modified = FALSE;
-  return TRUE;
-}
 
 /* ============================================================================
  * PaintCanvas (2-Tier Single-Texture Cache: Overview < 50% + 1:1 Viewport >= 50%)
@@ -2199,6 +26,8 @@ enum {
   SIGNAL_SELECTION_CHANGED,
   SIGNAL_TEXT_STATE_CHANGED,
   SIGNAL_HIDDEN_LAYER_BLOCKED,
+  SIGNAL_LOCKED_LAYER_BLOCKED,
+  SIGNAL_CURSOR_MOVED,
   N_SIGNALS
 };
 
@@ -2267,6 +96,8 @@ struct _PaintCanvas {
   /* Eyedropper state */
   gboolean eyedropper_active;
   gboolean alt_held;
+  gboolean pan_override_active;
+  gboolean pan_override_dragging;
   gboolean pick_badge_active;
   GdkRGBA pick_badge_color;
   guint pick_badge_timeout_id;
@@ -2274,8 +105,16 @@ struct _PaintCanvas {
   /* Selection & floating layer state */
   gboolean has_selection;
   cairo_rectangle_int_t sel_rect;
+  cairo_surface_t *sel_mask;          /* optional A8 binary mask matching sel_rect */
+  GArray *sel_ant_segs;               /* element-type: PaintSelSeg */
+  GArray *lasso_points;               /* element-type: PaintPoint */
   gboolean sel_dragging_new;
   gboolean sel_moving;
+  gboolean sel_resizing;
+  int sel_resize_handle;              /* 0=none, 1..8 = NW,N,NE,E,SE,S,SW,W */
+  cairo_rectangle_int_t sel_resize_orig_rect;
+  cairo_surface_t *sel_orig_floating;
+  cairo_surface_t *sel_orig_mask;
   double sel_move_anchor_x;
   double sel_move_anchor_y;
   int sel_move_orig_x;
@@ -2284,6 +123,16 @@ struct _PaintCanvas {
   GdkTexture *floating_texture;
   gboolean floating_has_hole;
   cairo_rectangle_int_t floating_hole;
+  cairo_surface_t *floating_hole_mask;
+
+  const PaintTool *stylus_override_tool;
+
+  /* Live filter preview state */
+  cairo_surface_t *filter_backup;
+  gboolean filter_has_rect;
+  cairo_rectangle_int_t filter_rect;
+  cairo_surface_t *filter_mask;
+  gboolean filter_alpha_lock;
 
   /* Interactive text placement state */
   gboolean text_active;
@@ -2484,7 +333,6 @@ rebuild_vp_cache (PaintCanvas *self, const graphene_rect_t *vis)
   req_x0 = (req_x0 / div) * div;
   req_y0 = (req_y0 / div) * div;
 
-  /* Ensure a minimum cache span so zooming 100% <-> 3200% doesn't re-copy */
   int min_w = MIN (doc->width, MIN_VP_CACHE_DIM * div);
   int min_h = MIN (doc->height, MIN_VP_CACHE_DIM * div);
   if (req_x1 - req_x0 < min_w) {
@@ -2650,7 +498,6 @@ box_downsample_rect (cairo_surface_t *src_surf,
   int src_stride_px = src_stride / 4;
   int dst_stride_px = dst_stride / 4;
 
-  /* Safe for 16-bit lane SWAR accumulation up to div=8 (max 64 * 255 = 16320 < 65535) */
   int shift = (div == 2) ? 2 : (div == 4) ? 4 : (div == 8) ? 6 : 0;
   int full_x_end = MAX (0, (src_w - src_ox) / div);
   int full_y_end = MAX (0, (src_h - src_oy) / div);
@@ -2881,21 +728,317 @@ sync_floating_texture (PaintCanvas *self)
     self->floating_texture = paint_texture_from_surface (self->floating_surface);
 }
 
+typedef struct {
+  int x0;
+  int y0;
+  int x1;
+  int y1;
+} PaintSelSeg;
+
+static void
+rebuild_sel_ant_segments (PaintCanvas *self)
+{
+  if (!self->sel_ant_segs)
+    return;
+  g_array_set_size (self->sel_ant_segs, 0);
+  if (!self->sel_mask || cairo_surface_status (self->sel_mask) != CAIRO_STATUS_SUCCESS)
+    return;
+
+  cairo_surface_flush (self->sel_mask);
+  int mw = cairo_image_surface_get_width (self->sel_mask);
+  int mh = cairo_image_surface_get_height (self->sel_mask);
+  int stride = cairo_image_surface_get_stride (self->sel_mask);
+  const unsigned char *data = cairo_image_surface_get_data (self->sel_mask);
+  if (mw <= 0 || mh <= 0 || !data)
+    return;
+
+  for (int y = 0; y <= mh; y++) {
+    const unsigned char *above = (y > 0) ? (data + (gsize) (y - 1) * (gsize) stride) : NULL;
+    const unsigned char *below = (y < mh) ? (data + (gsize) y * (gsize) stride) : NULL;
+    int run_start = -1;
+    for (int x = 0; x < mw; x++) {
+      gboolean in_a = above && above[x] >= 128;
+      gboolean in_b = below && below[x] >= 128;
+      if (in_a != in_b) {
+        if (run_start < 0)
+          run_start = x;
+      } else if (run_start >= 0) {
+        PaintSelSeg s = { run_start, y, x, y };
+        g_array_append_val (self->sel_ant_segs, s);
+        run_start = -1;
+      }
+    }
+    if (run_start >= 0) {
+      PaintSelSeg s = { run_start, y, mw, y };
+      g_array_append_val (self->sel_ant_segs, s);
+    }
+  }
+
+  for (int x = 0; x <= mw; x++) {
+    int run_start = -1;
+    for (int y = 0; y < mh; y++) {
+      const unsigned char *row = data + (gsize) y * (gsize) stride;
+      gboolean in_l = (x > 0) && row[x - 1] >= 128;
+      gboolean in_r = (x < mw) && row[x] >= 128;
+      if (in_l != in_r) {
+        if (run_start < 0)
+          run_start = y;
+      } else if (run_start >= 0) {
+        PaintSelSeg s = { x, run_start, x, y };
+        g_array_append_val (self->sel_ant_segs, s);
+        run_start = -1;
+      }
+    }
+    if (run_start >= 0) {
+      PaintSelSeg s = { x, run_start, x, mh };
+      g_array_append_val (self->sel_ant_segs, s);
+    }
+  }
+}
+
+static void
+threshold_a8_mask (cairo_surface_t *mask)
+{
+  if (!mask)
+    return;
+  cairo_surface_flush (mask);
+  int w = cairo_image_surface_get_width (mask);
+  int h = cairo_image_surface_get_height (mask);
+  int stride = cairo_image_surface_get_stride (mask);
+  unsigned char *data = cairo_image_surface_get_data (mask);
+  for (int y = 0; y < h; y++) {
+    unsigned char *row = data + (gsize) y * (gsize) stride;
+    for (int x = 0; x < w; x++)
+      row[x] = (row[x] >= 128) ? 255 : 0;
+  }
+  cairo_surface_mark_dirty (mask);
+}
+
+static cairo_surface_t *
+create_ellipse_mask (int w, int h)
+{
+  if (w <= 0 || h <= 0)
+    return NULL;
+  cairo_surface_t *mask = cairo_image_surface_create (CAIRO_FORMAT_A8, w, h);
+  cairo_t *cr = cairo_create (mask);
+  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  cairo_paint (cr);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 1.0);
+  cairo_translate (cr, (double) w * 0.5, (double) h * 0.5);
+  cairo_scale (cr, MAX (0.5, (double) w * 0.5), MAX (0.5, (double) h * 0.5));
+  cairo_arc (cr, 0.0, 0.0, 1.0, 0.0, 2.0 * G_PI);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+  threshold_a8_mask (mask);
+  return mask;
+}
+
+static cairo_surface_t *
+create_lasso_mask (const GArray *pts, int x0, int y0, int w, int h)
+{
+  if (!pts || pts->len < 3 || w <= 0 || h <= 0)
+    return NULL;
+  cairo_surface_t *mask = cairo_image_surface_create (CAIRO_FORMAT_A8, w, h);
+  cairo_t *cr = cairo_create (mask);
+  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  cairo_paint (cr);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 1.0);
+  cairo_translate (cr, -(double) x0, -(double) y0);
+  for (guint i = 0; i < pts->len; i++) {
+    PaintPoint pt = g_array_index (pts, PaintPoint, i);
+    if (i == 0)
+      cairo_move_to (cr, pt.x, pt.y);
+    else
+      cairo_line_to (cr, pt.x, pt.y);
+  }
+  cairo_close_path (cr);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+  threshold_a8_mask (mask);
+  return mask;
+}
+
+static cairo_surface_t *
+scale_a8_mask (cairo_surface_t *src, int nw, int nh)
+{
+  if (!src || nw <= 0 || nh <= 0)
+    return NULL;
+  int ow = cairo_image_surface_get_width (src);
+  int oh = cairo_image_surface_get_height (src);
+  if (ow <= 0 || oh <= 0)
+    return NULL;
+  cairo_surface_t *dst = cairo_image_surface_create (CAIRO_FORMAT_A8, nw, nh);
+  cairo_t *cr = cairo_create (dst);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_scale (cr, (double) nw / (double) ow, (double) nh / (double) oh);
+  cairo_set_source_surface (cr, src, 0.0, 0.0);
+  cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BILINEAR);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  threshold_a8_mask (dst);
+  return dst;
+}
+
+static cairo_surface_t *
+transform_a8_mask_rotate_90 (cairo_surface_t *src, gboolean clockwise)
+{
+  if (!src)
+    return NULL;
+  int w = cairo_image_surface_get_width (src);
+  int h = cairo_image_surface_get_height (src);
+  cairo_surface_t *dst = cairo_image_surface_create (CAIRO_FORMAT_A8, h, w);
+  cairo_t *cr = cairo_create (dst);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  if (clockwise) {
+    cairo_translate (cr, (double) h, 0.0);
+    cairo_rotate (cr, G_PI_2);
+  } else {
+    cairo_translate (cr, 0.0, (double) w);
+    cairo_rotate (cr, -G_PI_2);
+  }
+  cairo_set_source_surface (cr, src, 0.0, 0.0);
+  cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_NEAREST);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  return dst;
+}
+
+static cairo_surface_t *
+transform_a8_mask_flip (cairo_surface_t *src, gboolean horizontal)
+{
+  if (!src)
+    return NULL;
+  int w = cairo_image_surface_get_width (src);
+  int h = cairo_image_surface_get_height (src);
+  cairo_surface_t *dst = cairo_image_surface_create (CAIRO_FORMAT_A8, w, h);
+  cairo_t *cr = cairo_create (dst);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  if (horizontal) {
+    cairo_translate (cr, (double) w, 0.0);
+    cairo_scale (cr, -1.0, 1.0);
+  } else {
+    cairo_translate (cr, 0.0, (double) h);
+    cairo_scale (cr, 1.0, -1.0);
+  }
+  cairo_set_source_surface (cr, src, 0.0, 0.0);
+  cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_NEAREST);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  return dst;
+}
+
+static cairo_surface_t *
+scale_argb32_surface (cairo_surface_t *src, int nw, int nh)
+{
+  if (!src || nw <= 0 || nh <= 0)
+    return NULL;
+  int ow = cairo_image_surface_get_width (src);
+  int oh = cairo_image_surface_get_height (src);
+  if (ow <= 0 || oh <= 0)
+    return NULL;
+  cairo_surface_t *dst = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, nw, nh);
+  cairo_t *cr = cairo_create (dst);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_scale (cr, (double) nw / (double) ow, (double) nh / (double) oh);
+  cairo_set_source_surface (cr, src, 0.0, 0.0);
+  cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BILINEAR);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  return dst;
+}
+
+static void
+get_selection_handle_centers (const PaintCanvas *self, double hx[9], double hy[9])
+{
+  double x0 = self->sel_rect.x * self->zoom;
+  double y0 = self->sel_rect.y * self->zoom;
+  double x1 = (self->sel_rect.x + self->sel_rect.width) * self->zoom;
+  double y1 = (self->sel_rect.y + self->sel_rect.height) * self->zoom;
+  double xm = 0.5 * (x0 + x1);
+  double ym = 0.5 * (y0 + y1);
+  hx[0] = 0.0; hy[0] = 0.0;
+  hx[1] = x0;  hy[1] = y0; /* NW */
+  hx[2] = xm;  hy[2] = y0; /* N  */
+  hx[3] = x1;  hy[3] = y0; /* NE */
+  hx[4] = x1;  hy[4] = ym; /* E  */
+  hx[5] = x1;  hy[5] = y1; /* SE */
+  hx[6] = xm;  hy[6] = y1; /* S  */
+  hx[7] = x0;  hy[7] = y1; /* SW */
+  hx[8] = x0;  hy[8] = ym; /* W  */
+}
+
+static int
+hit_test_selection_handle (const PaintCanvas *self, double doc_x, double doc_y)
+{
+  if (!self->has_selection || self->sel_rect.width <= 0 || self->sel_rect.height <= 0 ||
+      self->zoom <= 0.0) {
+    return 0;
+  }
+  double px = doc_x * self->zoom;
+  double py = doc_y * self->zoom;
+  double hx[9], hy[9];
+  get_selection_handle_centers (self, hx, hy);
+
+  static const int order[8] = { 1, 3, 5, 7, 2, 4, 6, 8 };
+  for (int i = 0; i < 8; i++) {
+    int h = order[i];
+    if (fabs (px - hx[h]) <= 6.5 && fabs (py - hy[h]) <= 6.5)
+      return h;
+  }
+  return 0;
+}
+
+static const char *
+cursor_name_for_handle (int handle)
+{
+  switch (handle) {
+    case 1: case 5: return "nwse-resize";
+    case 2: case 6: return "ns-resize";
+    case 3: case 7: return "nesw-resize";
+    case 4: case 8: return "ew-resize";
+    default: return "default";
+  }
+}
+
+static gboolean
+check_active_layer_editable (PaintCanvas *self)
+{
+  if (!self || !self->document)
+    return FALSE;
+  int idx = paint_document_get_active_layer (self->document);
+  if (!paint_document_layer_get_visible (self->document, idx)) {
+    g_signal_emit (self, signals[SIGNAL_HIDDEN_LAYER_BLOCKED], 0);
+    return FALSE;
+  }
+  if (paint_document_layer_get_locked (self->document, idx)) {
+    g_signal_emit (self, signals[SIGNAL_LOCKED_LAYER_BLOCKED], 0);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 static void
 lift_selection_to_floating (PaintCanvas *self)
 {
   if (!self->has_selection || self->floating_surface || !self->document)
     return;
-  self->floating_surface = paint_document_copy_rect (self->document,
-                                                     self->sel_rect.x,
-                                                     self->sel_rect.y,
-                                                     self->sel_rect.width,
-                                                     self->sel_rect.height);
+  if (!check_active_layer_editable (self))
+    return;
+  self->floating_surface = paint_document_copy_masked_rect (self->document,
+                                                             &self->sel_rect,
+                                                             self->sel_mask);
   if (!self->floating_surface)
     return;
   self->floating_has_hole = TRUE;
   self->floating_hole = self->sel_rect;
-  paint_document_set_floating_hole (self->document, &self->floating_hole);
+  g_clear_pointer (&self->floating_hole_mask, cairo_surface_destroy);
+  if (self->sel_mask)
+    self->floating_hole_mask = cairo_surface_reference (self->sel_mask);
+  paint_document_set_floating_hole_masked (self->document,
+                                           &self->floating_hole,
+                                           self->floating_hole_mask);
   sync_floating_texture (self);
 }
 
@@ -2907,10 +1050,20 @@ clear_selection_state (PaintCanvas *self)
   self->sel_rect = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
   self->sel_dragging_new = FALSE;
   self->sel_moving = FALSE;
+  self->sel_resizing = FALSE;
+  self->sel_resize_handle = 0;
   self->floating_has_hole = FALSE;
   self->floating_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+  g_clear_pointer (&self->sel_mask, cairo_surface_destroy);
+  g_clear_pointer (&self->floating_hole_mask, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_orig_floating, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_orig_mask, cairo_surface_destroy);
   g_clear_pointer (&self->floating_surface, cairo_surface_destroy);
   g_clear_object (&self->floating_texture);
+  if (self->sel_ant_segs)
+    g_array_set_size (self->sel_ant_segs, 0);
+  if (self->lasso_points)
+    g_array_set_size (self->lasso_points, 0);
   if (self->document)
     paint_document_set_floating_hole (self->document, NULL);
   if (had)
@@ -2923,16 +1076,16 @@ update_text_bounds (PaintCanvas *self)
   if (!self->text_active || !self->document || !self->settings)
     return;
   cairo_t *cr = cairo_create (self->document->surface);
-  paint_render_text_layout (cr,
-                            self->text_x,
-                            self->text_y,
-                            self->text_content,
-                            self->settings,
-                            FALSE,
-                            &self->text_box_x,
-                            &self->text_box_y,
-                            &self->text_box_w,
-                            &self->text_box_h);
+  paint_document_render_text_layout (cr,
+                                     self->text_x,
+                                     self->text_y,
+                                     self->text_content,
+                                     self->settings,
+                                     FALSE,
+                                     &self->text_box_x,
+                                     &self->text_box_y,
+                                     &self->text_box_w,
+                                     &self->text_box_h);
   cairo_destroy (cr);
 }
 
@@ -3065,7 +1218,9 @@ update_canvas_cursor (PaintCanvas *self)
                             ? paint_tools_find (self->settings->active_tool_id)
                             : NULL;
   const char *want = NULL;
-  if (is_eyedropper_mode (self)) {
+  if (self->pan_override_active) {
+    want = self->pan_override_dragging ? "grabbing" : "grab";
+  } else if (is_eyedropper_mode (self)) {
     want = "crosshair";
   } else if (tool) {
     if (g_strcmp0 (tool->id, "text") == 0) {
@@ -3078,13 +1233,19 @@ update_canvas_cursor (PaintCanvas *self)
       } else {
         want = "text";
       }
-    } else if (g_strcmp0 (tool->id, "select") == 0) {
-      if (self->has_selection && self->has_hover &&
-          self->hover_x >= self->sel_rect.x &&
-          self->hover_x < self->sel_rect.x + self->sel_rect.width &&
-          self->hover_y >= self->sel_rect.y &&
-          self->hover_y < self->sel_rect.y + self->sel_rect.height) {
-        want = "move";
+    } else if (tool->is_select) {
+      if (self->has_selection && self->has_hover) {
+        int h = hit_test_selection_handle (self, self->hover_x, self->hover_y);
+        if (h > 0) {
+          want = cursor_name_for_handle (h);
+        } else if (self->hover_x >= self->sel_rect.x &&
+                   self->hover_x < self->sel_rect.x + self->sel_rect.width &&
+                   self->hover_y >= self->sel_rect.y &&
+                   self->hover_y < self->sel_rect.y + self->sel_rect.height) {
+          want = "move";
+        } else {
+          want = "crosshair";
+        }
       } else {
         want = "crosshair";
       }
@@ -3224,8 +1385,9 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     double y1 = self->preview_end_y;
 
     int rx, ry, rw, rh;
-    compute_tool_stroke_bounds (active_tool, self->settings, x0, y0, x1, y1,
-                                &rx, &ry, &rw, &rh);
+    paint_document_compute_tool_stroke_bounds (active_tool, self->settings,
+                                               x0, y0, x1, y1,
+                                               &rx, &ry, &rw, &rh);
 
     int vis_x0 = MAX (0, (int) floor (vis_rect.origin.x / self->zoom) - 4);
     int vis_y0 = MAX (0, (int) floor (vis_rect.origin.y / self->zoom) - 4);
@@ -3293,8 +1455,8 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     cairo_t *cr = gtk_snapshot_append_cairo (snapshot, &bounds);
     cairo_save (cr);
     cairo_scale (cr, self->zoom, self->zoom);
-    paint_render_text_layout (cr, self->text_x, self->text_y, self->text_content,
-                              self->settings, TRUE, NULL, NULL, NULL, NULL);
+    paint_document_render_text_layout (cr, self->text_x, self->text_y, self->text_content,
+                                       self->settings, TRUE, NULL, NULL, NULL, NULL);
     cairo_restore (cr);
 
     double gx = floor (self->text_box_x * self->zoom) - 2.5;
@@ -3310,36 +1472,122 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     cairo_destroy (cr);
   }
 
-  if ((self->has_selection || self->sel_dragging_new) &&
-      self->sel_rect.width > 0 && self->sel_rect.height > 0) {
+  if (self->sel_dragging_new && active_tool &&
+      g_strcmp0 (active_tool->id, "select-lasso") == 0 &&
+      self->lasso_points && self->lasso_points->len >= 2) {
+    float vw = (float) gtk_widget_get_width (widget);
+    float vh = (float) gtk_widget_get_height (widget);
+    graphene_rect_t bounds = GRAPHENE_RECT_INIT (0.0f, 0.0f, MAX (1.0f, vw), MAX (1.0f, vh));
+    cairo_t *cr = gtk_snapshot_append_cairo (snapshot, &bounds);
+    static const double dash[] = { 5.0, 5.0 };
+    cairo_set_line_width (cr, 1.0);
+    for (int pass = 0; pass < 2; pass++) {
+      cairo_set_dash (cr, dash, 2, pass ? 5.0 : 0.0);
+      if (pass == 0)
+        cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.95);
+      else
+        cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.9);
+      for (guint i = 0; i < self->lasso_points->len; i++) {
+        PaintPoint pt = g_array_index (self->lasso_points, PaintPoint, i);
+        if (i == 0)
+          cairo_move_to (cr, pt.x * self->zoom, pt.y * self->zoom);
+        else
+          cairo_line_to (cr, pt.x * self->zoom, pt.y * self->zoom);
+      }
+      cairo_stroke (cr);
+    }
+    cairo_destroy (cr);
+  } else if ((self->has_selection || self->sel_dragging_new) &&
+             self->sel_rect.width > 0 && self->sel_rect.height > 0) {
     double sx0 = floor (self->sel_rect.x * self->zoom) + 0.5;
     double sy0 = floor (self->sel_rect.y * self->zoom) + 0.5;
     double sw = MAX (1.0, round (self->sel_rect.width * self->zoom) - 1.0);
     double sh = MAX (1.0, round (self->sel_rect.height * self->zoom) - 1.0);
     graphene_rect_t bounds = GRAPHENE_RECT_INIT (
-        (float) (sx0 - 3.0), (float) (sy0 - 3.0), (float) (sw + 6.0), (float) (sh + 6.0));
+        (float) (sx0 - 10.0), (float) (sy0 - 10.0), (float) (sw + 20.0), (float) (sh + 20.0));
     cairo_t *cr = gtk_snapshot_append_cairo (snapshot, &bounds);
     static const double dash[] = { 5.0, 5.0 };
     cairo_set_line_width (cr, 1.0);
-    cairo_set_dash (cr, dash, 2, 0.0);
-    cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.95);
-    cairo_rectangle (cr, sx0, sy0, sw, sh);
-    cairo_stroke (cr);
 
-    cairo_set_dash (cr, dash, 2, 5.0);
-    cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.9);
-    cairo_rectangle (cr, sx0, sy0, sw, sh);
-    cairo_stroke (cr);
+    gboolean is_ellipse_drag = self->sel_dragging_new && active_tool &&
+                               g_strcmp0 (active_tool->id, "select-ellipse") == 0;
+    gboolean use_ant_segs = !self->sel_dragging_new &&
+                            self->sel_mask &&
+                            self->sel_ant_segs &&
+                            self->sel_ant_segs->len > 0;
+    double mask_sx = 1.0;
+    double mask_sy = 1.0;
+    if (use_ant_segs) {
+      int mw = MAX (1, cairo_image_surface_get_width (self->sel_mask));
+      int mh = MAX (1, cairo_image_surface_get_height (self->sel_mask));
+      mask_sx = (double) self->sel_rect.width / (double) mw;
+      mask_sy = (double) self->sel_rect.height / (double) mh;
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+      cairo_set_dash (cr, dash, 2, pass ? 5.0 : 0.0);
+      if (pass == 0)
+        cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.95);
+      else
+        cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.9);
+
+      if (use_ant_segs) {
+        for (guint i = 0; i < self->sel_ant_segs->len; i++) {
+          PaintSelSeg s = g_array_index (self->sel_ant_segs, PaintSelSeg, i);
+          cairo_move_to (cr,
+                        ((double) self->sel_rect.x + s.x0 * mask_sx) * self->zoom,
+                        ((double) self->sel_rect.y + s.y0 * mask_sy) * self->zoom);
+          cairo_line_to (cr,
+                        ((double) self->sel_rect.x + s.x1 * mask_sx) * self->zoom,
+                        ((double) self->sel_rect.y + s.y1 * mask_sy) * self->zoom);
+        }
+        cairo_stroke (cr);
+      } else if (is_ellipse_drag) {
+        cairo_save (cr);
+        cairo_translate (cr, sx0 + sw * 0.5, sy0 + sh * 0.5);
+        cairo_scale (cr, MAX (0.5, sw * 0.5), MAX (0.5, sh * 0.5));
+        cairo_arc (cr, 0.0, 0.0, 1.0, 0.0, 2.0 * G_PI);
+        cairo_restore (cr);
+        cairo_stroke (cr);
+      } else {
+        cairo_rectangle (cr, sx0, sy0, sw, sh);
+        cairo_stroke (cr);
+      }
+    }
+
+    if (self->has_selection && !self->sel_dragging_new) {
+      if (self->sel_mask) {
+        cairo_set_dash (cr, dash, 2, 0.0);
+        cairo_set_source_rgba (cr, 0.11, 0.44, 0.96, 0.45);
+        cairo_rectangle (cr, sx0, sy0, sw, sh);
+        cairo_stroke (cr);
+      }
+      cairo_set_dash (cr, NULL, 0, 0.0);
+      double hx[9], hy[9];
+      get_selection_handle_centers (self, hx, hy);
+      for (int h = 1; h <= 8; h++) {
+        double rx = round (hx[h]) - 3.0;
+        double ry = round (hy[h]) - 3.0;
+        cairo_rectangle (cr, rx, ry, 6.0, 6.0);
+        cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.98);
+        cairo_fill_preserve (cr);
+        cairo_set_source_rgba (cr, 0.11, 0.44, 0.96, 0.95);
+        cairo_set_line_width (cr, 1.25);
+        cairo_stroke (cr);
+      }
+    }
     cairo_destroy (cr);
   }
 
   gboolean eyedropper_active_mode = is_eyedropper_mode (self);
   gboolean show_ring = self->show_cursor_ring &&
                        self->has_hover &&
+                       !self->pan_override_active &&
                        !eyedropper_active_mode &&
                        active_tool &&
-                       g_strcmp0 (active_tool->id, "select") != 0 &&
-                       g_strcmp0 (active_tool->id, "text") != 0;
+                       !active_tool->is_select &&
+                       g_strcmp0 (active_tool->id, "text") != 0 &&
+                       g_strcmp0 (active_tool->id, "gradient") != 0;
   if (show_ring) {
     double px = self->hover_x * self->zoom;
     double py = self->hover_y * self->zoom;
@@ -3469,6 +1717,89 @@ sample_color_at (PaintCanvas *self, double cx, double cy)
   return FALSE;
 }
 
+static const PaintTool *
+resolve_stroke_tool (PaintCanvas *self, GtkGesture *gesture, gboolean is_begin)
+{
+  const PaintTool *base = paint_tools_find (self->settings->active_tool_id);
+  if (!self->settings || !gesture)
+    return base;
+
+  GdkEventSequence *seq = gtk_gesture_single_get_current_sequence (GTK_GESTURE_SINGLE (gesture));
+  GdkEvent *ev = gtk_gesture_get_last_event (gesture, seq);
+  double pressure = 1.0;
+  if (ev) {
+    double axis_val = 0.0;
+    if (gdk_event_get_axis (ev, GDK_AXIS_PRESSURE, &axis_val))
+      pressure = CLAMP (axis_val, 0.05, 1.0);
+  }
+  self->settings->stroke_pressure = pressure;
+
+  if (is_begin) {
+    self->stylus_override_tool = NULL;
+    if (ev) {
+      GdkDeviceTool *dtool = gdk_event_get_device_tool (ev);
+      if (dtool &&
+          gdk_device_tool_get_tool_type (dtool) == GDK_DEVICE_TOOL_TYPE_ERASER &&
+          !base->is_select &&
+          g_strcmp0 (base->id, "eyedropper") != 0 &&
+          g_strcmp0 (base->id, "text") != 0) {
+        self->stylus_override_tool = paint_tools_find ("eraser");
+      }
+    }
+  }
+  return self->stylus_override_tool ? self->stylus_override_tool : base;
+}
+
+static void
+apply_selection_handle_resize (PaintCanvas *self,
+                               double raw_cx,
+                               double raw_cy,
+                               GdkModifierType state)
+{
+  cairo_rectangle_int_t r = self->sel_resize_orig_rect;
+  int x0 = r.x;
+  int y0 = r.y;
+  int x1 = r.x + r.width;
+  int y1 = r.y + r.height;
+  int dx = (int) lround (raw_cx - self->sel_move_anchor_x);
+  int dy = (int) lround (raw_cy - self->sel_move_anchor_y);
+  int h = self->sel_resize_handle;
+
+  gboolean left = (h == 1 || h == 7 || h == 8);
+  gboolean right = (h == 3 || h == 4 || h == 5);
+  gboolean top = (h == 1 || h == 2 || h == 3);
+  gboolean bottom = (h == 5 || h == 6 || h == 7);
+
+  if (left)
+    x0 = MIN (x0 + dx, x1 - 2);
+  if (right)
+    x1 = MAX (x1 + dx, x0 + 2);
+  if (top)
+    y0 = MIN (y0 + dy, y1 - 2);
+  if (bottom)
+    y1 = MAX (y1 + dy, y0 + 2);
+
+  if ((left || right) && (top || bottom) && (state & GDK_SHIFT_MASK)) {
+    double aspect = (double) MAX (1, r.width) / (double) MAX (1, r.height);
+    int nw = x1 - x0;
+    int nh = y1 - y0;
+    if ((double) nw / aspect >= (double) nh)
+      nh = MAX (2, (int) lround ((double) nw / aspect));
+    else
+      nw = MAX (2, (int) lround ((double) nh * aspect));
+    if (left)
+      x0 = x1 - nw;
+    else
+      x1 = x0 + nw;
+    if (top)
+      y0 = y1 - nh;
+    else
+      y1 = y0 + nh;
+  }
+
+  self->sel_rect = (cairo_rectangle_int_t) { x0, y0, x1 - x0, y1 - y0 };
+}
+
 static void
 on_drag_begin (GtkGestureDrag *gesture,
                double start_x,
@@ -3478,7 +1809,6 @@ on_drag_begin (GtkGestureDrag *gesture,
   PaintCanvas *self = PAINT_CANVAS (user_data);
   gboolean is_touch = is_touch_gesture (GTK_GESTURE (gesture));
 
-  /* Leave touch sequences unclaimed so parent CAPTURE zoom gesture can see a 2nd finger */
   if (!is_touch)
     gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 
@@ -3503,7 +1833,7 @@ on_drag_begin (GtkGestureDrag *gesture,
   self->preview_end_x = cx;
   self->preview_end_y = cy;
 
-  const PaintTool *tool = paint_tools_find (self->settings->active_tool_id);
+  const PaintTool *tool = resolve_stroke_tool (self, GTK_GESTURE (gesture), TRUE);
   GdkModifierType state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
   if (g_strcmp0 (tool->id, "eyedropper") == 0 || (state & GDK_ALT_MASK) || self->alt_held) {
     self->eyedropper_active = TRUE;
@@ -3516,41 +1846,103 @@ on_drag_begin (GtkGestureDrag *gesture,
 
   clear_pick_badge (self);
 
-  if (self->document &&
-      !paint_document_layer_get_visible (self->document,
-                                         paint_document_get_active_layer (self->document))) {
-    self->drawing_active = FALSE;
-    self->touch_stroke_pending = FALSE;
-    g_signal_emit (self, signals[SIGNAL_HIDDEN_LAYER_BLOCKED], 0);
-    return;
-  }
-
-  if (g_strcmp0 (tool->id, "select") == 0) {
+  if (tool->is_select) {
     self->touch_stroke_pending = FALSE;
     if (self->text_active)
       paint_canvas_commit_text (self);
+
+    int handle = hit_test_selection_handle (self, cx, cy);
+    if (self->has_selection && handle > 0) {
+      lift_selection_to_floating (self);
+      if (!self->floating_surface) {
+        self->drawing_active = FALSE;
+        return;
+      }
+      if (!self->sel_orig_floating)
+        self->sel_orig_floating = cairo_surface_reference (self->floating_surface);
+      if (!self->sel_orig_mask && self->sel_mask)
+        self->sel_orig_mask = cairo_surface_reference (self->sel_mask);
+      self->sel_resizing = TRUE;
+      self->sel_resize_handle = handle;
+      self->sel_resize_orig_rect = self->sel_rect;
+      self->sel_move_anchor_x = cx;
+      self->sel_move_anchor_y = cy;
+      gtk_widget_queue_draw (GTK_WIDGET (self));
+      return;
+    }
+
     if (self->has_selection &&
         cx >= self->sel_rect.x && cx < self->sel_rect.x + self->sel_rect.width &&
         cy >= self->sel_rect.y && cy < self->sel_rect.y + self->sel_rect.height) {
       lift_selection_to_floating (self);
+      if (!self->floating_surface) {
+        self->drawing_active = FALSE;
+        return;
+      }
       self->sel_moving = TRUE;
       self->sel_move_anchor_x = cx;
       self->sel_move_anchor_y = cy;
       self->sel_move_orig_x = self->sel_rect.x;
       self->sel_move_orig_y = self->sel_rect.y;
+      gtk_widget_queue_draw (GTK_WIDGET (self));
+      return;
+    }
+
+    if (self->has_selection)
+      paint_canvas_commit_selection (self);
+
+    if (g_strcmp0 (tool->id, "select-wand") == 0) {
+      self->drawing_active = FALSE;
+      int sx = (int) floor (cx);
+      int sy = (int) floor (cy);
+      int active_idx = paint_document_get_active_layer (self->document);
+      cairo_surface_t *src = self->settings->fill_sample_all_layers
+                               ? self->document->surface
+                               : paint_document_layer_get_surface (self->document, active_idx);
+      cairo_rectangle_int_t r = { 0 };
+      cairo_surface_t *mask = paint_tools_build_wand_mask (src, sx, sy,
+                                                           self->settings->fill_tolerance, &r);
+      if (mask && r.width > 0 && r.height > 0) {
+        self->sel_mask = mask;
+        self->sel_rect = r;
+        self->has_selection = TRUE;
+        rebuild_sel_ant_segments (self);
+      } else if (mask) {
+        cairo_surface_destroy (mask);
+      }
+      g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
+      gtk_widget_queue_draw (GTK_WIDGET (self));
+      return;
+    }
+
+    self->sel_dragging_new = TRUE;
+    self->has_selection = FALSE;
+    g_clear_pointer (&self->sel_mask, cairo_surface_destroy);
+    if (self->sel_ant_segs)
+      g_array_set_size (self->sel_ant_segs, 0);
+    if (g_strcmp0 (tool->id, "select-lasso") == 0) {
+      g_array_set_size (self->lasso_points, 0);
+      PaintPoint pt = {
+        CLAMP (cx, 0.0, (double) self->document->width),
+        CLAMP (cy, 0.0, (double) self->document->height)
+      };
+      g_array_append_val (self->lasso_points, pt);
+      self->sel_rect = (cairo_rectangle_int_t) { (int) floor (pt.x), (int) floor (pt.y), 0, 0 };
     } else {
-      if (self->has_selection)
-        paint_canvas_commit_selection (self);
-      self->sel_dragging_new = TRUE;
-      self->has_selection = FALSE;
       self->sel_rect = (cairo_rectangle_int_t) {
         CLAMP ((int) floor (cx), 0, self->document->width),
         CLAMP ((int) floor (cy), 0, self->document->height),
         0, 0
       };
-      g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
     }
+    g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
     gtk_widget_queue_draw (GTK_WIDGET (self));
+    return;
+  }
+
+  if (!check_active_layer_editable (self)) {
+    self->drawing_active = FALSE;
+    self->touch_stroke_pending = FALSE;
     return;
   }
 
@@ -3591,6 +1983,18 @@ on_drag_begin (GtkGestureDrag *gesture,
 }
 
 static void
+emit_cursor_coords (PaintCanvas *self, gboolean inside, double doc_x, double doc_y)
+{
+  if (!self->document || !inside) {
+    g_signal_emit (self, signals[SIGNAL_CURSOR_MOVED], 0, FALSE, 0, 0);
+    return;
+  }
+  int ix = CLAMP ((int) floor (doc_x), 0, MAX (0, self->document->width - 1));
+  int iy = CLAMP ((int) floor (doc_y), 0, MAX (0, self->document->height - 1));
+  g_signal_emit (self, signals[SIGNAL_CURSOR_MOVED], 0, TRUE, ix, iy);
+}
+
+static void
 on_drag_update (GtkGestureDrag *gesture,
                 double offset_x,
                 double offset_y,
@@ -3604,9 +2008,17 @@ on_drag_update (GtkGestureDrag *gesture,
   double raw_cy = (self->drag_start_y + offset_y) / self->zoom;
   self->hover_x = raw_cx;
   self->hover_y = raw_cy;
+  emit_cursor_coords (self, TRUE, raw_cx, raw_cy);
 
   if (self->eyedropper_active) {
     sample_color_at (self, raw_cx, raw_cy);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    return;
+  }
+
+  if (self->sel_resizing) {
+    GdkModifierType state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
+    apply_selection_handle_resize (self, raw_cx, raw_cy, state);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
   }
@@ -3621,6 +2033,24 @@ on_drag_update (GtkGestureDrag *gesture,
   }
 
   if (self->sel_dragging_new) {
+    const PaintTool *sel_tool = paint_tools_find (self->settings->active_tool_id);
+    if (sel_tool && g_strcmp0 (sel_tool->id, "select-lasso") == 0) {
+      double px = CLAMP (raw_cx, 0.0, (double) self->document->width);
+      double py = CLAMP (raw_cy, 0.0, (double) self->document->height);
+      if (self->lasso_points->len == 0) {
+        PaintPoint pt = { px, py };
+        g_array_append_val (self->lasso_points, pt);
+      } else {
+        PaintPoint last = g_array_index (self->lasso_points, PaintPoint, self->lasso_points->len - 1);
+        if (hypot (px - last.x, py - last.y) >= 1.5) {
+          PaintPoint pt = { px, py };
+          g_array_append_val (self->lasso_points, pt);
+        }
+      }
+      gtk_widget_queue_draw (GTK_WIDGET (self));
+      return;
+    }
+
     double sx0 = CLAMP (self->drag_start_x / self->zoom, 0.0, (double) self->document->width);
     double sy0 = CLAMP (self->drag_start_y / self->zoom, 0.0, (double) self->document->height);
     double ex = raw_cx;
@@ -3647,7 +2077,7 @@ on_drag_update (GtkGestureDrag *gesture,
     return;
   }
 
-  const PaintTool *tool = paint_tools_find (self->settings->active_tool_id);
+  const PaintTool *tool = resolve_stroke_tool (self, GTK_GESTURE (gesture), FALSE);
   if (g_strcmp0 (tool->id, "text") == 0)
     return;
 
@@ -3738,22 +2168,88 @@ on_drag_end (GtkGestureDrag *gesture,
       paint_tool_settings_add_recent_color (self->settings, &self->settings->color);
       trigger_pick_badge (self, &self->settings->color);
     }
+    if (self->settings)
+      self->settings->stroke_pressure = 1.0;
+    self->stylus_override_tool = NULL;
     g_signal_emit (self, signals[SIGNAL_COLOR_PICKED], 0, TRUE);
     update_canvas_cursor (self);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
   }
 
+  if (self->sel_resizing) {
+    GdkModifierType state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
+    apply_selection_handle_resize (self, raw_cx, raw_cy, state);
+    self->sel_resizing = FALSE;
+    self->sel_resize_handle = 0;
+    if (self->sel_orig_mask) {
+      g_clear_pointer (&self->sel_mask, cairo_surface_destroy);
+      self->sel_mask = scale_a8_mask (self->sel_orig_mask,
+                                      self->sel_rect.width,
+                                      self->sel_rect.height);
+      rebuild_sel_ant_segments (self);
+    }
+    if (self->settings)
+      self->settings->stroke_pressure = 1.0;
+    self->stylus_override_tool = NULL;
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
+    return;
+  }
+
   if (self->sel_moving) {
     self->sel_moving = FALSE;
+    if (self->settings)
+      self->settings->stroke_pressure = 1.0;
+    self->stylus_override_tool = NULL;
     g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
     return;
   }
 
   if (self->sel_dragging_new) {
+    const PaintTool *sel_tool = paint_tools_find (self->settings->active_tool_id);
     self->sel_dragging_new = FALSE;
-    if (!self->has_selection)
+    if (sel_tool && g_strcmp0 (sel_tool->id, "select-lasso") == 0) {
+      if (self->lasso_points && self->lasso_points->len >= 3) {
+        double minx = self->document->width, miny = self->document->height;
+        double maxx = 0.0, maxy = 0.0;
+        for (guint i = 0; i < self->lasso_points->len; i++) {
+          PaintPoint pt = g_array_index (self->lasso_points, PaintPoint, i);
+          if (pt.x < minx) minx = pt.x;
+          if (pt.y < miny) miny = pt.y;
+          if (pt.x > maxx) maxx = pt.x;
+          if (pt.y > maxy) maxy = pt.y;
+        }
+        int x0 = CLAMP ((int) floor (minx), 0, self->document->width);
+        int y0 = CLAMP ((int) floor (miny), 0, self->document->height);
+        int x1 = CLAMP ((int) ceil (maxx), 0, self->document->width);
+        int y1 = CLAMP ((int) ceil (maxy), 0, self->document->height);
+        if (x1 - x0 >= 2 && y1 - y0 >= 2) {
+          cairo_surface_t *mask = create_lasso_mask (self->lasso_points,
+                                                     x0, y0, x1 - x0, y1 - y0);
+          self->sel_mask = mask;
+          self->sel_rect = (cairo_rectangle_int_t) { x0, y0, x1 - x0, y1 - y0 };
+          rebuild_sel_ant_segments (self);
+          if (self->sel_ant_segs->len > 0) {
+            self->has_selection = TRUE;
+          } else {
+            g_clear_pointer (&self->sel_mask, cairo_surface_destroy);
+            self->has_selection = FALSE;
+            self->sel_rect = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+          }
+        }
+      }
+      if (self->lasso_points)
+        g_array_set_size (self->lasso_points, 0);
+    } else if (!self->has_selection) {
       self->sel_rect = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+    } else if (sel_tool && g_strcmp0 (sel_tool->id, "select-ellipse") == 0) {
+      self->sel_mask = create_ellipse_mask (self->sel_rect.width, self->sel_rect.height);
+      rebuild_sel_ant_segments (self);
+    }
+    if (self->settings)
+      self->settings->stroke_pressure = 1.0;
+    self->stylus_override_tool = NULL;
     gtk_widget_queue_draw (GTK_WIDGET (self));
     g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
     return;
@@ -3761,12 +2257,19 @@ on_drag_end (GtkGestureDrag *gesture,
 
   if (self->text_dragging) {
     self->text_dragging = FALSE;
+    if (self->settings)
+      self->settings->stroke_pressure = 1.0;
+    self->stylus_override_tool = NULL;
     return;
   }
 
-  const PaintTool *tool = paint_tools_find (self->settings->active_tool_id);
-  if (g_strcmp0 (tool->id, "text") == 0 || g_strcmp0 (tool->id, "select") == 0)
+  const PaintTool *tool = resolve_stroke_tool (self, GTK_GESTURE (gesture), FALSE);
+  if (g_strcmp0 (tool->id, "text") == 0 || tool->is_select) {
+    if (self->settings)
+      self->settings->stroke_pressure = 1.0;
+    self->stylus_override_tool = NULL;
     return;
+  }
 
   if (self->touch_stroke_pending) {
     self->touch_stroke_pending = FALSE;
@@ -3807,7 +2310,10 @@ on_drag_end (GtkGestureDrag *gesture,
   self->shape_shift_y = 0.0;
 
   paint_document_end_stroke (self->document, cx, cy, tool, self->settings);
-  if (g_strcmp0 (tool->id, "eraser") != 0 && !tool->is_transparency)
+  if (self->settings)
+    self->settings->stroke_pressure = 1.0;
+  self->stylus_override_tool = NULL;
+  if (g_strcmp0 (tool->id, "eraser") != 0 && !tool->is_transparency && !tool->is_retouch)
     paint_tool_settings_add_recent_color (self->settings, &self->settings->color);
   gtk_widget_queue_draw (GTK_WIDGET (self));
   g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
@@ -3826,10 +2332,20 @@ on_drag_cancel (GtkGesture *gesture G_GNUC_UNUSED,
   self->space_held = FALSE;
   self->shape_shift_x = 0.0;
   self->shape_shift_y = 0.0;
+  if (self->settings)
+    self->settings->stroke_pressure = 1.0;
+  self->stylus_override_tool = NULL;
 
   if (self->eyedropper_active) {
     self->eyedropper_active = FALSE;
     update_canvas_cursor (self);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    return;
+  }
+  if (self->sel_resizing) {
+    self->sel_rect = self->sel_resize_orig_rect;
+    self->sel_resizing = FALSE;
+    self->sel_resize_handle = 0;
     gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
   }
@@ -3844,6 +2360,8 @@ on_drag_cancel (GtkGesture *gesture G_GNUC_UNUSED,
     self->sel_dragging_new = FALSE;
     self->has_selection = FALSE;
     self->sel_rect = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+    if (self->lasso_points)
+      g_array_set_size (self->lasso_points, 0);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
     return;
@@ -3880,6 +2398,7 @@ on_motion (GtkEventControllerMotion *ctrl,
     self->alt_held = (state & GDK_ALT_MASK) != 0;
   }
   update_canvas_cursor (self);
+  emit_cursor_coords (self, TRUE, self->hover_x, self->hover_y);
   if (self->show_cursor_ring || is_eyedropper_mode (self) || self->pick_badge_active)
     gtk_widget_queue_draw (GTK_WIDGET (self));
 }
@@ -3891,8 +2410,19 @@ on_leave (GtkEventControllerMotion *ctrl G_GNUC_UNUSED, gpointer user_data)
   gboolean was_eyedropper = is_eyedropper_mode (self);
   self->has_hover = FALSE;
   update_canvas_cursor (self);
+  emit_cursor_coords (self, FALSE, 0.0, 0.0);
   if (self->show_cursor_ring || was_eyedropper || self->pick_badge_active)
     gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+static void
+clear_filter_state (PaintCanvas *self)
+{
+  g_clear_pointer (&self->filter_backup, cairo_surface_destroy);
+  g_clear_pointer (&self->filter_mask, cairo_surface_destroy);
+  self->filter_has_rect = FALSE;
+  self->filter_rect = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
+  self->filter_alpha_lock = FALSE;
 }
 
 static void
@@ -3900,10 +2430,17 @@ paint_canvas_finalize (GObject *object)
 {
   PaintCanvas *self = PAINT_CANVAS (object);
   g_clear_handle_id (&self->pick_badge_timeout_id, g_source_remove);
+  clear_filter_state (self);
   invalidate_viewport_cache (self);
   g_clear_object (&self->checker_texture);
   g_clear_pointer (&self->vp_surface, cairo_surface_destroy);
   g_clear_pointer (&self->ov_surface, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_mask, cairo_surface_destroy);
+  g_clear_pointer (&self->floating_hole_mask, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_orig_floating, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_orig_mask, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_ant_segs, g_array_unref);
+  g_clear_pointer (&self->lasso_points, g_array_unref);
   g_clear_pointer (&self->floating_surface, cairo_surface_destroy);
   g_clear_object (&self->floating_texture);
   g_clear_pointer (&self->text_content, g_free);
@@ -3951,6 +2488,17 @@ paint_canvas_class_init (PaintCanvasClass *klass)
                                                         G_SIGNAL_RUN_FIRST,
                                                         0, NULL, NULL, NULL,
                                                         G_TYPE_NONE, 0);
+  signals[SIGNAL_LOCKED_LAYER_BLOCKED] = g_signal_new ("locked-layer-blocked",
+                                                        G_TYPE_FROM_CLASS (klass),
+                                                        G_SIGNAL_RUN_FIRST,
+                                                        0, NULL, NULL, NULL,
+                                                        G_TYPE_NONE, 0);
+  signals[SIGNAL_CURSOR_MOVED] = g_signal_new ("cursor-moved",
+                                                 G_TYPE_FROM_CLASS (klass),
+                                                 G_SIGNAL_RUN_FIRST,
+                                                 0, NULL, NULL, NULL,
+                                                 G_TYPE_NONE, 3,
+                                                 G_TYPE_BOOLEAN, G_TYPE_INT, G_TYPE_INT);
 }
 
 static void
@@ -3959,6 +2507,8 @@ paint_canvas_init (PaintCanvas *self)
   self->zoom = 1.0;
   self->show_cursor_ring = TRUE;
   self->show_pixel_grid = TRUE;
+  self->sel_ant_segs = g_array_new (FALSE, FALSE, sizeof (PaintSelSeg));
+  self->lasso_points = g_array_new (FALSE, FALSE, sizeof (PaintPoint));
 
   gtk_widget_add_css_class (GTK_WIDGET (self), "paint-canvas-frame");
   gtk_widget_add_css_class (GTK_WIDGET (self), "paint-canvas-shadow");
@@ -4008,6 +2558,7 @@ paint_canvas_get_document (PaintCanvas *self)
 void
 paint_canvas_set_document (PaintCanvas *self, PaintDocument *doc)
 {
+  clear_filter_state (self);
   paint_canvas_cancel_text (self);
   clear_selection_state (self);
   invalidate_viewport_cache (self);
@@ -4121,6 +2672,8 @@ paint_canvas_redo (PaintCanvas *self)
 void
 paint_canvas_clear (PaintCanvas *self)
 {
+  if (!check_active_layer_editable (self))
+    return;
   paint_canvas_commit_active_overlays (self);
   paint_document_clear (self->document);
   gtk_widget_queue_draw (GTK_WIDGET (self));
@@ -4130,6 +2683,8 @@ paint_canvas_clear (PaintCanvas *self)
 void
 paint_canvas_clear_transparent (PaintCanvas *self)
 {
+  if (!check_active_layer_editable (self))
+    return;
   paint_canvas_commit_active_overlays (self);
   paint_document_clear_transparent (self->document);
   gtk_widget_queue_draw (GTK_WIDGET (self));
@@ -4156,6 +2711,26 @@ paint_canvas_scale (PaintCanvas *self, int width, int height)
   g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
 }
 
+static void
+normalize_floating_for_transform (PaintCanvas *self)
+{
+  if (!self->floating_surface)
+    return;
+  int fw = cairo_image_surface_get_width (self->floating_surface);
+  int fh = cairo_image_surface_get_height (self->floating_surface);
+  if (fw != self->sel_rect.width || fh != self->sel_rect.height) {
+    cairo_surface_t *scaled = scale_argb32_surface (self->floating_surface,
+                                                    self->sel_rect.width,
+                                                    self->sel_rect.height);
+    if (scaled) {
+      cairo_surface_destroy (self->floating_surface);
+      self->floating_surface = scaled;
+    }
+  }
+  g_clear_pointer (&self->sel_orig_floating, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_orig_mask, cairo_surface_destroy);
+}
+
 void
 paint_canvas_rotate_90 (PaintCanvas *self, gboolean clockwise)
 {
@@ -4163,9 +2738,16 @@ paint_canvas_rotate_90 (PaintCanvas *self, gboolean clockwise)
     lift_selection_to_floating (self);
     if (!self->floating_surface)
       return;
+    normalize_floating_for_transform (self);
     cairo_surface_t *rot = paint_surface_rotate_90 (self->floating_surface, clockwise);
     cairo_surface_destroy (self->floating_surface);
     self->floating_surface = rot;
+    if (self->sel_mask) {
+      cairo_surface_t *rmask = transform_a8_mask_rotate_90 (self->sel_mask, clockwise);
+      cairo_surface_destroy (self->sel_mask);
+      self->sel_mask = rmask;
+      rebuild_sel_ant_segments (self);
+    }
     int nw = cairo_image_surface_get_width (rot);
     int nh = cairo_image_surface_get_height (rot);
     int cx = self->sel_rect.x + self->sel_rect.width / 2;
@@ -4194,9 +2776,16 @@ paint_canvas_flip (PaintCanvas *self, gboolean horizontal)
     lift_selection_to_floating (self);
     if (!self->floating_surface)
       return;
+    normalize_floating_for_transform (self);
     cairo_surface_t *flipped = paint_surface_flip (self->floating_surface, horizontal);
     cairo_surface_destroy (self->floating_surface);
     self->floating_surface = flipped;
+    if (self->sel_mask) {
+      cairo_surface_t *fmask = transform_a8_mask_flip (self->sel_mask, horizontal);
+      cairo_surface_destroy (self->sel_mask);
+      self->sel_mask = fmask;
+      rebuild_sel_ant_segments (self);
+    }
     sync_floating_texture (self);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     return;
@@ -4214,16 +2803,130 @@ paint_canvas_has_selection (PaintCanvas *self)
   return self && self->has_selection && self->sel_rect.width > 0 && self->sel_rect.height > 0;
 }
 
+gboolean
+paint_canvas_is_drawing (PaintCanvas *self)
+{
+  return self && self->drawing_active;
+}
+
+gboolean
+paint_canvas_get_selection_mask_and_rect (PaintCanvas *self,
+                                          cairo_rectangle_int_t *out_rect,
+                                          cairo_surface_t **out_mask)
+{
+  if (!paint_canvas_has_selection (self))
+    return FALSE;
+  if (out_rect)
+    *out_rect = self->sel_rect;
+  if (out_mask)
+    *out_mask = self->sel_mask;
+  return TRUE;
+}
+
 void
 paint_canvas_select_all (PaintCanvas *self)
 {
   if (!self || !self->document)
     return;
   paint_canvas_commit_active_overlays (self);
+  g_clear_pointer (&self->sel_mask, cairo_surface_destroy);
+  if (self->sel_ant_segs)
+    g_array_set_size (self->sel_ant_segs, 0);
   self->has_selection = TRUE;
   self->sel_rect = (cairo_rectangle_int_t) {
     0, 0, self->document->width, self->document->height
   };
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
+}
+
+void
+paint_canvas_invert_selection (PaintCanvas *self)
+{
+  if (!self || !self->document)
+    return;
+  if (!paint_canvas_has_selection (self)) {
+    paint_canvas_select_all (self);
+    return;
+  }
+
+  cairo_rectangle_int_t old_r = self->sel_rect;
+  cairo_surface_t *old_mask = self->sel_mask ? cairo_surface_reference (self->sel_mask) : NULL;
+  paint_canvas_commit_active_overlays (self);
+
+  int dw = self->document->width;
+  int dh = self->document->height;
+  const unsigned char *mdata = NULL;
+  int mstride = 0;
+  int mw = 0, mh = 0;
+  if (old_mask) {
+    cairo_surface_flush (old_mask);
+    mdata = cairo_image_surface_get_data (old_mask);
+    mstride = cairo_image_surface_get_stride (old_mask);
+    mw = cairo_image_surface_get_width (old_mask);
+    mh = cairo_image_surface_get_height (old_mask);
+  }
+
+  int min_x = dw, min_y = dh, max_x = -1, max_y = -1;
+  guint8 *inv = g_malloc ((gsize) dw * (gsize) dh);
+  for (int y = 0; y < dh; y++) {
+    guint8 *irow = inv + (gsize) y * (gsize) dw;
+    gboolean in_y = (y >= old_r.y && y < old_r.y + old_r.height);
+    const unsigned char *mrow = NULL;
+    if (mdata && in_y) {
+      int my = y - old_r.y;
+      if (my >= 0 && my < mh)
+        mrow = mdata + (gsize) my * (gsize) mstride;
+    }
+    for (int x = 0; x < dw; x++) {
+      gboolean inside = FALSE;
+      if (in_y && x >= old_r.x && x < old_r.x + old_r.width) {
+        if (!old_mask) {
+          inside = TRUE;
+        } else if (mrow) {
+          int mx = x - old_r.x;
+          if (mx >= 0 && mx < mw && mrow[mx] >= 128)
+            inside = TRUE;
+        }
+      }
+      if (!inside) {
+        irow[x] = 255;
+        if (x < min_x) min_x = x;
+        if (x > max_x) max_x = x;
+        if (y < min_y) min_y = y;
+        if (y > max_y) max_y = y;
+      } else {
+        irow[x] = 0;
+      }
+    }
+  }
+  g_clear_pointer (&old_mask, cairo_surface_destroy);
+
+  if (max_x < min_x || max_y < min_y) {
+    g_free (inv);
+    clear_selection_state (self);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
+    return;
+  }
+
+  int cw = max_x - min_x + 1;
+  int ch = max_y - min_y + 1;
+  cairo_surface_t *cropped = cairo_image_surface_create (CAIRO_FORMAT_A8, cw, ch);
+  unsigned char *cdata = cairo_image_surface_get_data (cropped);
+  int cstride = cairo_image_surface_get_stride (cropped);
+  for (int y = 0; y < ch; y++) {
+    memcpy (cdata + (gsize) y * (gsize) cstride,
+            inv + (gsize) (min_y + y) * (gsize) dw + (gsize) min_x,
+            (gsize) cw);
+  }
+  cairo_surface_mark_dirty (cropped);
+  g_free (inv);
+
+  self->has_selection = TRUE;
+  self->sel_rect = (cairo_rectangle_int_t) { min_x, min_y, cw, ch };
+  self->sel_mask = cropped;
+  rebuild_sel_ant_segments (self);
   gtk_widget_queue_draw (GTK_WIDGET (self));
   g_signal_emit (self, signals[SIGNAL_SELECTION_CHANGED], 0);
 }
@@ -4235,11 +2938,13 @@ paint_canvas_commit_selection (PaintCanvas *self)
     return;
 
   if (self->floating_surface) {
-    paint_document_commit_move (self->document,
-                                self->floating_has_hole ? &self->floating_hole : NULL,
-                                self->floating_surface,
-                                self->sel_rect.x,
-                                self->sel_rect.y);
+    if (!check_active_layer_editable (self))
+      return;
+    paint_document_commit_move_masked (self->document,
+                                       self->floating_has_hole ? &self->floating_hole : NULL,
+                                       self->floating_hole_mask,
+                                       self->floating_surface,
+                                       &self->sel_rect);
     clear_selection_state (self);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
@@ -4263,14 +2968,14 @@ paint_canvas_delete_selection (PaintCanvas *self)
 {
   if (!self || !self->has_selection)
     return FALSE;
+  if (!check_active_layer_editable (self))
+    return FALSE;
 
   if (self->floating_surface) {
     if (self->floating_has_hole) {
-      paint_document_clear_rect (self->document,
-                                 self->floating_hole.x,
-                                 self->floating_hole.y,
-                                 self->floating_hole.width,
-                                 self->floating_hole.height);
+      paint_document_clear_masked_rect (self->document,
+                                        &self->floating_hole,
+                                        self->floating_hole_mask);
     }
     clear_selection_state (self);
     gtk_widget_queue_draw (GTK_WIDGET (self));
@@ -4279,8 +2984,10 @@ paint_canvas_delete_selection (PaintCanvas *self)
   }
 
   cairo_rectangle_int_t r = self->sel_rect;
+  cairo_surface_t *mask = self->sel_mask ? cairo_surface_reference (self->sel_mask) : NULL;
   clear_selection_state (self);
-  paint_document_clear_rect (self->document, r.x, r.y, r.width, r.height);
+  paint_document_clear_masked_rect (self->document, &r, mask);
+  g_clear_pointer (&mask, cairo_surface_destroy);
   gtk_widget_queue_draw (GTK_WIDGET (self));
   g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
   return TRUE;
@@ -4305,6 +3012,36 @@ paint_canvas_crop_to_selection (PaintCanvas *self)
   return TRUE;
 }
 
+gboolean
+paint_canvas_trim_transparent (PaintCanvas *self)
+{
+  if (!self || !self->document)
+    return FALSE;
+  paint_canvas_cancel_filter_preview (self);
+  paint_canvas_commit_active_overlays (self);
+  if (!paint_document_trim_transparent (self->document))
+    return FALSE;
+  invalidate_viewport_cache (self);
+  update_size_request (self);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  return TRUE;
+}
+
+static cairo_surface_t *
+dup_scaled_floating_surface (const PaintCanvas *self)
+{
+  if (!self->floating_surface)
+    return NULL;
+  int fw = cairo_image_surface_get_width (self->floating_surface);
+  int fh = cairo_image_surface_get_height (self->floating_surface);
+  if (fw == self->sel_rect.width && fh == self->sel_rect.height)
+    return cairo_surface_reference (self->floating_surface);
+  return scale_argb32_surface (self->floating_surface,
+                               MAX (1, self->sel_rect.width),
+                               MAX (1, self->sel_rect.height));
+}
+
 GdkTexture *
 paint_canvas_copy_selection (PaintCanvas *self)
 {
@@ -4312,13 +3049,17 @@ paint_canvas_copy_selection (PaintCanvas *self)
     return NULL;
 
   if (self->has_selection) {
-    if (self->floating_surface)
-      return paint_texture_from_surface (self->floating_surface);
-    cairo_surface_t *copy = paint_document_copy_rect (self->document,
-                                                      self->sel_rect.x,
-                                                      self->sel_rect.y,
-                                                      self->sel_rect.width,
-                                                      self->sel_rect.height);
+    if (self->floating_surface) {
+      cairo_surface_t *fs = dup_scaled_floating_surface (self);
+      if (!fs)
+        return NULL;
+      GdkTexture *tex = paint_texture_from_surface (fs);
+      cairo_surface_destroy (fs);
+      return tex;
+    }
+    cairo_surface_t *copy = paint_document_copy_masked_rect (self->document,
+                                                             &self->sel_rect,
+                                                             self->sel_mask);
     if (!copy)
       return NULL;
     GdkTexture *tex = paint_texture_from_surface (copy);
@@ -4330,8 +3071,42 @@ paint_canvas_copy_selection (PaintCanvas *self)
 }
 
 GdkTexture *
+paint_canvas_copy_merged_selection (PaintCanvas *self)
+{
+  if (!self || !self->document)
+    return NULL;
+
+  if (self->has_selection) {
+    cairo_surface_t *copy = paint_document_copy_merged_masked_rect (
+        self->document,
+        &self->sel_rect,
+        self->floating_surface ? NULL : self->sel_mask);
+    if (!copy)
+      return NULL;
+    if (self->floating_surface) {
+      cairo_surface_t *fs = dup_scaled_floating_surface (self);
+      if (fs) {
+        cairo_t *cr = cairo_create (copy);
+        cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+        cairo_set_source_surface (cr, fs, 0.0, 0.0);
+        cairo_paint (cr);
+        cairo_destroy (cr);
+        cairo_surface_destroy (fs);
+      }
+    }
+    GdkTexture *tex = paint_texture_from_surface (copy);
+    cairo_surface_destroy (copy);
+    return tex;
+  }
+
+  return paint_texture_from_surface (self->document->surface);
+}
+
+GdkTexture *
 paint_canvas_cut_selection (PaintCanvas *self)
 {
+  if (!check_active_layer_editable (self))
+    return NULL;
   GdkTexture *tex = paint_canvas_copy_selection (self);
   if (!tex)
     return NULL;
@@ -4347,6 +3122,8 @@ void
 paint_canvas_paste_texture (PaintCanvas *self, GdkTexture *texture)
 {
   if (!self || !self->document || !texture)
+    return;
+  if (!check_active_layer_editable (self))
     return;
 
   paint_canvas_commit_active_overlays (self);
@@ -4372,6 +3149,12 @@ paint_canvas_paste_texture (PaintCanvas *self, GdkTexture *texture)
                 ? 0
                 : CLAMP ((int) lround (cy) - ph / 2, 0, self->document->height - ph);
 
+  g_clear_pointer (&self->sel_mask, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_orig_floating, cairo_surface_destroy);
+  g_clear_pointer (&self->sel_orig_mask, cairo_surface_destroy);
+  g_clear_pointer (&self->floating_hole_mask, cairo_surface_destroy);
+  if (self->sel_ant_segs)
+    g_array_set_size (self->sel_ant_segs, 0);
   self->floating_surface = surf;
   self->floating_has_hole = FALSE;
   self->floating_hole = (cairo_rectangle_int_t) { 0, 0, 0, 0 };
@@ -4388,6 +3171,8 @@ paint_canvas_nudge_selection (PaintCanvas *self, int dx, int dy)
   if (!self || !self->has_selection)
     return;
   lift_selection_to_floating (self);
+  if (!self->floating_surface)
+    return;
   self->sel_rect.x += dx;
   self->sel_rect.y += dy;
   gtk_widget_queue_draw (GTK_WIDGET (self));
@@ -4423,6 +3208,8 @@ paint_canvas_commit_text (PaintCanvas *self)
     return;
 
   gboolean drew = (self->text_content && *self->text_content);
+  if (drew && !check_active_layer_editable (self))
+    return;
   if (drew) {
     paint_document_draw_text (self->document,
                               self->text_x,
@@ -4497,6 +3284,19 @@ paint_canvas_set_alt_eyedropper (PaintCanvas *self, gboolean active)
 }
 
 void
+paint_canvas_set_pan_override (PaintCanvas *self, gboolean active, gboolean dragging)
+{
+  if (!self)
+    return;
+  if (self->pan_override_active == active && self->pan_override_dragging == dragging)
+    return;
+  self->pan_override_active = active;
+  self->pan_override_dragging = active && dragging;
+  update_canvas_cursor (self);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+void
 paint_canvas_check_viewport (PaintCanvas *self)
 {
   if (!self->document || gtk_widget_get_width (GTK_WIDGET (self)) <= 0)
@@ -4519,6 +3319,44 @@ paint_canvas_add_layer (PaintCanvas *self, const char *name)
     return -1;
   paint_canvas_commit_active_overlays (self);
   int idx = paint_document_add_layer (self->document, name);
+  if (idx >= 0) {
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+  }
+  return idx;
+}
+
+int
+paint_canvas_add_layer_from_texture (PaintCanvas *self,
+                                     const char *name,
+                                     GdkTexture *texture)
+{
+  if (!self || !self->document || !texture)
+    return -1;
+  paint_canvas_commit_active_overlays (self);
+  cairo_surface_t *raw = paint_surface_from_texture (texture);
+  if (!raw)
+    return -1;
+
+  int pw = cairo_image_surface_get_width (raw);
+  int ph = cairo_image_surface_get_height (raw);
+  cairo_surface_t *placed = raw;
+  if (pw < self->document->width || ph < self->document->height) {
+    int ox = (pw < self->document->width) ? (self->document->width - pw) / 2 : 0;
+    int oy = (ph < self->document->height) ? (self->document->height - ph) / 2 : 0;
+    placed = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+                                         self->document->width,
+                                         self->document->height);
+    cairo_t *cr = cairo_create (placed);
+    cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface (cr, raw, (double) ox, (double) oy);
+    cairo_paint (cr);
+    cairo_destroy (cr);
+    cairo_surface_destroy (raw);
+  }
+
+  int idx = paint_document_add_layer_from_surface (self->document, name, placed);
+  cairo_surface_destroy (placed);
   if (idx >= 0) {
     gtk_widget_queue_draw (GTK_WIDGET (self));
     g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
@@ -4614,6 +3452,19 @@ paint_canvas_set_layer_visible (PaintCanvas *self, int index, gboolean visible)
 }
 
 void
+paint_canvas_set_layers_visibility (PaintCanvas *self,
+                                    const gboolean *visible,
+                                    int count)
+{
+  if (!self || !self->document || !visible || count <= 0)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_set_layers_visibility (self->document, visible, count);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
 paint_canvas_set_layer_opacity (PaintCanvas *self, int index, double opacity)
 {
   if (!self || !self->document)
@@ -4636,6 +3487,26 @@ paint_canvas_set_layer_blend_mode (PaintCanvas *self, int index, PaintBlendMode 
 }
 
 void
+paint_canvas_set_layer_alpha_lock (PaintCanvas *self, int index, gboolean alpha_lock)
+{
+  if (!self || !self->document)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_layer_set_alpha_lock (self->document, index, alpha_lock);
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
+paint_canvas_set_layer_locked (PaintCanvas *self, int index, gboolean locked)
+{
+  if (!self || !self->document)
+    return;
+  paint_canvas_commit_active_overlays (self);
+  paint_document_layer_set_locked (self->document, index, locked);
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
 paint_canvas_set_layer_name (PaintCanvas *self, int index, const char *name)
 {
   if (!self || !self->document)
@@ -4643,4 +3514,98 @@ paint_canvas_set_layer_name (PaintCanvas *self, int index, const char *name)
   paint_canvas_commit_active_overlays (self);
   paint_document_layer_set_name (self->document, index, name);
   g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+gboolean
+paint_canvas_begin_filter_preview (PaintCanvas *self)
+{
+  if (!self || !self->document)
+    return FALSE;
+  if (!check_active_layer_editable (self))
+    return FALSE;
+
+  if (self->filter_backup)
+    paint_canvas_cancel_filter_preview (self);
+  if (self->text_active)
+    paint_canvas_commit_text (self);
+
+  clear_filter_state (self);
+  if (self->has_selection && self->sel_rect.width > 0 && self->sel_rect.height > 0) {
+    self->filter_has_rect = TRUE;
+    self->filter_rect = self->sel_rect;
+    if (self->sel_mask &&
+        cairo_image_surface_get_width (self->sel_mask) == self->sel_rect.width &&
+        cairo_image_surface_get_height (self->sel_mask) == self->sel_rect.height) {
+      self->filter_mask = cairo_surface_reference (self->sel_mask);
+    }
+    if (self->floating_surface)
+      paint_canvas_commit_selection (self);
+  }
+
+  self->filter_backup = paint_document_dup_active_layer_surface (self->document);
+  if (!self->filter_backup) {
+    clear_filter_state (self);
+    return FALSE;
+  }
+  self->filter_alpha_lock = paint_document_layer_get_alpha_lock (
+      self->document,
+      paint_document_get_active_layer (self->document));
+  return TRUE;
+}
+
+void
+paint_canvas_update_filter_preview (PaintCanvas *self,
+                                    PaintCanvasFilterFunc func,
+                                    gpointer user_data)
+{
+  if (!self || !self->document || !self->filter_backup || !func)
+    return;
+
+  const cairo_rectangle_int_t *r = self->filter_has_rect ? &self->filter_rect : NULL;
+  paint_document_restore_active_layer_rect (self->document, self->filter_backup, r);
+
+  int active = paint_document_get_active_layer (self->document);
+  cairo_surface_t *layer_surf = paint_document_layer_get_surface (self->document, active);
+  if (layer_surf)
+    func (layer_surf, r, self->filter_mask, self->filter_alpha_lock, user_data);
+
+  paint_document_notify_active_layer_rect_modified (self->document, r);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+void
+paint_canvas_commit_filter_preview (PaintCanvas *self)
+{
+  if (!self || !self->document || !self->filter_backup)
+    return;
+
+  const cairo_rectangle_int_t *r = self->filter_has_rect ? &self->filter_rect : NULL;
+  paint_document_commit_active_layer_from_backup (self->document, self->filter_backup, r);
+  clear_filter_state (self);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  g_signal_emit (self, signals[SIGNAL_CHANGED], 0);
+}
+
+void
+paint_canvas_cancel_filter_preview (PaintCanvas *self)
+{
+  if (!self || !self->document || !self->filter_backup)
+    return;
+
+  const cairo_rectangle_int_t *r = self->filter_has_rect ? &self->filter_rect : NULL;
+  paint_document_restore_active_layer_rect (self->document, self->filter_backup, r);
+  clear_filter_state (self);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+gboolean
+paint_canvas_apply_filter (PaintCanvas *self,
+                           PaintCanvasFilterFunc func,
+                           gpointer user_data)
+{
+  if (!paint_canvas_begin_filter_preview (self))
+    return FALSE;
+  paint_canvas_update_filter_preview (self, func, user_data);
+  paint_canvas_commit_filter_preview (self);
+  return TRUE;
 }

@@ -4,62 +4,83 @@
 #include <string.h>
 
 #include "paint-canvas.h"
+#include "paint-i18n.h"
 
 static const PaintKeybindSpec KEYBIND_SPECS[] = {
   /* Tools */
-  { "win.tool-select", "Tools", "Selection Tool", "m", { NULL } },
-  { "win.tool-brush", "Tools", "Brush Tool", "b", { NULL } },
-  { "win.tool-line", "Tools", "Line Tool", "l", { NULL } },
-  { "win.tool-text", "Tools", "Text Tool", "x", { NULL } },
-  { "win.tool-eraser", "Tools", "Eraser Tool", "e", { NULL } },
-  { "win.tool-fill", "Tools", "Fill Tool", "f", { NULL } },
-  { "win.tool-eyedropper", "Tools", "Color Picker", "i", { NULL } },
-  { "win.tool-transparent", "Tools", "Transparency Tool", "t", { NULL } },
-  { "win.tool-shape", "Tools", "Shapes Tool", "s", { NULL } },
-  { "win.brush-smaller", "Tools", "Decrease Brush Size", "bracketleft", { NULL } },
-  { "win.brush-larger", "Tools", "Increase Brush Size", "bracketright", { NULL } },
+  { "win.tool-select", N_("Tools"), N_("Selection Tool"), "m", { NULL } },
+  { "win.tool-brush", N_("Tools"), N_("Brush Tool"), "b", { NULL } },
+  { "win.tool-line", N_("Tools"), N_("Line Tool"), "l", { NULL } },
+  { "win.tool-text", N_("Tools"), N_("Text Tool"), "x", { NULL } },
+  { "win.tool-eraser", N_("Tools"), N_("Eraser Tool"), "e", { NULL } },
+  { "win.tool-fill", N_("Tools"), N_("Fill Tool"), "f", { NULL } },
+  { "win.tool-gradient", N_("Tools"), N_("Gradient Tool"), "g", { NULL } },
+  { "win.tool-eyedropper", N_("Tools"), N_("Color Picker"), "i", { NULL } },
+  { "win.tool-blur", N_("Tools"), N_("Blur Brush"), "", { NULL } },
+  { "win.tool-pixelate", N_("Tools"), N_("Pixelate Brush"), "", { NULL } },
+  { "win.tool-transparent", N_("Tools"), N_("Transparency Tool"), "t", { NULL } },
+  { "win.tool-shape", N_("Tools"), N_("Shapes Tool"), "s", { NULL } },
+  { "win.brush-smaller", N_("Tools"), N_("Decrease Brush Size"), "bracketleft", { NULL } },
+  { "win.brush-larger", N_("Tools"), N_("Increase Brush Size"), "bracketright", { NULL } },
+  { "win.swap-colors", N_("Tools"), N_("Swap Primary/Secondary Colors"), "<Shift>x", { NULL } },
+  { "win.reset-colors", N_("Tools"), N_("Reset Colors to Black & White"), "d", { NULL } },
 
   /* Canvas & Layers */
-  { "win.undo", "Canvas & Layers", "Undo", "<Primary>z", { NULL } },
-  { "win.redo", "Canvas & Layers", "Redo", "<Primary><Shift>z", { "<Primary>y", NULL } },
-  { "win.toggle-layers", "Canvas & Layers", "Toggle Layers Panel", "<Primary>l", { NULL } },
-  { "win.new-layer", "Canvas & Layers", "New Layer", "<Primary><Shift>l", { NULL } },
-  { "win.duplicate-layer", "Canvas & Layers", "Duplicate Layer", "", { NULL } },
-  { "win.merge-layer-down", "Canvas & Layers", "Merge Layer Down", "", { NULL } },
-  { "win.flatten-layers", "Canvas & Layers", "Flatten Layers", "", { NULL } },
-  { "win.resize-canvas", "Canvas & Layers", "Resize & Scale", "", { NULL } },
-  { "win.rotate-cw", "Canvas & Layers", "Rotate Right 90°", "", { NULL } },
-  { "win.rotate-ccw", "Canvas & Layers", "Rotate Left 90°", "", { NULL } },
-  { "win.flip-horizontal", "Canvas & Layers", "Flip Horizontal", "", { NULL } },
-  { "win.flip-vertical", "Canvas & Layers", "Flip Vertical", "", { NULL } },
+  { "win.undo", N_("Canvas & Layers"), N_("Undo"), "<Primary>z", { NULL } },
+  { "win.redo", N_("Canvas & Layers"), N_("Redo"), "<Primary><Shift>z", { "<Primary>y", NULL } },
+  { "win.toggle-layers", N_("Canvas & Layers"), N_("Toggle Layers Panel"), "<Primary>l", { NULL } },
+  { "win.new-layer", N_("Canvas & Layers"), N_("New Layer"), "<Primary><Shift>l", { NULL } },
+  { "win.import-layer", N_("Canvas & Layers"), N_("Import Image as Layer"), "", { NULL } },
+  { "win.duplicate-layer", N_("Canvas & Layers"), N_("Duplicate Layer"), "", { NULL } },
+  { "win.merge-layer-down", N_("Canvas & Layers"), N_("Merge Layer Down"), "", { NULL } },
+  { "win.flatten-layers", N_("Canvas & Layers"), N_("Flatten Layers"), "", { NULL } },
+  { "win.resize-canvas", N_("Canvas & Layers"), N_("Resize & Scale"), "", { NULL } },
+  { "win.rotate-cw", N_("Canvas & Layers"), N_("Rotate Right 90°"), "", { NULL } },
+  { "win.rotate-ccw", N_("Canvas & Layers"), N_("Rotate Left 90°"), "", { NULL } },
+  { "win.flip-horizontal", N_("Canvas & Layers"), N_("Flip Horizontal"), "", { NULL } },
+  { "win.flip-vertical", N_("Canvas & Layers"), N_("Flip Vertical"), "", { NULL } },
+  { "win.trim-transparent", N_("Canvas & Layers"), N_("Trim Transparent"), "", { NULL } },
+
+  /* Filters */
+  { "win.filter-brightness-contrast", N_("Filters"), N_("Brightness & Contrast"), "", { NULL } },
+  { "win.filter-hsl", N_("Filters"), N_("Hue & Saturation"), "", { NULL } },
+  { "win.filter-blur", N_("Filters"), N_("Gaussian Blur"), "", { NULL } },
+  { "win.filter-sharpen", N_("Filters"), N_("Sharpen"), "", { NULL } },
+  { "win.filter-invert", N_("Filters"), N_("Invert Colors"), "", { NULL } },
+  { "win.filter-grayscale", N_("Filters"), N_("Grayscale"), "", { NULL } },
 
   /* Selection & Clipboard */
-  { "win.select-all", "Selection & Clipboard", "Select All", "<Primary>a", { NULL } },
-  { "win.copy", "Selection & Clipboard", "Copy", "<Primary>c", { NULL } },
-  { "win.cut", "Selection & Clipboard", "Cut", "<Primary>x", { NULL } },
-  { "win.paste", "Selection & Clipboard", "Paste", "<Primary>v", { NULL } },
-  { "win.paste-new-tab", "Selection & Clipboard", "Paste as New Canvas", "<Primary><Shift>v", { NULL } },
-  { "win.crop-selection", "Selection & Clipboard", "Crop to Selection", "<Primary><Shift>x", { NULL } },
+  { "win.select-all", N_("Selection & Clipboard"), N_("Select All"), "<Primary>a", { NULL } },
+  { "win.invert-selection", N_("Selection & Clipboard"), N_("Invert Selection"), "<Primary><Shift>i", { NULL } },
+  { "win.copy", N_("Selection & Clipboard"), N_("Copy"), "<Primary>c", { NULL } },
+  { "win.copy-merged", N_("Selection & Clipboard"), N_("Copy Merged"), "<Primary><Shift>c", { NULL } },
+  { "win.cut", N_("Selection & Clipboard"), N_("Cut"), "<Primary>x", { NULL } },
+  { "win.paste", N_("Selection & Clipboard"), N_("Paste"), "<Primary>v", { NULL } },
+  { "win.paste-as-layer", N_("Selection & Clipboard"), N_("Paste as New Layer"), "<Primary><Alt>v", { NULL } },
+  { "win.paste-new-tab", N_("Selection & Clipboard"), N_("Paste as New Canvas"), "<Primary><Shift>v", { NULL } },
+  { "win.crop-selection", N_("Selection & Clipboard"), N_("Crop to Selection"), "<Primary><Shift>x", { NULL } },
 
   /* View */
-  { "win.zoom-in", "View", "Zoom In", "<Primary>plus", { "<Primary>equal", "<Primary>KP_Add", NULL } },
-  { "win.zoom-out", "View", "Zoom Out", "<Primary>minus", { "<Primary>KP_Subtract", NULL } },
-  { "win.zoom-fit", "View", "Fit to Window", "<Primary>9", { "<Primary>KP_9", NULL } },
-  { "win.zoom-reset", "View", "Reset Zoom", "<Primary>0", { "<Primary>KP_0", NULL } },
-  { "win.toggle-toolbar", "View", "Toggle Floating Toolbar", "F9", { NULL } },
-  { "win.toggle-fullscreen", "View", "Fullscreen", "F11", { NULL } },
+  { "win.zoom-in", N_("View"), N_("Zoom In"), "<Primary>plus", { "<Primary>equal", "<Primary>KP_Add", NULL } },
+  { "win.zoom-out", N_("View"), N_("Zoom Out"), "<Primary>minus", { "<Primary>KP_Subtract", NULL } },
+  { "win.zoom-fit", N_("View"), N_("Fit to Window"), "<Primary>9", { "<Primary>KP_9", NULL } },
+  { "win.zoom-reset", N_("View"), N_("Reset Zoom"), "<Primary>0", { "<Primary>KP_0", NULL } },
+  { "win.toggle-toolbar", N_("View"), N_("Toggle Floating Toolbar"), "F9", { NULL } },
+  { "win.toggle-fullscreen", N_("View"), N_("Fullscreen"), "F11", { NULL } },
 
   /* Files & Tabs */
-  { "win.new-tab", "Files & Tabs", "New Canvas Tab", "<Primary>n", { "<Primary>t", NULL } },
-  { "app.new-window", "Files & Tabs", "New Window", "<Primary><Shift>n", { NULL } },
-  { "win.open", "Files & Tabs", "Open Image", "<Primary>o", { NULL } },
-  { "win.save", "Files & Tabs", "Save", "<Primary>s", { NULL } },
-  { "win.save-as", "Files & Tabs", "Save As", "<Primary><Shift>s", { NULL } },
-  { "win.close-tab", "Files & Tabs", "Close Tab", "<Primary>w", { NULL } },
-  { "win.tab-overview", "Files & Tabs", "Tab Overview", "<Primary><Shift>o", { NULL } },
-  { "app.preferences", "Files & Tabs", "Preferences", "<Primary>comma", { NULL } },
-  { "app.shortcuts", "Files & Tabs", "Keyboard Shortcuts", "<Primary>question", { NULL } },
-  { "app.quit", "Files & Tabs", "Quit", "<Primary>q", { NULL } },
+  { "win.new-tab", N_("Files & Tabs"), N_("New Canvas Tab"), "<Primary>n", { "<Primary>t", NULL } },
+  { "app.new-window", N_("Files & Tabs"), N_("New Window"), "<Primary><Shift>n", { NULL } },
+  { "win.open", N_("Files & Tabs"), N_("Open Image"), "<Primary>o", { NULL } },
+  { "win.save", N_("Files & Tabs"), N_("Save"), "<Primary>s", { NULL } },
+  { "win.save-as", N_("Files & Tabs"), N_("Save As"), "<Primary><Shift>s", { NULL } },
+  { "win.export-image", N_("Files & Tabs"), N_("Export Image"), "<Primary><Shift>e", { NULL } },
+  { "win.print", N_("Files & Tabs"), N_("Print"), "<Primary>p", { NULL } },
+  { "win.close-tab", N_("Files & Tabs"), N_("Close Tab"), "<Primary>w", { NULL } },
+  { "win.tab-overview", N_("Files & Tabs"), N_("Tab Overview"), "<Primary><Shift>o", { NULL } },
+  { "app.preferences", N_("Files & Tabs"), N_("Preferences"), "<Primary>comma", { NULL } },
+  { "app.shortcuts", N_("Files & Tabs"), N_("Keyboard Shortcuts"), "<Primary>question", { NULL } },
+  { "app.quit", N_("Files & Tabs"), N_("Quit"), "<Primary>q", { NULL } },
 };
 
 static char *
@@ -206,11 +227,11 @@ char *
 paint_preferences_format_accel_label (const char *accel)
 {
   if (!accel || !*accel)
-    return g_strdup ("Disabled");
+    return g_strdup (_("Disabled"));
   guint kv = 0;
   GdkModifierType mods = 0;
   if (!gtk_accelerator_parse (accel, &kv, &mods))
-    return g_strdup ("Disabled");
+    return g_strdup (_("Disabled"));
   return gtk_accelerator_get_label (kv, mods);
 }
 
@@ -269,6 +290,52 @@ paint_preferences_match_local_keybind (const PaintPreferences *prefs,
   return NULL;
 }
 
+static void
+load_color_list (GKeyFile *kf,
+                 const char *group,
+                 const char *key,
+                 GdkRGBA *out_colors,
+                 int *out_count,
+                 int max_count)
+{
+  *out_count = 0;
+  if (!g_key_file_has_key (kf, group, key, NULL))
+    return;
+  g_autofree char *raw = g_key_file_get_string (kf, group, key, NULL);
+  if (!raw || !*raw)
+    return;
+  g_auto (GStrv) parts = g_strsplit (raw, ";", -1);
+  for (int i = 0; parts && parts[i] && *out_count < max_count; i++) {
+    g_strstrip (parts[i]);
+    if (!*parts[i])
+      continue;
+    GdkRGBA c;
+    if (gdk_rgba_parse (&c, parts[i]))
+      out_colors[(*out_count)++] = c;
+  }
+}
+
+static void
+save_color_list (GKeyFile *kf,
+                 const char *group,
+                 const char *key,
+                 const GdkRGBA *colors,
+                 int count,
+                 int max_count)
+{
+  int n = CLAMP (count, 0, max_count);
+  g_autoptr (GString) str = g_string_new ("");
+  for (int i = 0; i < n; i++) {
+    g_autofree char *s = gdk_rgba_to_string (&colors[i]);
+    if (s) {
+      if (str->len > 0)
+        g_string_append_c (str, ';');
+      g_string_append (str, s);
+    }
+  }
+  g_key_file_set_string (kf, group, key, str->str);
+}
+
 PaintPreferences *
 paint_preferences_load (void)
 {
@@ -286,6 +353,8 @@ paint_preferences_load (void)
   prefs->last_window_width = PAINT_DEFAULT_WINDOW_WIDTH;
   prefs->last_window_height = PAINT_DEFAULT_WINDOW_HEIGHT;
   prefs->last_window_maximized = FALSE;
+  prefs->pressure_size = TRUE;
+  prefs->pressure_opacity = FALSE;
   prefs->keybinds = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 
   g_autofree char *path = preferences_file_path ();
@@ -327,6 +396,16 @@ paint_preferences_load (void)
     prefs->default_height = CLAMP (g_key_file_get_integer (kf, "Canvas", "DefaultHeight", NULL), 64, 8192);
   if (g_key_file_has_key (kf, "Canvas", "DefaultBrushSize", NULL))
     prefs->default_brush_size = CLAMP (g_key_file_get_double (kf, "Canvas", "DefaultBrushSize", NULL), 1.0, 96.0);
+
+  if (g_key_file_has_key (kf, "Stylus", "PressureSize", NULL))
+    prefs->pressure_size = g_key_file_get_boolean (kf, "Stylus", "PressureSize", NULL);
+  if (g_key_file_has_key (kf, "Stylus", "PressureOpacity", NULL))
+    prefs->pressure_opacity = g_key_file_get_boolean (kf, "Stylus", "PressureOpacity", NULL);
+
+  load_color_list (kf, "Colors", "Recent",
+                   prefs->recent_colors, &prefs->n_recent_colors, PAINT_PREFS_MAX_RECENT_COLORS);
+  load_color_list (kf, "Colors", "Custom",
+                   prefs->custom_colors, &prefs->n_custom_colors, PAINT_PREFS_MAX_CUSTOM_COLORS);
 
   if (g_key_file_has_group (kf, "Shortcuts")) {
     gsize n_keys = 0;
@@ -371,6 +450,12 @@ paint_preferences_save (const PaintPreferences *prefs)
   g_key_file_set_integer (kf, "Canvas", "DefaultWidth", prefs->default_width);
   g_key_file_set_integer (kf, "Canvas", "DefaultHeight", prefs->default_height);
   g_key_file_set_double (kf, "Canvas", "DefaultBrushSize", prefs->default_brush_size);
+  g_key_file_set_boolean (kf, "Stylus", "PressureSize", prefs->pressure_size);
+  g_key_file_set_boolean (kf, "Stylus", "PressureOpacity", prefs->pressure_opacity);
+  save_color_list (kf, "Colors", "Recent",
+                   prefs->recent_colors, prefs->n_recent_colors, PAINT_PREFS_MAX_RECENT_COLORS);
+  save_color_list (kf, "Colors", "Custom",
+                   prefs->custom_colors, prefs->n_custom_colors, PAINT_PREFS_MAX_CUSTOM_COLORS);
 
   for (gsize i = 0; i < G_N_ELEMENTS (KEYBIND_SPECS); i++) {
     const char *id = KEYBIND_SPECS[i].id;
@@ -476,9 +561,9 @@ paint_theme_selector_new (PaintPreferences *prefs,
     const char *css_class;
     const char *tooltip;
   } items[3] = {
-    { "follow", "Follow System" },
-    { "light", "Light Style" },
-    { "dark", "Dark Style" },
+    { "follow", N_("Follow System") },
+    { "light", N_("Light Style") },
+    { "dark", N_("Dark Style") },
   };
 
   GtkToggleButton *group_head = NULL;
@@ -488,7 +573,7 @@ paint_theme_selector_new (PaintPreferences *prefs,
     GtkWidget *btn = gtk_toggle_button_new ();
     gtk_widget_add_css_class (btn, "paint-theme-circle");
     gtk_widget_add_css_class (btn, items[i].css_class);
-    gtk_widget_set_tooltip_text (btn, items[i].tooltip);
+    gtk_widget_set_tooltip_text (btn, _(items[i].tooltip));
     if (!group_head)
       group_head = GTK_TOGGLE_BUTTON (btn);
     else
@@ -653,8 +738,8 @@ update_capture_preview (PrefsDialogCtx *ctx, const char *accel)
         : NULL;
   if (ctx->pending_conflict) {
     g_autofree char *warn = g_strdup_printf (
-        "Already used by “%s” — setting will reassign it",
-        ctx->pending_conflict->label);
+        _("Already used by “%s” — setting will reassign it"),
+        _(ctx->pending_conflict->label));
     gtk_label_set_text (GTK_LABEL (ctx->capture_conflict_label), warn);
     gtk_widget_set_visible (ctx->capture_conflict_label, TRUE);
   } else {
@@ -760,7 +845,7 @@ open_shortcut_capture_dialog (PrefsDialogCtx *ctx, const PaintKeybindSpec *spec)
   g_clear_pointer (&ctx->pending_accel, g_free);
 
   AdwDialog *dlg = adw_dialog_new ();
-  adw_dialog_set_title (dlg, "Set Shortcut");
+  adw_dialog_set_title (dlg, _("Set Shortcut"));
   adw_dialog_set_content_width (dlg, 360);
   ctx->capture_dialog = dlg;
 
@@ -769,11 +854,11 @@ open_shortcut_capture_dialog (PrefsDialogCtx *ctx, const PaintKeybindSpec *spec)
   adw_header_bar_set_show_start_title_buttons (ADW_HEADER_BAR (header), FALSE);
   adw_header_bar_set_show_end_title_buttons (ADW_HEADER_BAR (header), FALSE);
 
-  GtkWidget *cancel_btn = gtk_button_new_with_label ("Cancel");
+  GtkWidget *cancel_btn = gtk_button_new_with_label (_("Cancel"));
   g_signal_connect_swapped (cancel_btn, "clicked", G_CALLBACK (close_capture_dialog), ctx);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), cancel_btn);
 
-  ctx->capture_set_btn = gtk_button_new_with_label ("Set");
+  ctx->capture_set_btn = gtk_button_new_with_label (_("Set"));
   gtk_widget_add_css_class (ctx->capture_set_btn, "suggested-action");
   gtk_widget_set_sensitive (ctx->capture_set_btn, FALSE);
   g_signal_connect (ctx->capture_set_btn, "clicked", G_CALLBACK (on_capture_set_clicked), ctx);
@@ -786,13 +871,13 @@ open_shortcut_capture_dialog (PrefsDialogCtx *ctx, const PaintKeybindSpec *spec)
   gtk_widget_set_margin_start (content, 18);
   gtk_widget_set_margin_end (content, 18);
 
-  g_autofree char *prompt = g_strdup_printf ("Press a new shortcut for “%s”", spec->label);
+  g_autofree char *prompt = g_strdup_printf (_("Press a new shortcut for “%s”"), _(spec->label));
   GtkWidget *prompt_lbl = gtk_label_new (prompt);
   gtk_label_set_wrap (GTK_LABEL (prompt_lbl), TRUE);
   gtk_label_set_justify (GTK_LABEL (prompt_lbl), GTK_JUSTIFY_CENTER);
   gtk_box_append (GTK_BOX (content), prompt_lbl);
 
-  ctx->capture_preview_label = gtk_label_new ("Press keys…");
+  ctx->capture_preview_label = gtk_label_new (_("Press keys…"));
   gtk_widget_add_css_class (ctx->capture_preview_label, "paint-keycap-preview");
   gtk_widget_add_css_class (ctx->capture_preview_label, "dim-label");
   gtk_widget_set_halign (ctx->capture_preview_label, GTK_ALIGN_CENTER);
@@ -806,7 +891,7 @@ open_shortcut_capture_dialog (PrefsDialogCtx *ctx, const PaintKeybindSpec *spec)
   gtk_widget_set_visible (ctx->capture_conflict_label, FALSE);
   gtk_box_append (GTK_BOX (content), ctx->capture_conflict_label);
 
-  GtkWidget *hint_lbl = gtk_label_new ("Backspace to disable · Escape to cancel");
+  GtkWidget *hint_lbl = gtk_label_new (_("Backspace to disable · Escape to cancel"));
   gtk_widget_add_css_class (hint_lbl, "paint-dim-label");
   gtk_widget_add_css_class (hint_lbl, "caption");
   gtk_widget_set_halign (hint_lbl, GTK_ALIGN_CENTER);
@@ -816,11 +901,11 @@ open_shortcut_capture_dialog (PrefsDialogCtx *ctx, const PaintKeybindSpec *spec)
   gtk_widget_set_halign (btn_row, GTK_ALIGN_CENTER);
   gtk_widget_set_margin_top (btn_row, 4);
 
-  GtkWidget *clear_btn = gtk_button_new_with_label ("Clear");
+  GtkWidget *clear_btn = gtk_button_new_with_label (_("Clear"));
   g_signal_connect (clear_btn, "clicked", G_CALLBACK (on_capture_clear_clicked), ctx);
   gtk_box_append (GTK_BOX (btn_row), clear_btn);
 
-  GtkWidget *reset_btn = gtk_button_new_with_label ("Reset Default");
+  GtkWidget *reset_btn = gtk_button_new_with_label (_("Reset Default"));
   g_signal_connect (reset_btn, "clicked", G_CALLBACK (on_capture_reset_clicked), ctx);
   gtk_box_append (GTK_BOX (btn_row), reset_btn);
   gtk_box_append (GTK_BOX (content), btn_row);
@@ -850,7 +935,7 @@ build_shortcuts_page (PrefsDialogCtx *ctx)
 {
   GtkWidget *page = adw_preferences_page_new ();
   adw_preferences_page_set_name (ADW_PREFERENCES_PAGE (page), "shortcuts");
-  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Shortcuts");
+  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), _("Shortcuts"));
   adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page), "input-keyboard-symbolic");
 
   gsize n_specs = 0;
@@ -863,9 +948,9 @@ build_shortcuts_page (PrefsDialogCtx *ctx)
     if (!cur_grp || g_strcmp0 (cur_sec, spec->section) != 0) {
       cur_sec = spec->section;
       cur_grp = adw_preferences_group_new ();
-      adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), cur_sec);
+      adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (cur_grp), _(cur_sec));
       if (i == 0) {
-        ctx->reset_all_btn = gtk_button_new_with_label ("Reset All");
+        ctx->reset_all_btn = gtk_button_new_with_label (_("Reset All"));
         gtk_widget_add_css_class (ctx->reset_all_btn, "flat");
         g_signal_connect (ctx->reset_all_btn, "clicked",
                           G_CALLBACK (on_shortcuts_reset_all_clicked), ctx);
@@ -876,7 +961,7 @@ build_shortcuts_page (PrefsDialogCtx *ctx)
     }
 
     GtkWidget *row = adw_action_row_new ();
-    adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), spec->label);
+    adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), _(spec->label));
     gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (row), TRUE);
     g_object_set_data (G_OBJECT (row), "paint-keybind-spec", (gpointer) spec);
     g_signal_connect (row, "activated", G_CALLBACK (on_shortcut_row_activated), ctx);
@@ -888,7 +973,7 @@ build_shortcuts_page (PrefsDialogCtx *ctx)
     GtkWidget *reset_btn = gtk_button_new_from_icon_name ("edit-undo-symbolic");
     gtk_widget_add_css_class (reset_btn, "flat");
     gtk_widget_set_valign (reset_btn, GTK_ALIGN_CENTER);
-    gtk_widget_set_tooltip_text (reset_btn, "Reset to Default");
+    gtk_widget_set_tooltip_text (reset_btn, _("Reset to Default"));
     g_object_set_data (G_OBJECT (reset_btn), "paint-keybind-id", (gpointer) spec->id);
     g_signal_connect (reset_btn, "clicked", G_CALLBACK (on_shortcut_reset_one_clicked), ctx);
     adw_action_row_add_suffix (ADW_ACTION_ROW (row), reset_btn);
@@ -980,6 +1065,22 @@ on_default_brush_changed (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointe
   notify_changed (ctx);
 }
 
+static void
+on_pressure_size_toggled (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
+{
+  PrefsDialogCtx *ctx = user_data;
+  ctx->prefs->pressure_size = adw_switch_row_get_active (ADW_SWITCH_ROW (obj));
+  notify_changed (ctx);
+}
+
+static void
+on_pressure_opacity_toggled (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
+{
+  PrefsDialogCtx *ctx = user_data;
+  ctx->prefs->pressure_opacity = adw_switch_row_get_active (ADW_SWITCH_ROW (obj));
+  notify_changed (ctx);
+}
+
 void
 paint_preferences_dialog_present (PaintPreferences *prefs,
                                   GtkWidget *parent,
@@ -988,7 +1089,7 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
                                   gpointer user_data)
 {
   AdwDialog *dlg = adw_preferences_dialog_new ();
-  adw_dialog_set_title (dlg, "Preferences");
+  adw_dialog_set_title (dlg, _("Preferences"));
   adw_preferences_dialog_set_search_enabled (ADW_PREFERENCES_DIALOG (dlg), TRUE);
 
   PrefsDialogCtx *ctx = g_new0 (PrefsDialogCtx, 1);
@@ -1001,33 +1102,33 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
 
   GtkWidget *page = adw_preferences_page_new ();
   adw_preferences_page_set_name (ADW_PREFERENCES_PAGE (page), "general");
-  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "General");
+  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), _("General"));
   adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page), "applications-graphics-symbolic");
 
   /* Appearance group */
   GtkWidget *appearance_grp = adw_preferences_group_new ();
-  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (appearance_grp), "Appearance");
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (appearance_grp), _("Appearance"));
 
   GtkWidget *cursor_row = adw_switch_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (cursor_row), "Brush Cursor Ring");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (cursor_row), _("Brush Cursor Ring"));
   adw_action_row_set_subtitle (ADW_ACTION_ROW (cursor_row),
-                               "Show live brush size outline while hovering");
+                               _("Show live brush size outline while hovering"));
   adw_switch_row_set_active (ADW_SWITCH_ROW (cursor_row), prefs->show_cursor_ring);
   g_signal_connect (cursor_row, "notify::active", G_CALLBACK (on_cursor_ring_toggled), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (appearance_grp), cursor_row);
 
   GtkWidget *grid_row = adw_switch_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (grid_row), "High-Zoom Pixel Grid");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (grid_row), _("High-Zoom Pixel Grid"));
   adw_action_row_set_subtitle (ADW_ACTION_ROW (grid_row),
-                               "Show subtle pixel grid at 800% zoom or higher");
+                               _("Show subtle pixel grid at 800% zoom or higher"));
   adw_switch_row_set_active (ADW_SWITCH_ROW (grid_row), prefs->show_pixel_grid);
   g_signal_connect (grid_row, "notify::active", G_CALLBACK (on_pixel_grid_toggled), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (appearance_grp), grid_row);
 
   GtkWidget *toolbar_row = adw_switch_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (toolbar_row), "Floating Toolbar");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (toolbar_row), _("Floating Toolbar"));
   adw_action_row_set_subtitle (ADW_ACTION_ROW (toolbar_row),
-                               "Show bottom floating tool controls on the canvas");
+                               _("Show bottom floating tool controls on the canvas"));
   adw_switch_row_set_active (ADW_SWITCH_ROW (toolbar_row), prefs->show_toolbar);
   g_signal_connect (toolbar_row, "notify::active", G_CALLBACK (on_toolbar_toggled), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (appearance_grp), toolbar_row);
@@ -1036,26 +1137,26 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
 
   /* Behavior group */
   GtkWidget *behavior_grp = adw_preferences_group_new ();
-  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (behavior_grp), "Behavior");
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (behavior_grp), _("Behavior"));
 
   GtkWidget *restore_row = adw_switch_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (restore_row), "Restore Session");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (restore_row), _("Restore Session"));
   adw_action_row_set_subtitle (ADW_ACTION_ROW (restore_row),
-                               "Reopen open canvases and unsaved drafts on startup");
+                               _("Reopen open canvases and unsaved drafts on startup"));
   adw_switch_row_set_active (ADW_SWITCH_ROW (restore_row), prefs->restore_session);
   g_signal_connect (restore_row, "notify::active", G_CALLBACK (on_restore_session_toggled), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (behavior_grp), restore_row);
 
-  static const char *const win_modes[] = {
-    "Remember Previous Size",
-    "Fit Window to Canvas",
-    "Default Size",
+  const char *const win_modes[] = {
+    _("Remember Previous Size"),
+    _("Fit Window to Canvas"),
+    _("Default Size"),
     NULL,
   };
   GtkWidget *win_mode_row = adw_combo_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (win_mode_row), "Startup Window Size");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (win_mode_row), _("Startup Window Size"));
   adw_action_row_set_subtitle (ADW_ACTION_ROW (win_mode_row),
-                               "Choose how the window is sized when Paint opens");
+                               _("Choose how the window is sized when Paint opens"));
   g_autoptr (GtkStringList) win_mode_model = gtk_string_list_new (win_modes);
   adw_combo_row_set_model (ADW_COMBO_ROW (win_mode_row), G_LIST_MODEL (win_mode_model));
   adw_combo_row_set_selected (ADW_COMBO_ROW (win_mode_row), (guint) prefs->startup_window_mode);
@@ -1064,9 +1165,9 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
 
   GtkWidget *fit_canvas_row = adw_switch_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (fit_canvas_row),
-                                 "Fit Canvas to Window on Startup");
+                                 _("Fit Canvas to Window on Startup"));
   adw_action_row_set_subtitle (ADW_ACTION_ROW (fit_canvas_row),
-                               "Automatically zoom the canvas to fit the window when opened");
+                               _("Automatically zoom the canvas to fit the window when opened"));
   adw_switch_row_set_active (ADW_SWITCH_ROW (fit_canvas_row), prefs->fit_canvas_on_startup);
   g_signal_connect (fit_canvas_row,
                     "notify::active",
@@ -1078,27 +1179,49 @@ paint_preferences_dialog_present (PaintPreferences *prefs,
 
   /* New Canvas Defaults group */
   GtkWidget *canvas_grp = adw_preferences_group_new ();
-  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (canvas_grp), "New Canvas Defaults");
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (canvas_grp), _("New Canvas Defaults"));
 
   GtkWidget *w_row = adw_spin_row_new_with_range (64.0, 8192.0, 16.0);
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (w_row), "Default Width (px)");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (w_row), _("Default Width (px)"));
   adw_spin_row_set_value (ADW_SPIN_ROW (w_row), (double) prefs->default_width);
   g_signal_connect (w_row, "notify::value", G_CALLBACK (on_default_width_changed), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (canvas_grp), w_row);
 
   GtkWidget *h_row = adw_spin_row_new_with_range (64.0, 8192.0, 16.0);
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (h_row), "Default Height (px)");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (h_row), _("Default Height (px)"));
   adw_spin_row_set_value (ADW_SPIN_ROW (h_row), (double) prefs->default_height);
   g_signal_connect (h_row, "notify::value", G_CALLBACK (on_default_height_changed), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (canvas_grp), h_row);
 
   GtkWidget *brush_row = adw_spin_row_new_with_range (1.0, 96.0, 1.0);
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (brush_row), "Default Brush Size (px)");
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (brush_row), _("Default Brush Size (px)"));
   adw_spin_row_set_value (ADW_SPIN_ROW (brush_row), prefs->default_brush_size);
   g_signal_connect (brush_row, "notify::value", G_CALLBACK (on_default_brush_changed), ctx);
   adw_preferences_group_add (ADW_PREFERENCES_GROUP (canvas_grp), brush_row);
 
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (canvas_grp));
+
+  /* Stylus group */
+  GtkWidget *stylus_grp = adw_preferences_group_new ();
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (stylus_grp), _("Stylus"));
+
+  GtkWidget *p_size_row = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (p_size_row), _("Pressure Controls Size"));
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (p_size_row),
+                               _("Vary brush and retouch diameter with tablet pen pressure"));
+  adw_switch_row_set_active (ADW_SWITCH_ROW (p_size_row), prefs->pressure_size);
+  g_signal_connect (p_size_row, "notify::active", G_CALLBACK (on_pressure_size_toggled), ctx);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (stylus_grp), p_size_row);
+
+  GtkWidget *p_opacity_row = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (p_opacity_row), _("Pressure Controls Opacity"));
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (p_opacity_row),
+                               _("Scale stroke opacity with tablet pen pressure"));
+  adw_switch_row_set_active (ADW_SWITCH_ROW (p_opacity_row), prefs->pressure_opacity);
+  g_signal_connect (p_opacity_row, "notify::active", G_CALLBACK (on_pressure_opacity_toggled), ctx);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (stylus_grp), p_opacity_row);
+
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (stylus_grp));
 
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg), ADW_PREFERENCES_PAGE (page));
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),

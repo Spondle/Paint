@@ -5,6 +5,27 @@ All notable changes to Paint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Native OpenRaster (`.ora`) multi-layer project reading and writing via pure-C ZIP & zlib streams, preserving layer names, visibility, opacity, blend modes, and locks
+- Dedicated **Export Image…** dialog (`Ctrl+Shift+E`) with PNG, JPEG (configurable quality & matte color), WebP (optional `libwebp`), and BMP support, plus flatten confirmation warnings when saving multi-layer projects to flat formats
+- Layer **Alpha Lock**, **Layer Lock**, drag-and-drop layer reordering, layer row context menu, **Solo Layer** (`Alt+Click` visibility eye), **Import Image as Layer…**, **Copy Merged** (`Ctrl+Shift+C`), **Paste as New Layer** (`Ctrl+Alt+V`), sidebar file drops, and layer-vs-tab drop confirmation on non-blank canvases
+- **Ellipse Select**, **Freehand Lasso**, and **Magic Wand** selection tools, **Invert Selection** (`Ctrl+Shift+I`), and 8 interactive selection resize handles with `Shift` aspect ratio locking
+- Flood Fill **Tolerance** slider (`0–255`) and **Sample All Layers** option
+- **Gradient** tool (`G`, Linear & Radial) plus **Blur** and **Pixelate** retouch brushes
+- Stylus pressure sensitivity (`GDK_AXIS_PRESSURE` controlling brush size and/or opacity in **Preferences → Stylus**) and hardware tablet eraser routing
+- Multiline Text overlay (`GtkTextView`), `GtkFontDialogButton` font chooser, Left/Center/Right text alignment, Secondary-color **Outline**, and **Fill** pill backdrop
+- Overlapping **Primary / Secondary** color swatches (`Shift+X` swap, `D` B&W reset), persisted 16-slot **Custom Palette**, and persisted **Recent Colors** across sessions
+- Image Adjustments & Filters menu with live canvas preview (**Brightness & Contrast…**, **Hue & Saturation…**, **Gaussian Blur…**), one-shot **Sharpen**, **Invert Colors**, and Rec. 709 **Grayscale** (all selection-mask and Alpha Lock aware), plus **Trim Transparent**
+- Bottom-left live cursor coordinates & selection/canvas dimensions HUD pill, draggable East/South/SE canvas edge resize handles, Spacebar-drag canvas panning, right-click canvas context menu, and **Print…** (`Ctrl+P` via `GtkPrintOperation`)
+- `gettext` internationalization scaffolding (`po/POTFILES`, `po/LINGUAS`, `src/paint-i18n.h`) and wrapped UI strings
+
+### Changed
+- Modularized codebase into focused C translation units (`paint-document`, `paint-io`, `paint-filters`, `paint-color-picker`, `paint-layers-panel`, `paint-session`, `paint-dialogs`)
+- Upgraded undo/redo history from a fixed step limit to a `256 MB` memory budget (`10–250` steps) with oldest-step eviction
+- Migrated all file load/save routines to GIO streams and added atomic session saves with 30-second background autosave
+
 ## [0.3.0] - 2026-11-21
 
 ### Added

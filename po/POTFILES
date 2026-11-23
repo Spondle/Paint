@@ -1,0 +1,16 @@
+data/io.github.spondle.Paint.desktop
+data/io.github.spondle.Paint.metainfo.xml
+src/main.c
+src/paint-application.c
+src/paint-canvas.c
+src/paint-canvas-page.c
+src/paint-color-picker.c
+src/paint-dialogs.c
+src/paint-document.c
+src/paint-filters.c
+src/paint-io.c
+src/paint-layers-panel.c
+src/paint-preferences.c
+src/paint-session.c
+src/paint-tools.c
+src/paint-window.c

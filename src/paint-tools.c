@@ -5,7 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FILL_TOLERANCE 72
+#include "paint-i18n.h"
+
 #define FILL_FRINGE_MAX_DIST 185
 #define FILL_COLLINEAR_ERR 18
 
@@ -14,12 +15,18 @@ paint_tool_settings_new (void)
 {
   PaintToolSettings *settings = g_new0 (PaintToolSettings, 1);
   settings->color = (GdkRGBA) { 0.11f, 0.44f, 0.96f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 1.0f, 1.0f, 1.0f, 1.0f };
   settings->size = 6.0;
   settings->background_color = (GdkRGBA) { 1.0f, 1.0f, 1.0f, 1.0f };
   settings->active_tool_id = "brush";
   settings->brush_style = PAINT_BRUSH_SMOOTH;
+  settings->fill_tolerance = 32;
+  settings->stroke_pressure = 1.0;
+  settings->pressure_size = TRUE;
+  settings->pressure_opacity = FALSE;
   settings->text_font_family = g_strdup ("Sans");
   settings->text_font_size = 28.0;
+  settings->text_align = PANGO_ALIGN_LEFT;
   settings->history_points = g_array_new (FALSE, FALSE, sizeof (PaintPoint));
   return settings;
 }
@@ -87,22 +94,96 @@ paint_tool_settings_add_recent_color (PaintToolSettings *settings, const GdkRGBA
     settings->n_recent_colors++;
 }
 
+void
+paint_tool_settings_swap_colors (PaintToolSettings *settings)
+{
+  if (!settings)
+    return;
+  GdkRGBA tmp = settings->color;
+  settings->color = settings->secondary_color;
+  settings->secondary_color = tmp;
+}
+
+void
+paint_tool_settings_reset_colors (PaintToolSettings *settings)
+{
+  if (!settings)
+    return;
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 1.0f, 1.0f, 1.0f, 1.0f };
+}
+
+void
+paint_tool_settings_add_custom_color (PaintToolSettings *settings, const GdkRGBA *color)
+{
+  if (!settings || !color)
+    return;
+  for (int i = 0; i < settings->n_custom_colors; i++) {
+    if (rgba_nearly_equal (&settings->custom_colors[i], color)) {
+      settings->custom_colors[i] = *color;
+      return;
+    }
+  }
+  if (settings->n_custom_colors < PAINT_MAX_CUSTOM_COLORS) {
+    settings->custom_colors[settings->n_custom_colors++] = *color;
+  } else {
+    for (int i = 1; i < PAINT_MAX_CUSTOM_COLORS; i++)
+      settings->custom_colors[i - 1] = settings->custom_colors[i];
+    settings->custom_colors[PAINT_MAX_CUSTOM_COLORS - 1] = *color;
+  }
+}
+
+void
+paint_tool_settings_remove_custom_color (PaintToolSettings *settings, int index)
+{
+  if (!settings || index < 0 || index >= settings->n_custom_colors)
+    return;
+  for (int i = index; i + 1 < settings->n_custom_colors; i++)
+    settings->custom_colors[i] = settings->custom_colors[i + 1];
+  settings->n_custom_colors--;
+}
+
+static inline double
+effective_stroke_size (const PaintToolSettings *settings)
+{
+  double p = settings->stroke_pressure > 0.0 ? CLAMP (settings->stroke_pressure, 0.05, 1.0) : 1.0;
+  if (!settings->pressure_size || p >= 0.999)
+    return settings->size;
+  return MAX (1.0, settings->size * (0.15 + 0.85 * p));
+}
+
+static inline float
+effective_stroke_alpha (const PaintToolSettings *settings, float base_a)
+{
+  double p = settings->stroke_pressure > 0.0 ? CLAMP (settings->stroke_pressure, 0.05, 1.0) : 1.0;
+  if (!settings->pressure_opacity || p >= 0.999)
+    return base_a;
+  return CLAMP (base_a * (float) p, 0.0f, 1.0f);
+}
+
 static void
 configure_brush_context (cairo_t *cr, const PaintToolSettings *settings)
 {
+  float alpha = effective_stroke_alpha (settings, settings->color.alpha);
   cairo_set_source_rgba (cr,
                          settings->color.red,
                          settings->color.green,
                          settings->color.blue,
-                         settings->color.alpha);
-  cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+                         alpha);
+  cairo_set_operator (cr, settings->target_alpha_lock ? CAIRO_OPERATOR_ATOP
+                                                      : CAIRO_OPERATOR_OVER);
 }
 
 static void
 configure_eraser_context (cairo_t *cr, const PaintToolSettings *settings)
 {
   if (settings->background_color.alpha <= 0.0f) {
-    cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+    if (settings->target_alpha_lock) {
+      cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.0);
+      cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+    } else {
+      cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+    }
     return;
   }
   cairo_set_source_rgba (cr,
@@ -110,20 +191,26 @@ configure_eraser_context (cairo_t *cr, const PaintToolSettings *settings)
                          settings->background_color.green,
                          settings->background_color.blue,
                          settings->background_color.alpha);
-  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_operator (cr, settings->target_alpha_lock ? CAIRO_OPERATOR_ATOP
+                                                      : CAIRO_OPERATOR_SOURCE);
 }
 
 static void
-configure_transparent_context (cairo_t *cr)
+configure_transparent_context (cairo_t *cr, const PaintToolSettings *settings)
 {
-  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  if (settings->target_alpha_lock) {
+    cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.0);
+    cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+  } else {
+    cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  }
 }
 
 static void
 configure_for_tool (const PaintTool *tool, cairo_t *cr, const PaintToolSettings *settings)
 {
   if (g_strcmp0 (tool->id, "transparent") == 0)
-    configure_transparent_context (cr);
+    configure_transparent_context (cr, settings);
   else if (g_strcmp0 (tool->id, "eraser") == 0)
     configure_eraser_context (cr, settings);
   else
@@ -159,11 +246,12 @@ draw_pixel_segment (const PaintTool *tool,
   if (steps == 0)
     return;
 
+  double eff_sz = effective_stroke_size (settings);
   for (int i = 1; i <= steps; i++) {
     double t = (double) i / (double) steps;
     int sx = (int) lround ((double) ix0 + (double) (ix1 - ix0) * t);
     int sy = (int) lround ((double) iy0 + (double) (iy1 - iy0) * t);
-    draw_pixel_stamp (cr, sx, sy, settings->size);
+    draw_pixel_stamp (cr, sx, sy, eff_sz);
   }
 }
 
@@ -174,23 +262,30 @@ draw_soft_stamp (const PaintTool *tool,
                  double y,
                  const PaintToolSettings *settings)
 {
-  double r = MAX (1.5, settings->size * 0.5);
+  double eff_sz = effective_stroke_size (settings);
+  double r = MAX (1.5, eff_sz * 0.5);
   cairo_pattern_t *pat = cairo_pattern_create_radial (x, y, 0.0, x, y, r);
 
   gboolean erase_alpha = (g_strcmp0 (tool->id, "transparent") == 0) ||
                          (g_strcmp0 (tool->id, "eraser") == 0 &&
                           settings->background_color.alpha <= 0.0f);
   if (erase_alpha) {
+    if (settings->target_alpha_lock) {
+      cairo_pattern_destroy (pat);
+      return;
+    }
+    double pa = effective_stroke_alpha (settings, 1.0f);
     cairo_set_operator (cr, CAIRO_OPERATOR_DEST_OUT);
-    cairo_pattern_add_color_stop_rgba (pat, 0.0, 0.0, 0.0, 0.0, 0.35);
-    cairo_pattern_add_color_stop_rgba (pat, 0.5, 0.0, 0.0, 0.0, 0.14);
+    cairo_pattern_add_color_stop_rgba (pat, 0.0, 0.0, 0.0, 0.0, 0.35 * pa);
+    cairo_pattern_add_color_stop_rgba (pat, 0.5, 0.0, 0.0, 0.0, 0.14 * pa);
     cairo_pattern_add_color_stop_rgba (pat, 1.0, 0.0, 0.0, 0.0, 0.0);
   } else {
     GdkRGBA c = (g_strcmp0 (tool->id, "eraser") == 0)
                   ? settings->background_color
                   : settings->color;
-    double a = CLAMP ((double) c.alpha, 0.0, 1.0);
-    cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+    double a = CLAMP ((double) effective_stroke_alpha (settings, c.alpha), 0.0, 1.0);
+    cairo_set_operator (cr, settings->target_alpha_lock ? CAIRO_OPERATOR_ATOP
+                                                        : CAIRO_OPERATOR_OVER);
     cairo_pattern_add_color_stop_rgba (pat, 0.0, c.red, c.green, c.blue, a * 0.35);
     cairo_pattern_add_color_stop_rgba (pat, 0.5, c.red, c.green, c.blue, a * 0.14);
     cairo_pattern_add_color_stop_rgba (pat, 1.0, c.red, c.green, c.blue, 0.0);
@@ -211,7 +306,7 @@ draw_soft_segment (const PaintTool *tool,
                    double y1,
                    const PaintToolSettings *settings)
 {
-  double r = MAX (1.5, settings->size * 0.5);
+  double r = MAX (1.5, effective_stroke_size (settings) * 0.5);
   double dist = hypot (x1 - x0, y1 - y0);
   if (dist < 0.5)
     return;
@@ -234,10 +329,11 @@ freehand_begin_stroke (const PaintTool *tool,
   g_array_set_size (settings->history_points, 0);
   g_array_append_val (settings->history_points, pt);
 
+  double eff_sz = effective_stroke_size (settings);
   if (settings->brush_style == PAINT_BRUSH_PIXEL) {
     configure_for_tool (tool, cr, settings);
     cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
-    draw_pixel_stamp (cr, (int) floor (x), (int) floor (y), settings->size);
+    draw_pixel_stamp (cr, (int) floor (x), (int) floor (y), eff_sz);
     return;
   }
   if (settings->brush_style == PAINT_BRUSH_SOFT) {
@@ -246,7 +342,7 @@ freehand_begin_stroke (const PaintTool *tool,
   }
 
   configure_for_tool (tool, cr, settings);
-  cairo_arc (cr, x, y, MAX (0.5, settings->size / 2.0), 0.0, 2.0 * G_PI);
+  cairo_arc (cr, x, y, MAX (0.5, eff_sz / 2.0), 0.0, 2.0 * G_PI);
   cairo_fill (cr);
 }
 
@@ -279,7 +375,7 @@ freehand_continue_stroke (const PaintTool *tool,
   }
 
   configure_for_tool (tool, cr, settings);
-  cairo_set_line_width (cr, MAX (1.0, settings->size));
+  cairo_set_line_width (cr, MAX (1.0, effective_stroke_size (settings)));
   cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
   cairo_set_line_join (cr, CAIRO_LINE_JOIN_ROUND);
 
@@ -332,7 +428,7 @@ freehand_end_stroke (const PaintTool *tool,
   if (pts->len >= 2) {
     PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
     configure_for_tool (tool, cr, settings);
-    cairo_set_line_width (cr, MAX (1.0, settings->size));
+    cairo_set_line_width (cr, MAX (1.0, effective_stroke_size (settings)));
     cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
     cairo_move_to (cr, last.x, last.y);
     cairo_line_to (cr, x, y);
@@ -453,6 +549,175 @@ blend_over_argb32 (uint32_t dst, uint32_t src_pm, uint8_t src_a)
          MIN (255u, out_b);
 }
 
+static inline uint32_t
+blend_atop_argb32 (uint32_t dst, uint32_t src_pm, uint8_t src_a)
+{
+  uint32_t dst_a = (dst >> 24) & 0xFFU;
+  if (dst_a == 0 || src_a == 0)
+    return dst;
+
+  uint32_t inv_sa = 255U - (uint32_t) src_a;
+  uint32_t src_r = (src_pm >> 16) & 0xFFU;
+  uint32_t src_g = (src_pm >> 8) & 0xFFU;
+  uint32_t src_b = src_pm & 0xFFU;
+  uint32_t dst_r = (dst >> 16) & 0xFFU;
+  uint32_t dst_g = (dst >> 8) & 0xFFU;
+  uint32_t dst_b = dst & 0xFFU;
+
+  uint32_t out_r = MIN (dst_a, (src_r * dst_a + dst_r * inv_sa + 127U) / 255U);
+  uint32_t out_g = MIN (dst_a, (src_g * dst_a + dst_g * inv_sa + 127U) / 255U);
+  uint32_t out_b = MIN (dst_a, (src_b * dst_a + dst_b * inv_sa + 127U) / 255U);
+  return (dst_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
+}
+
+static inline uint32_t
+blend_pixel_for_lock (uint32_t dst, uint32_t src_pm, uint8_t src_a, gboolean alpha_lock)
+{
+  return alpha_lock ? blend_atop_argb32 (dst, src_pm, src_a)
+                    : blend_over_argb32 (dst, src_pm, src_a);
+}
+
+static guint8 *
+compute_flood_region_mask (cairo_surface_t *sample_surf,
+                           int sx,
+                           int sy,
+                           int tol,
+                           int *out_min_x,
+                           int *out_max_x,
+                           int *out_min_y,
+                           int *out_max_y,
+                           uint32_t *out_target_px)
+{
+  int w = cairo_image_surface_get_width (sample_surf);
+  int h = cairo_image_surface_get_height (sample_surf);
+  int stride = cairo_image_surface_get_stride (sample_surf);
+  const unsigned char *data = cairo_image_surface_get_data (sample_surf);
+  if (sx < 0 || sx >= w || sy < 0 || sy >= h || !data)
+    return NULL;
+
+  const uint32_t *start_row = (const uint32_t *) (data + (gsize) sy * (gsize) stride);
+  uint32_t target_px = start_row[sx];
+  if (out_target_px)
+    *out_target_px = target_px;
+
+  guint8 *visited = g_malloc0 ((gsize) w * (gsize) h);
+  GArray *stack = g_array_new (FALSE, FALSE, sizeof (FillSeed));
+  FillSeed init = { sx, sy };
+  g_array_append_val (stack, init);
+
+  int min_x = sx;
+  int max_x = sx;
+  int min_y = sy;
+  int max_y = sy;
+
+  while (stack->len > 0) {
+    FillSeed seed = g_array_index (stack, FillSeed, stack->len - 1);
+    g_array_set_size (stack, stack->len - 1);
+
+    int row_y = seed.y;
+    if (visited[(gsize) row_y * (gsize) w + (gsize) seed.x])
+      continue;
+
+    const uint32_t *row = (const uint32_t *) (data + (gsize) row_y * (gsize) stride);
+    guint8 *vis_row = visited + (gsize) row_y * (gsize) w;
+    if (!pixel_matches (row[seed.x], target_px, tol))
+      continue;
+
+    int left = seed.x;
+    while (left > 0 && !vis_row[left - 1] &&
+           pixel_matches (row[left - 1], target_px, tol)) {
+      left--;
+    }
+
+    int right = seed.x;
+    while (right + 1 < w && !vis_row[right + 1] &&
+           pixel_matches (row[right + 1], target_px, tol)) {
+      right++;
+    }
+
+    if (left < min_x) min_x = left;
+    if (right > max_x) max_x = right;
+    if (row_y < min_y) min_y = row_y;
+    if (row_y > max_y) max_y = row_y;
+
+    gboolean span_above = FALSE;
+    gboolean span_below = FALSE;
+
+    for (int col = left; col <= right; col++) {
+      vis_row[col] = 1;
+
+      if (row_y > 0) {
+        const uint32_t *above_row = (const uint32_t *) (data + (gsize) (row_y - 1) * (gsize) stride);
+        guint8 *above_vis = visited + (gsize) (row_y - 1) * (gsize) w;
+        gboolean match = !above_vis[col] && pixel_matches (above_row[col], target_px, tol);
+        if (!span_above && match) {
+          FillSeed s = { col, row_y - 1 };
+          g_array_append_val (stack, s);
+          span_above = TRUE;
+        } else if (span_above && !match) {
+          span_above = FALSE;
+        }
+      }
+
+      if (row_y + 1 < h) {
+        const uint32_t *below_row = (const uint32_t *) (data + (gsize) (row_y + 1) * (gsize) stride);
+        guint8 *below_vis = visited + (gsize) (row_y + 1) * (gsize) w;
+        gboolean match = !below_vis[col] && pixel_matches (below_row[col], target_px, tol);
+        if (!span_below && match) {
+          FillSeed s = { col, row_y + 1 };
+          g_array_append_val (stack, s);
+          span_below = TRUE;
+        } else if (span_below && !match) {
+          span_below = FALSE;
+        }
+      }
+    }
+  }
+
+  g_array_free (stack, TRUE);
+  if (out_min_x) *out_min_x = min_x;
+  if (out_max_x) *out_max_x = max_x;
+  if (out_min_y) *out_min_y = min_y;
+  if (out_max_y) *out_max_y = max_y;
+  return visited;
+}
+
+cairo_surface_t *
+paint_tools_build_wand_mask (cairo_surface_t *src,
+                             int sx,
+                             int sy,
+                             int tolerance,
+                             cairo_rectangle_int_t *out_rect)
+{
+  if (!src || cairo_surface_get_type (src) != CAIRO_SURFACE_TYPE_IMAGE)
+    return NULL;
+  cairo_surface_flush (src);
+  int w = cairo_image_surface_get_width (src);
+  int min_x = 0, max_x = 0, min_y = 0, max_y = 0;
+  guint8 *visited = compute_flood_region_mask (src, sx, sy, CLAMP (tolerance, 0, 255),
+                                               &min_x, &max_x, &min_y, &max_y, NULL);
+  if (!visited)
+    return NULL;
+
+  int rw = max_x - min_x + 1;
+  int rh = max_y - min_y + 1;
+  cairo_surface_t *mask = cairo_image_surface_create (CAIRO_FORMAT_A8, rw, rh);
+  unsigned char *mdata = cairo_image_surface_get_data (mask);
+  int mstride = cairo_image_surface_get_stride (mask);
+  for (int y = min_y; y <= max_y; y++) {
+    unsigned char *mrow = mdata + (gsize) (y - min_y) * (gsize) mstride;
+    const guint8 *vis_row = visited + (gsize) y * (gsize) w;
+    for (int x = min_x; x <= max_x; x++)
+      mrow[x - min_x] = vis_row[x] ? 255 : 0;
+  }
+  cairo_surface_mark_dirty (mask);
+  g_free (visited);
+
+  if (out_rect)
+    *out_rect = (cairo_rectangle_int_t) { min_x, min_y, rw, rh };
+  return mask;
+}
+
 static void
 flood_fill_surface (cairo_t *cr,
                     double x,
@@ -460,6 +725,8 @@ flood_fill_surface (cairo_t *cr,
                     const PaintToolSettings *settings,
                     gboolean make_transparent)
 {
+  if (make_transparent && settings->target_alpha_lock)
+    return;
   cairo_surface_t *surface = cairo_get_target (cr);
   if (!surface || cairo_surface_get_type (surface) != CAIRO_SURFACE_TYPE_IMAGE)
     return;
@@ -483,180 +750,138 @@ flood_fill_surface (cairo_t *cr,
       return;
   }
 
-  uint32_t *start_row = (uint32_t *) (data + (gsize) sy * (gsize) stride);
-  uint32_t target_px = start_row[sx];
-  if (make_transparent) {
-    if (((target_px >> 24) & 0xFFU) == 0)
-      return;
-  } else if (fill_a == 255 && target_px == fill_px) {
-    return;
+  cairo_surface_t *sample_surf = surface;
+  if (settings->fill_sample_surface &&
+      cairo_surface_get_type (settings->fill_sample_surface) == CAIRO_SURFACE_TYPE_IMAGE &&
+      cairo_image_surface_get_width (settings->fill_sample_surface) == w &&
+      cairo_image_surface_get_height (settings->fill_sample_surface) == h) {
+    sample_surf = settings->fill_sample_surface;
+    if (sample_surf != surface)
+      cairo_surface_flush (sample_surf);
   }
 
-  guint8 *visited = g_malloc0 ((gsize) w * (gsize) h);
-  GArray *stack = g_array_new (FALSE, FALSE, sizeof (FillSeed));
-  FillSeed init = { sx, sy };
-  g_array_append_val (stack, init);
+  int sstride = cairo_image_surface_get_stride (sample_surf);
+  const unsigned char *sdata = cairo_image_surface_get_data (sample_surf);
+  const uint32_t *sample_start = (const uint32_t *) (sdata + (gsize) sy * (gsize) sstride);
+  uint32_t start_px = sample_start[sx];
+  if (make_transparent && sample_surf == surface && ((start_px >> 24) & 0xFFU) == 0)
+    return;
+  if (!make_transparent && sample_surf == surface && fill_a == 255 && start_px == fill_px)
+    return;
 
-  int min_x = sx;
-  int max_x = sx;
-  int min_y = sy;
-  int max_y = sy;
+  int tol = CLAMP (settings->fill_tolerance, 0, 255);
+  int min_x = 0, max_x = 0, min_y = 0, max_y = 0;
+  uint32_t target_px = start_px;
+  guint8 *visited = compute_flood_region_mask (sample_surf, sx, sy, tol,
+                                               &min_x, &max_x, &min_y, &max_y, &target_px);
+  if (!visited)
+    return;
 
-  while (stack->len > 0) {
-    FillSeed seed = g_array_index (stack, FillSeed, stack->len - 1);
-    g_array_set_size (stack, stack->len - 1);
-
-    int row_y = seed.y;
-    if (visited[(gsize) row_y * (gsize) w + (gsize) seed.x])
-      continue;
-
+  for (int row_y = min_y; row_y <= max_y; row_y++) {
     uint32_t *row = (uint32_t *) (data + (gsize) row_y * (gsize) stride);
-    guint8 *vis_row = visited + (gsize) row_y * (gsize) w;
-    if (!pixel_matches (row[seed.x], target_px, FILL_TOLERANCE))
-      continue;
-
-    int left = seed.x;
-    while (left > 0 && !vis_row[left - 1] &&
-           pixel_matches (row[left - 1], target_px, FILL_TOLERANCE)) {
-      left--;
-    }
-
-    int right = seed.x;
-    while (right + 1 < w && !vis_row[right + 1] &&
-           pixel_matches (row[right + 1], target_px, FILL_TOLERANCE)) {
-      right++;
-    }
-
-    if (left < min_x) min_x = left;
-    if (right > max_x) max_x = right;
-    if (row_y < min_y) min_y = row_y;
-    if (row_y > max_y) max_y = row_y;
-
-    gboolean span_above = FALSE;
-    gboolean span_below = FALSE;
-
-    for (int col = left; col <= right; col++) {
-      vis_row[col] = 1;
+    const guint8 *vis_row = visited + (gsize) row_y * (gsize) w;
+    for (int col = min_x; col <= max_x; col++) {
+      if (!vis_row[col])
+        continue;
       if (make_transparent)
         row[col] = 0x00000000U;
       else
-        row[col] = blend_over_argb32 (row[col], fill_px, fill_a);
-
-      if (row_y > 0) {
-        uint32_t *above_row = (uint32_t *) (data + (gsize) (row_y - 1) * (gsize) stride);
-        guint8 *above_vis = visited + (gsize) (row_y - 1) * (gsize) w;
-        gboolean match = !above_vis[col] && pixel_matches (above_row[col], target_px, FILL_TOLERANCE);
-        if (!span_above && match) {
-          FillSeed s = { col, row_y - 1 };
-          g_array_append_val (stack, s);
-          span_above = TRUE;
-        } else if (span_above && !match) {
-          span_above = FALSE;
-        }
-      }
-
-      if (row_y + 1 < h) {
-        uint32_t *below_row = (uint32_t *) (data + (gsize) (row_y + 1) * (gsize) stride);
-        guint8 *below_vis = visited + (gsize) (row_y + 1) * (gsize) w;
-        gboolean match = !below_vis[col] && pixel_matches (below_row[col], target_px, FILL_TOLERANCE);
-        if (!span_below && match) {
-          FillSeed s = { col, row_y + 1 };
-          g_array_append_val (stack, s);
-          span_below = TRUE;
-        } else if (span_below && !match) {
-          span_below = FALSE;
-        }
-      }
+        row[col] = blend_pixel_for_lock (row[col], fill_px, fill_a, settings->target_alpha_lock);
     }
   }
 
   /* Pass 2: smooth/fill 1px anti-aliased fringe adjacent to the filled mask */
-  int y0 = MAX (0, min_y - 1);
-  int y1 = MIN (h - 1, max_y + 1);
-  int x0 = MAX (0, min_x - 1);
-  int x1 = MIN (w - 1, max_x + 1);
-  uint32_t target_a = (target_px >> 24) & 0xFFU;
+  if (tol > 0) {
+    int y0 = MAX (0, min_y - 1);
+    int y1 = MIN (h - 1, max_y + 1);
+    int x0 = MAX (0, min_x - 1);
+    int x1 = MIN (w - 1, max_x + 1);
+    uint32_t target_a = (target_px >> 24) & 0xFFU;
 
-  for (int row_y = y0; row_y <= y1; row_y++) {
-    uint32_t *row = (uint32_t *) (data + (gsize) row_y * (gsize) stride);
-    guint8 *vis_row = visited + (gsize) row_y * (gsize) w;
+    for (int row_y = y0; row_y <= y1; row_y++) {
+      uint32_t *row = (uint32_t *) (data + (gsize) row_y * (gsize) stride);
+      const uint32_t *srow = (const uint32_t *) (sdata + (gsize) row_y * (gsize) sstride);
+      const guint8 *vis_row = visited + (gsize) row_y * (gsize) w;
 
-    for (int col = x0; col <= x1; col++) {
-      if (vis_row[col])
-        continue;
-
-      gboolean has_filled_neighbor = FALSE;
-      for (int dy = -1; dy <= 1 && !has_filled_neighbor; dy++) {
-        int ny = row_y + dy;
-        if (ny < 0 || ny >= h)
+      for (int col = x0; col <= x1; col++) {
+        if (vis_row[col])
           continue;
-        guint8 *nvis = visited + (gsize) ny * (gsize) w;
-        for (int dx = -1; dx <= 1; dx++) {
-          int nx = col + dx;
-          if (nx >= 0 && nx < w && nvis[nx]) {
-            has_filled_neighbor = TRUE;
-            break;
-          }
-        }
-      }
-      if (!has_filled_neighbor)
-        continue;
 
-      uint32_t px = row[col];
-      uint32_t px_a = (px >> 24) & 0xFFU;
-
-      if (make_transparent) {
-        if (px_a == 0)
-          continue;
-        if (pixel_is_blend_between (px, target_px, 0x00000000U)) {
-          row[col] = 0x00000000U;
-        } else {
-          int diff = pixel_max_diff (px, target_px);
-          if (diff <= FILL_FRINGE_MAX_DIST) {
-            double clear_w = (double) (FILL_FRINGE_MAX_DIST + 10 - diff) /
-                             (double) (FILL_FRINGE_MAX_DIST + 10);
-            clear_w = CLAMP (clear_w, 0.0, 1.0);
-            double keep = 1.0 - clear_w;
-            uint32_t out_a = (uint32_t) lround ((double) px_a * keep);
-            if (out_a == 0) {
-              row[col] = 0x00000000U;
-            } else {
-              double tr = (double) ((target_px >> 16) & 0xFFU);
-              double tg = (double) ((target_px >> 8) & 0xFFU);
-              double tb = (double) (target_px & 0xFFU);
-              double pr = (double) ((px >> 16) & 0xFFU);
-              double pg = (double) ((px >> 8) & 0xFFU);
-              double pb = (double) (px & 0xFFU);
-              int r = CLAMP ((int) lround (pr - clear_w * tr), 0, (int) out_a);
-              int g = CLAMP ((int) lround (pg - clear_w * tg), 0, (int) out_a);
-              int b = CLAMP ((int) lround (pb - clear_w * tb), 0, (int) out_a);
-              row[col] = (out_a << 24) |
-                         ((uint32_t) r << 16) |
-                         ((uint32_t) g << 8) |
-                         (uint32_t) b;
+        gboolean has_filled_neighbor = FALSE;
+        for (int dy = -1; dy <= 1 && !has_filled_neighbor; dy++) {
+          int ny = row_y + dy;
+          if (ny < 0 || ny >= h)
+            continue;
+          const guint8 *nvis = visited + (gsize) ny * (gsize) w;
+          for (int dx = -1; dx <= 1; dx++) {
+            int nx = col + dx;
+            if (nx >= 0 && nx < w && nvis[nx]) {
+              has_filled_neighbor = TRUE;
+              break;
             }
           }
         }
-      } else {
-        if (target_a > 0 && px_a == 0)
+        if (!has_filled_neighbor)
           continue;
-        if (pixel_is_blend_between (px, target_px, fill_px)) {
-          row[col] = blend_over_argb32 (px, fill_px, fill_a);
+
+        uint32_t spx = srow[col];
+        uint32_t px = row[col];
+        uint32_t spx_a = (spx >> 24) & 0xFFU;
+
+        if (make_transparent) {
+          uint32_t px_a = (px >> 24) & 0xFFU;
+          if (px_a == 0)
+            continue;
+          if (pixel_is_blend_between (spx, target_px, 0x00000000U)) {
+            row[col] = 0x00000000U;
+          } else {
+            int diff = pixel_max_diff (spx, target_px);
+            if (diff <= FILL_FRINGE_MAX_DIST) {
+              double clear_w = (double) (FILL_FRINGE_MAX_DIST + 10 - diff) /
+                               (double) (FILL_FRINGE_MAX_DIST + 10);
+              clear_w = CLAMP (clear_w, 0.0, 1.0);
+              double keep = 1.0 - clear_w;
+              uint32_t out_a = (uint32_t) lround ((double) px_a * keep);
+              if (out_a == 0) {
+                row[col] = 0x00000000U;
+              } else {
+                double tr = (double) ((target_px >> 16) & 0xFFU);
+                double tg = (double) ((target_px >> 8) & 0xFFU);
+                double tb = (double) (target_px & 0xFFU);
+                double pr = (double) ((px >> 16) & 0xFFU);
+                double pg = (double) ((px >> 8) & 0xFFU);
+                double pb = (double) (px & 0xFFU);
+                int r = CLAMP ((int) lround (pr - clear_w * tr), 0, (int) out_a);
+                int g = CLAMP ((int) lround (pg - clear_w * tg), 0, (int) out_a);
+                int b = CLAMP ((int) lround (pb - clear_w * tb), 0, (int) out_a);
+                row[col] = (out_a << 24) |
+                           ((uint32_t) r << 16) |
+                           ((uint32_t) g << 8) |
+                           (uint32_t) b;
+              }
+            }
+          }
         } else {
-          int diff = pixel_max_diff (px, target_px);
-          if (diff <= FILL_FRINGE_MAX_DIST) {
-            double weight = (double) (FILL_FRINGE_MAX_DIST + 10 - diff) /
-                            (double) (FILL_FRINGE_MAX_DIST + 10);
-            uint8_t blend_a = (uint8_t) lround (CLAMP (weight, 0.0, 1.0) * (double) fill_a);
-            if (blend_a > 0) {
-              uint8_t pm_r = (uint8_t) lround (CLAMP (settings->color.red, 0.0f, 1.0f) * blend_a);
-              uint8_t pm_g = (uint8_t) lround (CLAMP (settings->color.green, 0.0f, 1.0f) * blend_a);
-              uint8_t pm_b = (uint8_t) lround (CLAMP (settings->color.blue, 0.0f, 1.0f) * blend_a);
-              uint32_t pm_px = ((uint32_t) blend_a << 24) |
-                               ((uint32_t) pm_r << 16) |
-                               ((uint32_t) pm_g << 8) |
-                               (uint32_t) pm_b;
-              row[col] = blend_over_argb32 (px, pm_px, blend_a);
+          if (target_a > 0 && spx_a == 0)
+            continue;
+          if (pixel_is_blend_between (spx, target_px, fill_px)) {
+            row[col] = blend_pixel_for_lock (px, fill_px, fill_a, settings->target_alpha_lock);
+          } else {
+            int diff = pixel_max_diff (spx, target_px);
+            if (diff <= FILL_FRINGE_MAX_DIST) {
+              double weight = (double) (FILL_FRINGE_MAX_DIST + 10 - diff) /
+                              (double) (FILL_FRINGE_MAX_DIST + 10);
+              uint8_t blend_a = (uint8_t) lround (CLAMP (weight, 0.0, 1.0) * (double) fill_a);
+              if (blend_a > 0) {
+                uint8_t pm_r = (uint8_t) lround (CLAMP (settings->color.red, 0.0f, 1.0f) * blend_a);
+                uint8_t pm_g = (uint8_t) lround (CLAMP (settings->color.green, 0.0f, 1.0f) * blend_a);
+                uint8_t pm_b = (uint8_t) lround (CLAMP (settings->color.blue, 0.0f, 1.0f) * blend_a);
+                uint32_t pm_px = ((uint32_t) blend_a << 24) |
+                                 ((uint32_t) pm_r << 16) |
+                                 ((uint32_t) pm_g << 8) |
+                                 (uint32_t) pm_b;
+                row[col] = blend_pixel_for_lock (px, pm_px, blend_a, settings->target_alpha_lock);
+              }
             }
           }
         }
@@ -664,7 +889,6 @@ flood_fill_surface (cairo_t *cr,
     }
   }
 
-  g_array_free (stack, TRUE);
   g_free (visited);
   cairo_surface_mark_dirty (surface);
 }
@@ -1107,22 +1331,367 @@ block_arrow_get_bounds (const PaintTool *tool G_GNUC_UNUSED,
   *out_y1 = MAX (y0, y1) + pad;
 }
 
+static void
+gradient_draw_preview (const PaintTool *tool G_GNUC_UNUSED,
+                       cairo_t *cr,
+                       double x0,
+                       double y0,
+                       double x1,
+                       double y1,
+                       const PaintToolSettings *settings)
+{
+  double dist = hypot (x1 - x0, y1 - y0);
+  cairo_set_operator (cr, settings->target_alpha_lock ? CAIRO_OPERATOR_ATOP
+                                                      : CAIRO_OPERATOR_OVER);
+  if (dist < 0.5) {
+    cairo_set_source_rgba (cr,
+                           settings->color.red,
+                           settings->color.green,
+                           settings->color.blue,
+                           settings->color.alpha);
+    cairo_paint (cr);
+    return;
+  }
+
+  cairo_pattern_t *pat = settings->gradient_radial
+                           ? cairo_pattern_create_radial (x0, y0, 0.0, x0, y0, dist)
+                           : cairo_pattern_create_linear (x0, y0, x1, y1);
+  cairo_pattern_add_color_stop_rgba (pat, 0.0,
+                                     settings->color.red,
+                                     settings->color.green,
+                                     settings->color.blue,
+                                     settings->color.alpha);
+  cairo_pattern_add_color_stop_rgba (pat, 1.0,
+                                     settings->secondary_color.red,
+                                     settings->secondary_color.green,
+                                     settings->secondary_color.blue,
+                                     settings->secondary_color.alpha);
+  cairo_set_source (cr, pat);
+  cairo_paint (cr);
+  cairo_pattern_destroy (pat);
+}
+
+static void
+gradient_get_bounds (const PaintTool *tool G_GNUC_UNUSED,
+                     double x0 G_GNUC_UNUSED,
+                     double y0 G_GNUC_UNUSED,
+                     double x1 G_GNUC_UNUSED,
+                     double y1 G_GNUC_UNUSED,
+                     const PaintToolSettings *settings G_GNUC_UNUSED,
+                     double *out_x0,
+                     double *out_y0,
+                     double *out_x1,
+                     double *out_y1)
+{
+  *out_x0 = -65536.0;
+  *out_y0 = -65536.0;
+  *out_x1 = 65536.0;
+  *out_y1 = 65536.0;
+}
+
+static inline uint32_t
+retouch_pack_for_alpha_lock (uint32_t dst_px, uint32_t avg_a, uint32_t avg_r, uint32_t avg_g, uint32_t avg_b)
+{
+  uint32_t da = (dst_px >> 24) & 0xFFU;
+  if (da == 0)
+    return dst_px;
+  if (avg_a == 0)
+    return dst_px;
+  uint32_t out_r = MIN (da, (avg_r * da + avg_a / 2) / avg_a);
+  uint32_t out_g = MIN (da, (avg_g * da + avg_a / 2) / avg_a);
+  uint32_t out_b = MIN (da, (avg_b * da + avg_a / 2) / avg_a);
+  return (da << 24) | (out_r << 16) | (out_g << 8) | out_b;
+}
+
+static void
+retouch_blur_stamp (cairo_t *cr, double cx, double cy, const PaintToolSettings *settings)
+{
+  cairo_surface_t *surface = cairo_get_target (cr);
+  if (!surface || cairo_surface_get_type (surface) != CAIRO_SURFACE_TYPE_IMAGE)
+    return;
+
+  cairo_surface_flush (surface);
+  int w = cairo_image_surface_get_width (surface);
+  int h = cairo_image_surface_get_height (surface);
+  int stride = cairo_image_surface_get_stride (surface);
+  unsigned char *data = cairo_image_surface_get_data (surface);
+
+  double r = MAX (2.0, effective_stroke_size (settings) * 0.5);
+  double r2 = r * r;
+  int kr = (r >= 8.0) ? 2 : 1;
+  int bx0 = MAX (0, (int) floor (cx - r));
+  int by0 = MAX (0, (int) floor (cy - r));
+  int bx1 = MIN (w - 1, (int) ceil (cx + r));
+  int by1 = MIN (h - 1, (int) ceil (cy + r));
+  if (bx0 > bx1 || by0 > by1)
+    return;
+
+  int sx0 = MAX (0, bx0 - kr);
+  int sy0 = MAX (0, by0 - kr);
+  int sx1 = MIN (w - 1, bx1 + kr);
+  int sy1 = MIN (h - 1, by1 + kr);
+  int sw = sx1 - sx0 + 1;
+  int sh = sy1 - sy0 + 1;
+  g_autofree uint32_t *copy = g_new (uint32_t, (gsize) sw * (gsize) sh);
+  for (int y = 0; y < sh; y++) {
+    const uint32_t *src_row = (const uint32_t *) (data + (gsize) (sy0 + y) * (gsize) stride);
+    memcpy (copy + (gsize) y * (gsize) sw, src_row + sx0, (gsize) sw * sizeof (uint32_t));
+  }
+
+  for (int y = by0; y <= by1; y++) {
+    double dy = (double) y - cy;
+    uint32_t *dst_row = (uint32_t *) (data + (gsize) y * (gsize) stride);
+    for (int x = bx0; x <= bx1; x++) {
+      double dx = (double) x - cx;
+      if (dx * dx + dy * dy > r2)
+        continue;
+
+      uint32_t sa = 0, sr = 0, sg = 0, sb = 0, cnt = 0;
+      for (int ky = y - kr; ky <= y + kr; ky++) {
+        if (ky < sy0 || ky > sy1)
+          continue;
+        const uint32_t *crow = copy + (gsize) (ky - sy0) * (gsize) sw;
+        for (int kx = x - kr; kx <= x + kr; kx++) {
+          if (kx < sx0 || kx > sx1)
+            continue;
+          uint32_t p = crow[kx - sx0];
+          sa += (p >> 24) & 0xFFU;
+          sr += (p >> 16) & 0xFFU;
+          sg += (p >> 8) & 0xFFU;
+          sb += p & 0xFFU;
+          cnt++;
+        }
+      }
+      if (cnt == 0)
+        continue;
+
+      uint32_t avg_a = (sa + cnt / 2) / cnt;
+      uint32_t avg_r = (sr + cnt / 2) / cnt;
+      uint32_t avg_g = (sg + cnt / 2) / cnt;
+      uint32_t avg_b = (sb + cnt / 2) / cnt;
+      uint32_t dst_px = dst_row[x];
+      uint32_t da = (dst_px >> 24) & 0xFFU;
+      uint32_t dr = (dst_px >> 16) & 0xFFU;
+      uint32_t dg = (dst_px >> 8) & 0xFFU;
+      uint32_t db = dst_px & 0xFFU;
+
+      uint32_t oa = (da * 40 + avg_a * 60 + 50) / 100;
+      uint32_t or_ = (dr * 40 + avg_r * 60 + 50) / 100;
+      uint32_t og_ = (dg * 40 + avg_g * 60 + 50) / 100;
+      uint32_t ob_ = (db * 40 + avg_b * 60 + 50) / 100;
+
+      if (settings->target_alpha_lock) {
+        dst_row[x] = retouch_pack_for_alpha_lock (dst_px, oa, or_, og_, ob_);
+      } else {
+        dst_row[x] = (MIN (255u, oa) << 24) |
+                     (MIN (oa, or_) << 16) |
+                     (MIN (oa, og_) << 8) |
+                     MIN (oa, ob_);
+      }
+    }
+  }
+  cairo_surface_mark_dirty (surface);
+}
+
+static void
+retouch_pixelate_stamp (cairo_t *cr, double cx, double cy, const PaintToolSettings *settings)
+{
+  cairo_surface_t *surface = cairo_get_target (cr);
+  if (!surface || cairo_surface_get_type (surface) != CAIRO_SURFACE_TYPE_IMAGE)
+    return;
+
+  cairo_surface_flush (surface);
+  int w = cairo_image_surface_get_width (surface);
+  int h = cairo_image_surface_get_height (surface);
+  int stride = cairo_image_surface_get_stride (surface);
+  unsigned char *data = cairo_image_surface_get_data (surface);
+
+  double eff_sz = effective_stroke_size (settings);
+  double r = MAX (2.0, eff_sz * 0.5);
+  double r2 = r * r;
+  int blk = CLAMP ((int) lround (MAX (3.0, eff_sz * 0.28)), 3, 24);
+  int bx0 = MAX (0, (int) floor (cx - r));
+  int by0 = MAX (0, (int) floor (cy - r));
+  int bx1 = MIN (w - 1, (int) ceil (cx + r));
+  int by1 = MIN (h - 1, (int) ceil (cy + r));
+  if (bx0 > bx1 || by0 > by1)
+    return;
+
+  int gx0 = (bx0 / blk) * blk;
+  int gy0 = (by0 / blk) * blk;
+  for (int gy = gy0; gy <= by1; gy += blk) {
+    int cy0 = MAX (0, gy);
+    int cy1 = MIN (h - 1, gy + blk - 1);
+    for (int gx = gx0; gx <= bx1; gx += blk) {
+      int cx0 = MAX (0, gx);
+      int cx1 = MIN (w - 1, gx + blk - 1);
+      uint64_t sa = 0, sr = 0, sg = 0, sb = 0, cnt = 0;
+      for (int y = cy0; y <= cy1; y++) {
+        const uint32_t *row = (const uint32_t *) (data + (gsize) y * (gsize) stride);
+        for (int x = cx0; x <= cx1; x++) {
+          uint32_t p = row[x];
+          sa += (p >> 24) & 0xFFU;
+          sr += (p >> 16) & 0xFFU;
+          sg += (p >> 8) & 0xFFU;
+          sb += p & 0xFFU;
+          cnt++;
+        }
+      }
+      if (cnt == 0)
+        continue;
+      uint32_t avg_a = (uint32_t) ((sa + cnt / 2) / cnt);
+      uint32_t avg_r = (uint32_t) ((sr + cnt / 2) / cnt);
+      uint32_t avg_g = (uint32_t) ((sg + cnt / 2) / cnt);
+      uint32_t avg_b = (uint32_t) ((sb + cnt / 2) / cnt);
+      uint32_t avg_px = (MIN (255u, avg_a) << 24) |
+                        (MIN (avg_a, avg_r) << 16) |
+                        (MIN (avg_a, avg_g) << 8) |
+                        MIN (avg_a, avg_b);
+
+      for (int y = cy0; y <= cy1; y++) {
+        double dy = (double) y - cy;
+        uint32_t *row = (uint32_t *) (data + (gsize) y * (gsize) stride);
+        for (int x = cx0; x <= cx1; x++) {
+          double dx = (double) x - cx;
+          if (dx * dx + dy * dy > r2)
+            continue;
+          if (settings->target_alpha_lock)
+            row[x] = retouch_pack_for_alpha_lock (row[x], avg_a, avg_r, avg_g, avg_b);
+          else
+            row[x] = avg_px;
+        }
+      }
+    }
+  }
+  cairo_surface_mark_dirty (surface);
+}
+
+static void
+retouch_apply_stamp (const PaintTool *tool, cairo_t *cr, double x, double y, const PaintToolSettings *settings)
+{
+  if (g_strcmp0 (tool->id, "pixelate") == 0)
+    retouch_pixelate_stamp (cr, x, y, settings);
+  else
+    retouch_blur_stamp (cr, x, y, settings);
+}
+
+static void
+retouch_begin_stroke (const PaintTool *tool,
+                      cairo_t *cr,
+                      double x,
+                      double y,
+                      PaintToolSettings *settings)
+{
+  PaintPoint pt = { x, y };
+  g_array_set_size (settings->history_points, 0);
+  g_array_append_val (settings->history_points, pt);
+  retouch_apply_stamp (tool, cr, x, y, settings);
+}
+
+static void
+retouch_step_segment (const PaintTool *tool,
+                      cairo_t *cr,
+                      double x0,
+                      double y0,
+                      double x1,
+                      double y1,
+                      const PaintToolSettings *settings)
+{
+  double r = MAX (2.0, effective_stroke_size (settings) * 0.5);
+  double dist = hypot (x1 - x0, y1 - y0);
+  if (dist < 0.5)
+    return;
+  double spacing = MAX (1.5, r * 0.35);
+  int steps = MAX (1, (int) ceil (dist / spacing));
+  for (int i = 1; i <= steps; i++) {
+    double t = (double) i / (double) steps;
+    retouch_apply_stamp (tool, cr, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, settings);
+  }
+}
+
+static void
+retouch_continue_stroke (const PaintTool *tool,
+                         cairo_t *cr,
+                         double x,
+                         double y,
+                         PaintToolSettings *settings)
+{
+  GArray *pts = settings->history_points;
+  if (pts->len == 0) {
+    retouch_begin_stroke (tool, cr, x, y, settings);
+    return;
+  }
+  PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
+  retouch_step_segment (tool, cr, last.x, last.y, x, y, settings);
+  PaintPoint next = { x, y };
+  g_array_append_val (pts, next);
+}
+
+static void
+retouch_end_stroke (const PaintTool *tool,
+                    cairo_t *cr,
+                    double x,
+                    double y,
+                    PaintToolSettings *settings)
+{
+  GArray *pts = settings->history_points;
+  if (pts->len >= 1) {
+    PaintPoint last = g_array_index (pts, PaintPoint, pts->len - 1);
+    retouch_step_segment (tool, cr, last.x, last.y, x, y, settings);
+  }
+  g_array_set_size (pts, 0);
+}
+
 static const PaintTool BUILTIN_TOOLS[] = {
   {
     .id = "select",
-    .name = "Select",
+    .name = N_("Rectangle Select"),
     .icon_name = "tool-select-symbolic",
-    .tooltip = "Select (M) · Drag to select, drag inside to move",
+    .tooltip = N_("Rectangle Select (M) · Drag to select, drag inside to move"),
     .uses_brush_size = FALSE,
+    .is_select = TRUE,
+    .begin_stroke = fill_noop,
+    .continue_stroke = fill_noop,
+    .end_stroke = fill_noop,
+  },
+  {
+    .id = "select-ellipse",
+    .name = N_("Ellipse Select"),
+    .icon_name = "tool-select-ellipse-symbolic",
+    .tooltip = N_("Ellipse Select · Hold Shift for circle"),
+    .uses_brush_size = FALSE,
+    .is_select = TRUE,
+    .begin_stroke = fill_noop,
+    .continue_stroke = fill_noop,
+    .end_stroke = fill_noop,
+  },
+  {
+    .id = "select-lasso",
+    .name = N_("Freehand Lasso"),
+    .icon_name = "tool-select-lasso-symbolic",
+    .tooltip = N_("Freehand Lasso · Draw freehand selection region"),
+    .uses_brush_size = FALSE,
+    .is_select = TRUE,
+    .begin_stroke = fill_noop,
+    .continue_stroke = fill_noop,
+    .end_stroke = fill_noop,
+  },
+  {
+    .id = "select-wand",
+    .name = N_("Magic Wand"),
+    .icon_name = "tool-select-wand-symbolic",
+    .tooltip = N_("Magic Wand · Click to select similar color region"),
+    .uses_brush_size = FALSE,
+    .is_select = TRUE,
     .begin_stroke = fill_noop,
     .continue_stroke = fill_noop,
     .end_stroke = fill_noop,
   },
   {
     .id = "brush",
-    .name = "Brush",
+    .name = N_("Brush"),
     .icon_name = "document-edit-symbolic",
-    .tooltip = "Brush (B)",
+    .tooltip = N_("Brush (B)"),
     .uses_brush_size = TRUE,
     .begin_stroke = freehand_begin_stroke,
     .continue_stroke = freehand_continue_stroke,
@@ -1130,9 +1699,9 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "line",
-    .name = "Line",
+    .name = N_("Line"),
     .icon_name = "tool-line-symbolic",
-    .tooltip = "Line (L) · Hold Shift to snap angle",
+    .tooltip = N_("Line (L) · Hold Shift to snap angle"),
     .uses_brush_size = TRUE,
     .begin_stroke = line_begin_stroke,
     .continue_stroke = fill_noop,
@@ -1142,9 +1711,9 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "eraser",
-    .name = "Eraser",
+    .name = N_("Eraser"),
     .icon_name = "tool-eraser-symbolic",
-    .tooltip = "Eraser (E)",
+    .tooltip = N_("Eraser (E)"),
     .uses_brush_size = TRUE,
     .begin_stroke = freehand_begin_stroke,
     .continue_stroke = freehand_continue_stroke,
@@ -1152,19 +1721,54 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "fill",
-    .name = "Fill",
+    .name = N_("Fill"),
     .icon_name = "tool-fill-symbolic",
-    .tooltip = "Fill (F)",
+    .tooltip = N_("Fill (F)"),
     .uses_brush_size = FALSE,
     .begin_stroke = fill_begin_stroke,
     .continue_stroke = fill_noop,
     .end_stroke = fill_noop,
   },
   {
+    .id = "gradient",
+    .name = N_("Gradient"),
+    .icon_name = "tool-gradient-symbolic",
+    .tooltip = N_("Gradient (G) · Drag from Primary to Secondary color (Shift snaps)"),
+    .uses_brush_size = FALSE,
+    .begin_stroke = line_begin_stroke,
+    .continue_stroke = fill_noop,
+    .end_stroke = line_end_stroke,
+    .draw_preview = gradient_draw_preview,
+    .snap_point = line_snap_point,
+    .get_bounds = gradient_get_bounds,
+  },
+  {
+    .id = "blur",
+    .name = N_("Blur Brush"),
+    .icon_name = "tool-blur-symbolic",
+    .tooltip = N_("Blur Brush · Soften painted details"),
+    .uses_brush_size = TRUE,
+    .is_retouch = TRUE,
+    .begin_stroke = retouch_begin_stroke,
+    .continue_stroke = retouch_continue_stroke,
+    .end_stroke = retouch_end_stroke,
+  },
+  {
+    .id = "pixelate",
+    .name = N_("Pixelate Brush"),
+    .icon_name = "tool-pixelate-symbolic",
+    .tooltip = N_("Pixelate Brush · Paint mosaic blocks"),
+    .uses_brush_size = TRUE,
+    .is_retouch = TRUE,
+    .begin_stroke = retouch_begin_stroke,
+    .continue_stroke = retouch_continue_stroke,
+    .end_stroke = retouch_end_stroke,
+  },
+  {
     .id = "text",
-    .name = "Text",
+    .name = N_("Text"),
     .icon_name = "tool-text-symbolic",
-    .tooltip = "Text (X) · Click canvas to add text",
+    .tooltip = N_("Text (X) · Click canvas to add text"),
     .uses_brush_size = FALSE,
     .begin_stroke = fill_noop,
     .continue_stroke = fill_noop,
@@ -1172,9 +1776,9 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "eyedropper",
-    .name = "Color Picker",
+    .name = N_("Color Picker"),
     .icon_name = "tool-eyedropper-symbolic",
-    .tooltip = "Color Picker (I) · Or Alt+Click anytime",
+    .tooltip = N_("Color Picker (I) · Or Alt+Click anytime"),
     .uses_brush_size = FALSE,
     .begin_stroke = fill_noop,
     .continue_stroke = fill_noop,
@@ -1182,9 +1786,9 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "transparent",
-    .name = "Brush",
+    .name = N_("Brush"),
     .icon_name = "tool-transparent-symbolic",
-    .tooltip = "Transparent Brush (T) · Paint areas transparent",
+    .tooltip = N_("Transparent Brush (T) · Paint areas transparent"),
     .uses_brush_size = TRUE,
     .is_transparency = TRUE,
     .begin_stroke = freehand_begin_stroke,
@@ -1193,9 +1797,9 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "transparent-fill",
-    .name = "Fill",
+    .name = N_("Fill"),
     .icon_name = "tool-transparent-fill-symbolic",
-    .tooltip = "Transparent Fill · Click an area to make it transparent",
+    .tooltip = N_("Transparent Fill · Click an area to make it transparent"),
     .uses_brush_size = FALSE,
     .is_transparency = TRUE,
     .begin_stroke = transparent_fill_begin_stroke,
@@ -1204,10 +1808,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-rectangle",
-    .name = "Rectangle",
+    .name = N_("Rectangle"),
     .icon_name = "tool-shape-rect-symbolic",
     .filled_icon_name = "tool-shape-rect-filled-symbolic",
-    .tooltip = "Rectangle · Hold Shift for square",
+    .tooltip = N_("Rectangle · Hold Shift for square"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1219,10 +1823,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-rounded-rect",
-    .name = "Rounded",
+    .name = N_("Rounded"),
     .icon_name = "tool-shape-rounded-rect-symbolic",
     .filled_icon_name = "tool-shape-rounded-rect-filled-symbolic",
-    .tooltip = "Rounded Rectangle · Hold Shift for square",
+    .tooltip = N_("Rounded Rectangle · Hold Shift for square"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1234,10 +1838,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-ellipse",
-    .name = "Circle",
+    .name = N_("Circle"),
     .icon_name = "tool-shape-ellipse-symbolic",
     .filled_icon_name = "tool-shape-ellipse-filled-symbolic",
-    .tooltip = "Ellipse / Circle · Hold Shift for circle",
+    .tooltip = N_("Ellipse / Circle · Hold Shift for circle"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1249,10 +1853,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-triangle",
-    .name = "Triangle",
+    .name = N_("Triangle"),
     .icon_name = "tool-shape-triangle-symbolic",
     .filled_icon_name = "tool-shape-triangle-filled-symbolic",
-    .tooltip = "Triangle · Hold Shift for 1:1 proportions",
+    .tooltip = N_("Triangle · Hold Shift for 1:1 proportions"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1264,10 +1868,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-diamond",
-    .name = "Diamond",
+    .name = N_("Diamond"),
     .icon_name = "tool-shape-diamond-symbolic",
     .filled_icon_name = "tool-shape-diamond-filled-symbolic",
-    .tooltip = "Diamond · Hold Shift for 1:1 proportions",
+    .tooltip = N_("Diamond · Hold Shift for 1:1 proportions"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1279,10 +1883,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-hexagon",
-    .name = "Hexagon",
+    .name = N_("Hexagon"),
     .icon_name = "tool-shape-hexagon-symbolic",
     .filled_icon_name = "tool-shape-hexagon-filled-symbolic",
-    .tooltip = "Hexagon · Hold Shift for regular hexagon",
+    .tooltip = N_("Hexagon · Hold Shift for regular hexagon"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1294,10 +1898,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-star",
-    .name = "Star",
+    .name = N_("Star"),
     .icon_name = "tool-shape-star-symbolic",
     .filled_icon_name = "tool-shape-star-filled-symbolic",
-    .tooltip = "Star · Hold Shift for symmetric star",
+    .tooltip = N_("Star · Hold Shift for symmetric star"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1309,10 +1913,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-arrow",
-    .name = "Arrow",
+    .name = N_("Arrow"),
     .icon_name = "tool-shape-arrow-symbolic",
     .filled_icon_name = "tool-shape-arrow-filled-symbolic",
-    .tooltip = "Arrow · Hold Shift to snap angle",
+    .tooltip = N_("Arrow · Hold Shift to snap angle"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1324,10 +1928,10 @@ static const PaintTool BUILTIN_TOOLS[] = {
   },
   {
     .id = "shape-block-arrow",
-    .name = "Block Arrow",
+    .name = N_("Block Arrow"),
     .icon_name = "tool-shape-block-arrow-symbolic",
     .filled_icon_name = "tool-shape-block-arrow-filled-symbolic",
-    .tooltip = "Block Arrow · Hold Shift to snap angle",
+    .tooltip = N_("Block Arrow · Hold Shift to snap angle"),
     .uses_brush_size = TRUE,
     .is_shape = TRUE,
     .begin_stroke = line_begin_stroke,
@@ -1365,6 +1969,8 @@ paint_tool_get_icon_name (const PaintTool *tool, const PaintToolSettings *settin
 {
   if (!tool)
     return NULL;
+  if (g_strcmp0 (tool->id, "gradient") == 0 && settings && settings->gradient_radial)
+    return "tool-gradient-radial-symbolic";
   if (tool->is_shape && settings && settings->shape_filled && tool->filled_icon_name)
     return tool->filled_icon_name;
   return tool->icon_name;

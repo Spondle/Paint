@@ -179,6 +179,66 @@ test_startup_behavior_defaults_and_roundtrip (void)
   paint_preferences_free (reloaded2);
 }
 
+static void
+test_keybinds_no_default_conflicts_and_shift_swap (void)
+{
+  PaintPreferences *prefs = paint_preferences_load ();
+  gsize count = 0;
+  const PaintKeybindSpec *specs = paint_preferences_get_keybind_specs (&count);
+  for (gsize i = 0; i < count; i++) {
+    const char *accel = specs[i].default_accel;
+    if (!accel || !*accel)
+      continue;
+    const PaintKeybindSpec *conflict =
+        paint_preferences_find_keybind_conflict (prefs, specs[i].id, accel);
+    g_assert_null (conflict);
+  }
+
+  g_assert_cmpstr (paint_preferences_match_local_keybind (prefs, GDK_KEY_x, 0),
+                   ==, "win.tool-text");
+  g_assert_cmpstr (paint_preferences_match_local_keybind (prefs, GDK_KEY_X, GDK_SHIFT_MASK),
+                   ==, "win.swap-colors");
+  g_assert_cmpstr (paint_preferences_match_local_keybind (prefs, GDK_KEY_d, 0),
+                   ==, "win.reset-colors");
+  g_assert_cmpstr (paint_preferences_match_local_keybind (prefs, GDK_KEY_g, 0),
+                   ==, "win.tool-gradient");
+
+  paint_preferences_free (prefs);
+}
+
+static void
+test_stylus_and_colors_roundtrip (void)
+{
+  g_autofree char *ini = g_build_filename (g_get_user_config_dir (), "paint", "settings.ini", NULL);
+  g_unlink (ini);
+
+  PaintPreferences *prefs = paint_preferences_load ();
+  g_assert_true (prefs->pressure_size);
+  g_assert_false (prefs->pressure_opacity);
+  g_assert_cmpint (prefs->n_recent_colors, ==, 0);
+  g_assert_cmpint (prefs->n_custom_colors, ==, 0);
+
+  prefs->pressure_size = FALSE;
+  prefs->pressure_opacity = TRUE;
+  prefs->n_recent_colors = 2;
+  prefs->recent_colors[0] = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  prefs->recent_colors[1] = (GdkRGBA) { 0.0f, 0.5f, 1.0f, 0.5f };
+  prefs->n_custom_colors = 1;
+  prefs->custom_colors[0] = (GdkRGBA) { 0.25f, 0.75f, 0.5f, 1.0f };
+  paint_preferences_save (prefs);
+  paint_preferences_free (prefs);
+
+  PaintPreferences *reloaded = paint_preferences_load ();
+  g_assert_false (reloaded->pressure_size);
+  g_assert_true (reloaded->pressure_opacity);
+  g_assert_cmpint (reloaded->n_recent_colors, ==, 2);
+  g_assert_cmpfloat_with_epsilon (reloaded->recent_colors[0].red, 1.0, 0.02);
+  g_assert_cmpfloat_with_epsilon (reloaded->recent_colors[1].blue, 1.0, 0.02);
+  g_assert_cmpint (reloaded->n_custom_colors, ==, 1);
+  g_assert_cmpfloat_with_epsilon (reloaded->custom_colors[0].green, 0.75, 0.02);
+  paint_preferences_free (reloaded);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -194,6 +254,10 @@ main (int argc, char **argv)
   g_test_add_func ("/keybinds/save_and_reload_roundtrip", test_keybinds_save_and_reload_roundtrip);
   g_test_add_func ("/preferences/startup_behavior_roundtrip",
                    test_startup_behavior_defaults_and_roundtrip);
+  g_test_add_func ("/keybinds/no_default_conflicts_and_shift_swap",
+                   test_keybinds_no_default_conflicts_and_shift_swap);
+  g_test_add_func ("/preferences/stylus_and_colors_roundtrip",
+                   test_stylus_and_colors_roundtrip);
   int res = g_test_run ();
 
   g_autofree char *ini = g_build_filename (tmp_cfg, "paint", "settings.ini", NULL);

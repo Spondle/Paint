@@ -6,6 +6,8 @@ G_BEGIN_DECLS
 
 #define PAINT_DEFAULT_WINDOW_WIDTH 720
 #define PAINT_DEFAULT_WINDOW_HEIGHT 520
+#define PAINT_PREFS_MAX_RECENT_COLORS 8
+#define PAINT_PREFS_MAX_CUSTOM_COLORS 16
 
 typedef enum {
   PAINT_COLOR_SCHEME_SYSTEM = 0,
@@ -41,6 +43,12 @@ typedef struct {
   int last_window_width;
   int last_window_height;
   gboolean last_window_maximized;
+  gboolean pressure_size;
+  gboolean pressure_opacity;
+  GdkRGBA recent_colors[PAINT_PREFS_MAX_RECENT_COLORS];
+  int n_recent_colors;
+  GdkRGBA custom_colors[PAINT_PREFS_MAX_CUSTOM_COLORS];
+  int n_custom_colors;
   GHashTable *keybinds; /* char* action_id -> char* accel ("" = disabled) */
 } PaintPreferences;
 

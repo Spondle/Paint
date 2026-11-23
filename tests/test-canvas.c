@@ -1,7 +1,10 @@
 #include "paint-canvas.h"
+#include "paint-filters.h"
 #include "paint-tools.h"
 
 #include <glib/gstdio.h>
+#include <math.h>
+#include <string.h>
 
 static void
 read_pixel_rgba (PaintDocument *doc, int x, int y, guint8 *r, guint8 *g, guint8 *b, guint8 *a)
@@ -1562,6 +1565,1042 @@ test_layers_per_layer_tiled_undo_and_names (void)
   paint_document_free (doc);
 }
 
+static void
+test_ora_multilayer_roundtrip (void)
+{
+  PaintDocument *doc = paint_document_new_transparent (64, 48);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->size = 8.0;
+  const PaintTool *brush = paint_tools_find ("brush");
+
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  paint_document_begin_stroke (doc, 20.0, 20.0, brush, settings);
+  paint_document_end_stroke (doc, 20.0, 20.0, brush, settings);
+
+  paint_document_add_layer (doc, "Ink & Lines");
+  paint_document_layer_set_blend_mode (doc, 1, PAINT_BLEND_MULTIPLY);
+  paint_document_layer_set_opacity (doc, 1, 0.5);
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  paint_document_begin_stroke (doc, 40.0, 20.0, brush, settings);
+  paint_document_end_stroke (doc, 40.0, 20.0, brush, settings);
+
+  paint_document_add_layer (doc, "Hidden");
+  paint_document_layer_set_blend_mode (doc, 2, PAINT_BLEND_SCREEN);
+  paint_document_layer_set_visible (doc, 2, FALSE);
+  settings->color = (GdkRGBA) { 0.0f, 1.0f, 0.0f, 1.0f };
+  paint_document_begin_stroke (doc, 10.0, 10.0, brush, settings);
+  paint_document_end_stroke (doc, 10.0, 10.0, brush, settings);
+
+  paint_document_set_active_layer (doc, 1);
+
+  g_autofree char *tmp_dir = g_dir_make_tmp ("paint-ora-XXXXXX", NULL);
+  g_autofree char *ora_path = g_build_filename (tmp_dir, "project.ora", NULL);
+  g_autoptr (GFile) ora_file = g_file_new_for_path (ora_path);
+  g_autoptr (GError) err = NULL;
+  g_assert_true (paint_document_save_to_file (doc, ora_file, &err));
+  g_assert_no_error (err);
+  g_assert_false (paint_document_get_modified (doc));
+
+  PaintDocument *loaded = paint_document_new_from_file (ora_file, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (loaded);
+  g_assert_cmpint (paint_document_get_width (loaded), ==, 64);
+  g_assert_cmpint (paint_document_get_height (loaded), ==, 48);
+  g_assert_cmpint (paint_document_get_n_layers (loaded), ==, 3);
+  g_assert_cmpint (paint_document_get_active_layer (loaded), ==, 1);
+  g_assert_true (paint_document_has_transparent_background (loaded));
+  g_assert_false (paint_document_get_modified (loaded));
+
+  g_assert_cmpstr (paint_document_layer_get_name (loaded, 0), ==, "Background");
+  g_assert_cmpstr (paint_document_layer_get_name (loaded, 1), ==, "Ink & Lines");
+  g_assert_cmpstr (paint_document_layer_get_name (loaded, 2), ==, "Hidden");
+  g_assert_cmpint (paint_document_layer_get_blend_mode (loaded, 1), ==, PAINT_BLEND_MULTIPLY);
+  g_assert_cmpfloat_with_epsilon (paint_document_layer_get_opacity (loaded, 1), 0.5, 1e-3);
+  g_assert_true (paint_document_layer_get_visible (loaded, 1));
+  g_assert_cmpint (paint_document_layer_get_blend_mode (loaded, 2), ==, PAINT_BLEND_SCREEN);
+  g_assert_false (paint_document_layer_get_visible (loaded, 2));
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (loaded, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (a, ==, 255);
+
+  /* Hidden green stroke on layer 2 must not appear in composite, and corner stays transparent */
+  read_pixel_rgba (loaded, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+
+  paint_document_free (loaded);
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+  g_unlink (ora_path);
+  g_rmdir (tmp_dir);
+}
+
+static guint32
+test_crc32 (const guint8 *data, gsize len)
+{
+  guint32 crc = 0xFFFFFFFFU;
+  for (gsize i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int k = 0; k < 8; k++)
+      crc = (crc & 1U) ? (0xEDB88320U ^ (crc >> 1)) : (crc >> 1);
+  }
+  return crc ^ 0xFFFFFFFFU;
+}
+
+static void
+test_put_le16 (GByteArray *a, guint16 v)
+{
+  guint8 b[2] = { (guint8) (v & 0xFFU), (guint8) (v >> 8) };
+  g_byte_array_append (a, b, 2);
+}
+
+static void
+test_put_le32 (GByteArray *a, guint32 v)
+{
+  guint8 b[4] = {
+    (guint8) (v & 0xFFU), (guint8) ((v >> 8) & 0xFFU),
+    (guint8) ((v >> 16) & 0xFFU), (guint8) ((v >> 24) & 0xFFU)
+  };
+  g_byte_array_append (a, b, 4);
+}
+
+static GBytes *
+test_deflate_raw (const guint8 *src, gsize len)
+{
+  g_autoptr (GZlibCompressor) comp = g_zlib_compressor_new (G_ZLIB_COMPRESSOR_FORMAT_RAW, 6);
+  GByteArray *out = g_byte_array_new ();
+  guint8 tmp[4096];
+  gsize pos = 0;
+  while (TRUE) {
+    gsize rd = 0, wr = 0;
+    GConverterResult res = g_converter_convert (
+        G_CONVERTER (comp), src + pos, len - pos, tmp, sizeof (tmp),
+        pos >= len ? G_CONVERTER_INPUT_AT_END : G_CONVERTER_NO_FLAGS, &rd, &wr, NULL);
+    g_assert_cmpint (res, !=, G_CONVERTER_ERROR);
+    if (wr > 0)
+      g_byte_array_append (out, tmp, (guint) wr);
+    pos += rd;
+    if (res == G_CONVERTER_FINISHED)
+      break;
+  }
+  return g_byte_array_free_to_bytes (out);
+}
+
+static cairo_status_t
+test_png_append (void *closure, const unsigned char *data, unsigned int length)
+{
+  g_byte_array_append (closure, data, length);
+  return CAIRO_STATUS_SUCCESS;
+}
+
+static void
+test_ora_deflate_external_compat (void)
+{
+  const char *xml =
+      "<?xml version='1.0' encoding='UTF-8'?>"
+      "<image w=\"40\" h=\"40\">"
+      "  <stack>"
+      "    <layer name=\"Offset\" src=\"data/l0.png\" x=\"10\" y=\"12\" "
+      "           opacity=\"1.0\" visibility=\"visible\" composite-op=\"svg:overlay\"/>"
+      "  </stack>"
+      "</image>";
+
+  cairo_surface_t *l0 = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 8, 8);
+  cairo_t *cr = cairo_create (l0);
+  cairo_set_source_rgba (cr, 0.0, 1.0, 0.0, 1.0);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+
+  GByteArray *png_arr = g_byte_array_new ();
+  g_assert_cmpint (cairo_surface_write_to_png_stream (l0, test_png_append, png_arr),
+                   ==, CAIRO_STATUS_SUCCESS);
+  cairo_surface_destroy (l0);
+
+  g_autoptr (GBytes) xml_raw = g_bytes_new_static (xml, strlen (xml));
+  g_autoptr (GBytes) xml_def = test_deflate_raw ((const guint8 *) xml, strlen (xml));
+  g_autoptr (GBytes) png_raw = g_byte_array_free_to_bytes (png_arr);
+  g_autoptr (GBytes) png_def = test_deflate_raw (
+      g_bytes_get_data (png_raw, NULL), g_bytes_get_size (png_raw));
+
+  struct {
+    const char *name;
+    guint16 method;
+    GBytes *raw;
+    GBytes *comp;
+    guint32 off;
+  } items[3] = {
+    { "mimetype", 0, g_bytes_new_static ("image/openraster", 16), NULL, 0 },
+    { "stack.xml", 8, xml_raw, xml_def, 0 },
+    { "data/l0.png", 8, png_raw, png_def, 0 },
+  };
+  items[0].comp = g_bytes_ref (items[0].raw);
+
+  GByteArray *zip = g_byte_array_new ();
+  for (int i = 0; i < 3; i++) {
+    gsize rlen = 0, clen = 0;
+    const guint8 *rptr = g_bytes_get_data (items[i].raw, &rlen);
+    const guint8 *cptr = g_bytes_get_data (items[i].comp, &clen);
+    guint32 crc = test_crc32 (rptr, rlen);
+    guint16 nlen = (guint16) strlen (items[i].name);
+    items[i].off = zip->len;
+    test_put_le32 (zip, 0x04034B50U);
+    test_put_le16 (zip, 20);
+    test_put_le16 (zip, 0);
+    test_put_le16 (zip, items[i].method);
+    test_put_le16 (zip, 0);
+    test_put_le16 (zip, 0x5421);
+    test_put_le32 (zip, crc);
+    test_put_le32 (zip, (guint32) clen);
+    test_put_le32 (zip, (guint32) rlen);
+    test_put_le16 (zip, nlen);
+    test_put_le16 (zip, 0);
+    g_byte_array_append (zip, (const guint8 *) items[i].name, nlen);
+    g_byte_array_append (zip, cptr, (guint) clen);
+  }
+
+  guint32 cd_off = zip->len;
+  for (int i = 0; i < 3; i++) {
+    gsize rlen = 0, clen = 0;
+    const guint8 *rptr = g_bytes_get_data (items[i].raw, &rlen);
+    (void) g_bytes_get_data (items[i].comp, &clen);
+    guint32 crc = test_crc32 (rptr, rlen);
+    guint16 nlen = (guint16) strlen (items[i].name);
+    test_put_le32 (zip, 0x02014B50U);
+    test_put_le16 (zip, 20);
+    test_put_le16 (zip, 20);
+    test_put_le16 (zip, 0);
+    test_put_le16 (zip, items[i].method);
+    test_put_le16 (zip, 0);
+    test_put_le16 (zip, 0x5421);
+    test_put_le32 (zip, crc);
+    test_put_le32 (zip, (guint32) clen);
+    test_put_le32 (zip, (guint32) rlen);
+    test_put_le16 (zip, nlen);
+    test_put_le16 (zip, 0);
+    test_put_le16 (zip, 0);
+    test_put_le16 (zip, 0);
+    test_put_le16 (zip, 0);
+    test_put_le32 (zip, 0);
+    test_put_le32 (zip, items[i].off);
+    g_byte_array_append (zip, (const guint8 *) items[i].name, nlen);
+  }
+  guint32 cd_size = zip->len - cd_off;
+  test_put_le32 (zip, 0x06054B50U);
+  test_put_le16 (zip, 0);
+  test_put_le16 (zip, 0);
+  test_put_le16 (zip, 3);
+  test_put_le16 (zip, 3);
+  test_put_le32 (zip, cd_size);
+  test_put_le32 (zip, cd_off);
+  test_put_le16 (zip, 0);
+
+  g_bytes_unref (items[0].raw);
+  g_bytes_unref (items[0].comp);
+
+  g_autoptr (GBytes) archive = g_byte_array_free_to_bytes (zip);
+  g_autoptr (GError) err = NULL;
+  PaintDocument *doc = paint_io_load_ora_bytes (archive, NULL, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (doc);
+  g_assert_cmpint (paint_document_get_width (doc), ==, 40);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 40);
+  g_assert_cmpint (paint_document_layer_get_blend_mode (doc, 0), ==, PAINT_BLEND_OVERLAY);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 14, 15, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (a, ==, 255);
+  read_pixel_rgba (doc, 2, 2, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+
+  paint_document_free (doc);
+}
+
+static void
+test_export_jpeg_quality_and_matte (void)
+{
+  PaintDocument *doc = paint_document_new_transparent (48, 48);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->size = 16.0;
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  const PaintTool *brush = paint_tools_find ("brush");
+  paint_document_begin_stroke (doc, 24.0, 24.0, brush, settings);
+  paint_document_end_stroke (doc, 24.0, 24.0, brush, settings);
+
+  g_autofree char *tmp_dir = g_dir_make_tmp ("paint-exp-XXXXXX", NULL);
+  g_autofree char *jpg_path = g_build_filename (tmp_dir, "out.jpg", NULL);
+  g_autoptr (GFile) jpg_file = g_file_new_for_path (jpg_path);
+  g_autoptr (GError) err = NULL;
+
+  PaintExportOptions opts = {
+    .format = "jpeg",
+    .quality = 90,
+    .matte_color = { 0.0f, 0.0f, 0.0f, 1.0f }, /* black matte */
+  };
+  g_assert_true (paint_document_export_to_file (doc, jpg_file, &opts, &err));
+  g_assert_no_error (err);
+  g_assert_null (paint_document_get_file (doc));
+  g_assert_true (paint_document_get_modified (doc));
+
+  PaintDocument *reloaded = paint_document_new_from_file (jpg_file, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (reloaded);
+  guint8 r, g, b, a;
+  read_pixel_rgba (reloaded, 2, 2, &r, &g, &b, &a);
+  g_assert_cmpuint (r, <=, 5);
+  g_assert_cmpuint (g, <=, 5);
+  g_assert_cmpuint (b, <=, 5);
+  read_pixel_rgba (reloaded, 24, 24, &r, &g, &b, &a);
+  g_assert_cmpuint (b, >=, 230);
+
+  paint_document_free (reloaded);
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+  g_unlink (jpg_path);
+  g_rmdir (tmp_dir);
+}
+
+static void
+test_export_webp_and_bmp (void)
+{
+  PaintDocument *doc = paint_document_new_transparent (32, 32);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->size = 10.0;
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  const PaintTool *brush = paint_tools_find ("brush");
+  paint_document_begin_stroke (doc, 16.0, 16.0, brush, settings);
+  paint_document_end_stroke (doc, 16.0, 16.0, brush, settings);
+
+  g_autofree char *tmp_dir = g_dir_make_tmp ("paint-wbmp-XXXXXX", NULL);
+  g_autofree char *webp_path = g_build_filename (tmp_dir, "out.webp", NULL);
+  g_autofree char *bmp_path = g_build_filename (tmp_dir, "out.bmp", NULL);
+  g_autoptr (GFile) webp_file = g_file_new_for_path (webp_path);
+  g_autoptr (GFile) bmp_file = g_file_new_for_path (bmp_path);
+  g_autoptr (GError) err = NULL;
+
+  PaintExportOptions webp_opts = { .format = "webp", .quality = 100 };
+  g_assert_true (paint_document_export_to_file (doc, webp_file, &webp_opts, &err));
+  g_assert_no_error (err);
+
+  PaintDocument *reloaded_webp = paint_document_new_from_file (webp_file, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (reloaded_webp);
+  g_assert_true (paint_document_has_transparent_background (reloaded_webp));
+  guint8 r, g, b, a;
+  read_pixel_rgba (reloaded_webp, 16, 16, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (a, ==, 255);
+  read_pixel_rgba (reloaded_webp, 1, 1, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  paint_document_free (reloaded_webp);
+
+  PaintExportOptions bmp_opts = { .format = "bmp", .quality = 100 };
+  g_assert_true (paint_document_export_to_file (doc, bmp_file, &bmp_opts, &err));
+  g_assert_no_error (err);
+  PaintDocument *reloaded_bmp = paint_document_new_from_file (bmp_file, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (reloaded_bmp);
+  g_assert_cmpint (paint_document_get_width (reloaded_bmp), ==, 32);
+  paint_document_free (reloaded_bmp);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+  g_unlink (webp_path);
+  g_unlink (bmp_path);
+  g_rmdir (tmp_dir);
+}
+
+static void
+test_undo_memory_budget_eviction (void)
+{
+  PaintDocument *doc = paint_document_new (64, 64);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->size = 4.0;
+  const PaintTool *brush = paint_tools_find ("brush");
+
+  for (int i = 0; i < 65; i++) {
+    paint_document_begin_stroke (doc, 10.0 + (i % 40), 20.0, brush, settings);
+    paint_document_end_stroke (doc, 10.0 + (i % 40), 20.0, brush, settings);
+  }
+  g_assert_cmpuint (paint_document_get_undo_depth (doc), ==, 65);
+  g_assert_cmpuint (paint_document_get_undo_memory_bytes (doc), >, 0);
+
+  paint_document_set_undo_budget_bytes (doc, 1024);
+  g_assert_cmpuint (paint_document_get_undo_depth (doc), ==, PAINT_UNDO_MIN_STEPS);
+
+  paint_document_clear (doc);
+  g_assert_cmpuint (paint_document_get_undo_depth (doc), ==, PAINT_UNDO_MIN_STEPS);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_layers_alpha_lock_preserves_alpha (void)
+{
+  PaintDocument *doc = paint_document_new_transparent (40, 40);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->size = 10.0;
+  settings->brush_style = PAINT_BRUSH_PIXEL;
+
+  const PaintTool *brush = paint_tools_find ("brush");
+  const PaintTool *fill = paint_tools_find ("fill");
+  const PaintTool *eraser = paint_tools_find ("eraser");
+  const PaintTool *trans = paint_tools_find ("transparent");
+
+  /* Paint red square around (20,20), leaving (2,2) transparent */
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  paint_document_begin_stroke (doc, 20.0, 20.0, brush, settings);
+  paint_document_end_stroke (doc, 20.0, 20.0, brush, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (a, ==, 255);
+  read_pixel_rgba (doc, 2, 2, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+
+  paint_document_layer_set_alpha_lock (doc, 0, TRUE);
+  g_assert_true (paint_document_layer_get_alpha_lock (doc, 0));
+
+  /* Paint huge blue stroke over entire canvas; (2,2) must remain transparent while (20,20) turns blue */
+  settings->size = 40.0;
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  paint_document_begin_stroke (doc, 10.0, 10.0, brush, settings);
+  paint_document_end_stroke (doc, 20.0, 20.0, brush, settings);
+  read_pixel_rgba (doc, 2, 2, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  read_pixel_rgba (doc, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (b, ==, 255);
+  g_assert_cmpuint (a, ==, 255);
+
+  /* Flood fill green inside (20,20) updates color while preserving alpha */
+  settings->color = (GdkRGBA) { 0.0f, 1.0f, 0.0f, 1.0f };
+  paint_document_begin_stroke (doc, 20.0, 20.0, fill, settings);
+  paint_document_end_stroke (doc, 20.0, 20.0, fill, settings);
+  read_pixel_rgba (doc, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (a, ==, 255);
+
+  /* Eraser, transparent brush, and clear_transparent must not erase alpha when alpha_lock is TRUE */
+  paint_document_begin_stroke (doc, 20.0, 20.0, eraser, settings);
+  paint_document_end_stroke (doc, 20.0, 20.0, eraser, settings);
+  paint_document_begin_stroke (doc, 20.0, 20.0, trans, settings);
+  paint_document_end_stroke (doc, 20.0, 20.0, trans, settings);
+  paint_document_clear_transparent (doc);
+  read_pixel_rgba (doc, 20, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 255);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_layers_lock_flag_and_undo (void)
+{
+  PaintDocument *doc = paint_document_new (24, 24);
+  g_assert_false (paint_document_layer_get_locked (doc, 0));
+  g_assert_false (paint_document_has_layer_structure (doc));
+
+  paint_document_layer_set_locked (doc, 0, TRUE);
+  g_assert_true (paint_document_layer_get_locked (doc, 0));
+  g_assert_true (paint_document_has_layer_structure (doc));
+
+  paint_document_layer_set_alpha_lock (doc, 0, TRUE);
+  g_assert_true (paint_document_duplicate_layer (doc, 0));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 2);
+  g_assert_true (paint_document_layer_get_locked (doc, 1));
+  g_assert_true (paint_document_layer_get_alpha_lock (doc, 1));
+
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpint (paint_document_get_n_layers (doc), ==, 1);
+  g_assert_true (paint_document_undo (doc));
+  g_assert_false (paint_document_layer_get_alpha_lock (doc, 0));
+  g_assert_true (paint_document_undo (doc));
+  g_assert_false (paint_document_layer_get_locked (doc, 0));
+  g_assert_true (paint_document_redo (doc));
+  g_assert_true (paint_document_layer_get_locked (doc, 0));
+
+  paint_document_free (doc);
+}
+
+static void
+test_layers_add_from_surface_and_copy_merged (void)
+{
+  PaintDocument *doc = paint_document_new (32, 32);
+
+  cairo_surface_t *src = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 32, 32);
+  cairo_t *cr = cairo_create (src);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.0);
+  cairo_paint (cr);
+  cairo_set_source_rgba (cr, 1.0, 0.0, 0.0, 0.5);
+  cairo_rectangle (cr, 4, 4, 10, 10);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  int idx = paint_document_add_layer_from_surface (doc, "Imported", src);
+  cairo_surface_destroy (src);
+  g_assert_cmpint (idx, ==, 1);
+  g_assert_cmpstr (paint_document_layer_get_name (doc, 1), ==, "Imported");
+
+  /* Copy merged must combine white Background + 50% red layer */
+  cairo_surface_t *merged = paint_document_copy_merged_rect (doc, 4, 4, 10, 10);
+  g_assert_nonnull (merged);
+  cairo_surface_flush (merged);
+  const uint32_t *px = (const uint32_t *) cairo_image_surface_get_data (merged);
+  guint8 mr = (px[0] >> 16) & 0xFF;
+  guint8 mg = (px[0] >> 8) & 0xFF;
+  g_assert_cmpuint (mr, ==, 255);
+  g_assert_cmpuint (mg, >=, 120);
+  g_assert_cmpuint (mg, <=, 136);
+  cairo_surface_destroy (merged);
+
+  /* Solo visibility array toggles in one undo step */
+  const gboolean solo[2] = { FALSE, TRUE };
+  paint_document_set_layers_visibility (doc, solo, 2);
+  g_assert_false (paint_document_layer_get_visible (doc, 0));
+  g_assert_true (paint_document_layer_get_visible (doc, 1));
+  g_assert_true (paint_document_undo (doc));
+  g_assert_true (paint_document_layer_get_visible (doc, 0));
+
+  paint_document_free (doc);
+}
+
+static void
+test_ora_layer_locks_roundtrip (void)
+{
+  PaintDocument *doc = paint_document_new (20, 20);
+  paint_document_add_layer (doc, "LockedOverlay");
+  paint_document_layer_set_alpha_lock (doc, 0, TRUE);
+  paint_document_layer_set_locked (doc, 1, TRUE);
+
+  g_autoptr (GError) err = NULL;
+  g_autoptr (GBytes) ora = paint_io_encode_ora (doc, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (ora);
+
+  PaintDocument *reloaded = paint_io_load_ora_bytes (ora, NULL, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (reloaded);
+  g_assert_cmpint (paint_document_get_n_layers (reloaded), ==, 2);
+  g_assert_true (paint_document_layer_get_alpha_lock (reloaded, 0));
+  g_assert_false (paint_document_layer_get_locked (reloaded, 0));
+  g_assert_false (paint_document_layer_get_alpha_lock (reloaded, 1));
+  g_assert_true (paint_document_layer_get_locked (reloaded, 1));
+
+  paint_document_free (reloaded);
+  paint_document_free (doc);
+}
+
+static void
+test_fill_tolerance_and_sample_all_layers (void)
+{
+  PaintDocument *doc = paint_document_new (40, 40);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  const PaintTool *fill_tool = paint_tools_find ("fill");
+  g_assert_nonnull (fill_tool);
+
+  /* Paint left half light red (240, 40, 40), right half darker red (200, 40, 40) */
+  cairo_surface_t *setup = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 40, 40);
+  cairo_t *cr = cairo_create (setup);
+  cairo_set_source_rgb (cr, 240.0 / 255.0, 40.0 / 255.0, 40.0 / 255.0);
+  cairo_rectangle (cr, 0, 0, 20, 40);
+  cairo_fill (cr);
+  cairo_set_source_rgb (cr, 200.0 / 255.0, 40.0 / 255.0, 40.0 / 255.0);
+  cairo_rectangle (cr, 20, 0, 20, 40);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+  paint_document_blit_surface (doc, setup, 0, 0);
+  cairo_surface_destroy (setup);
+
+  /* Tolerance 0 only fills exact left half */
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  settings->fill_tolerance = 0;
+  paint_document_begin_stroke (doc, 5.0, 5.0, fill_tool, settings);
+  paint_document_end_stroke (doc, 5.0, 5.0, fill_tool, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (b, >, 240);
+  read_pixel_rgba (doc, 30, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (r, >, 190);
+  g_assert_cmpuint (b, <, 60);
+
+  /* Undo and fill with tolerance 60: crosses from 240 to 200 (diff 40 <= 60) */
+  g_assert_true (paint_document_undo (doc));
+  settings->fill_tolerance = 60;
+  paint_document_begin_stroke (doc, 5.0, 5.0, fill_tool, settings);
+  paint_document_end_stroke (doc, 5.0, 5.0, fill_tool, settings);
+  read_pixel_rgba (doc, 30, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (b, >, 240);
+
+  /* Now test sample_all_layers on an empty upper layer with an obstacle on bottom layer */
+  g_assert_true (paint_document_undo (doc));
+  cairo_surface_t *divider = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 4, 40);
+  cairo_t *cr2 = cairo_create (divider);
+  cairo_set_source_rgb (cr2, 0.0, 1.0, 0.0);
+  cairo_paint (cr2);
+  cairo_destroy (cr2);
+  paint_document_blit_surface (doc, divider, 18, 0);
+  cairo_surface_destroy (divider);
+
+  paint_document_add_layer (doc, "Top");
+  settings->fill_sample_all_layers = TRUE;
+  settings->fill_tolerance = 10;
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  paint_document_begin_stroke (doc, 5.0, 5.0, fill_tool, settings);
+  paint_document_end_stroke (doc, 5.0, 5.0, fill_tool, settings);
+
+  /* Top layer filled on left side (x=5), stopped at green divider on bottom layer (x=30 stays transparent on top) */
+  cairo_surface_t *top =
+      paint_document_layer_get_surface (doc, paint_document_get_active_layer (doc));
+  cairo_surface_flush (top);
+  int stride = cairo_image_surface_get_stride (top);
+  const guint8 *data = cairo_image_surface_get_data (top);
+  const guint8 *p_left = data + 10 * stride + 5 * 4;
+  const guint8 *p_right = data + 10 * stride + 30 * 4;
+  g_assert_cmpuint (p_left[3], ==, 255);
+  g_assert_cmpuint (p_left[0], >, 240);
+  g_assert_cmpuint (p_right[3], ==, 0);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_wand_mask_and_masked_selection_ops (void)
+{
+  PaintDocument *doc = paint_document_new (30, 30);
+  cairo_surface_t *patch = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 10, 10);
+  cairo_t *cr = cairo_create (patch);
+  cairo_set_source_rgb (cr, 1.0, 0.0, 0.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  paint_document_blit_surface (doc, patch, 6, 6);
+  cairo_surface_destroy (patch);
+
+  cairo_rectangle_int_t rect = { 0 };
+  cairo_surface_t *mask = paint_tools_build_wand_mask (
+      paint_document_get_surface (doc), 10, 10, 10, &rect);
+  g_assert_nonnull (mask);
+  g_assert_cmpint (rect.x, ==, 6);
+  g_assert_cmpint (rect.y, ==, 6);
+  g_assert_cmpint (rect.width, ==, 10);
+  g_assert_cmpint (rect.height, ==, 10);
+
+  cairo_surface_t *copied = paint_document_copy_masked_rect (doc, &rect, mask);
+  g_assert_nonnull (copied);
+  cairo_surface_flush (copied);
+  const guint8 *cpx = cairo_image_surface_get_data (copied);
+  int cstride = cairo_image_surface_get_stride (copied);
+  g_assert_cmpuint (cpx[2 * cstride + 2 * 4 + 2], >, 240); /* Red */
+
+  /* Clear masked rect and move scaled floating to (16, 16, 12x12) */
+  cairo_rectangle_int_t dst_rect = { 16, 16, 12, 12 };
+  paint_document_commit_move_masked (doc, &rect, mask, copied, &dst_rect);
+
+  guint8 r, g, b, a;
+  /* Original spot restored to white bg */
+  read_pixel_rgba (doc, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+  g_assert_cmpuint (b, ==, 255);
+  /* Scaled destination spot is red */
+  read_pixel_rgba (doc, 22, 22, &r, &g, &b, &a);
+  g_assert_cmpuint (r, >, 240);
+  g_assert_cmpuint (g, <, 20);
+
+  /* Clear masked rect helper on new 6x6 mask */
+  cairo_rectangle_int_t cr_rect = { 16, 16, 6, 6 };
+  cairo_surface_t *m2 = cairo_image_surface_create (CAIRO_FORMAT_A8, 6, 6);
+  cairo_t *mcr = cairo_create (m2);
+  cairo_set_source_rgba (mcr, 0, 0, 0, 1);
+  cairo_paint (mcr);
+  cairo_destroy (mcr);
+  paint_document_clear_masked_rect (doc, &cr_rect, m2);
+  read_pixel_rgba (doc, 18, 18, &r, &g, &b, &a);
+  g_assert_cmpuint (r, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+
+  cairo_surface_destroy (m2);
+  cairo_surface_destroy (copied);
+  cairo_surface_destroy (mask);
+  paint_document_free (doc);
+}
+
+static void
+test_gradient_and_retouch_tools (void)
+{
+  PaintDocument *doc = paint_document_new (60, 40);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  const PaintTool *grad = paint_tools_find ("gradient");
+  const PaintTool *blur = paint_tools_find ("blur");
+  const PaintTool *pix = paint_tools_find ("pixelate");
+  g_assert_nonnull (grad);
+  g_assert_nonnull (blur);
+  g_assert_nonnull (pix);
+
+  /* Linear gradient from red to blue */
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  settings->gradient_radial = FALSE;
+  paint_document_begin_stroke (doc, 5.0, 20.0, grad, settings);
+  paint_document_end_stroke (doc, 55.0, 20.0, grad, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 5, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (r, >, 230);
+  g_assert_cmpuint (b, <, 30);
+  read_pixel_rgba (doc, 55, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (b, >, 230);
+  g_assert_cmpuint (r, <, 30);
+  read_pixel_rgba (doc, 30, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (r, >, 90);
+  g_assert_cmpuint (b, >, 90);
+
+  /* Radial gradient on alpha-locked transparent layer */
+  int top_idx = paint_document_add_layer (doc, "Top");
+  cairo_surface_t *patch = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 20, 20);
+  cairo_t *tcr = cairo_create (patch);
+  cairo_set_source_rgba (tcr, 1, 1, 1, 1);
+  cairo_paint (tcr);
+  cairo_destroy (tcr);
+  paint_document_blit_surface (doc, patch, 10, 10);
+  cairo_surface_destroy (patch);
+
+  paint_document_layer_set_alpha_lock (doc, top_idx, TRUE);
+  settings->gradient_radial = TRUE;
+  paint_document_begin_stroke (doc, 20.0, 20.0, grad, settings);
+  paint_document_end_stroke (doc, 35.0, 20.0, grad, settings);
+
+  cairo_surface_t *top = paint_document_layer_get_surface (doc, top_idx);
+  cairo_surface_flush (top);
+  int stride = cairo_image_surface_get_stride (top);
+  const guint8 *px = cairo_image_surface_get_data (top);
+  g_assert_cmpuint (px[5 * stride + 5 * 4 + 3], ==, 0);     /* transparent stays transparent */
+  g_assert_cmpuint (px[20 * stride + 20 * 4 + 3], ==, 255); /* center opaque red */
+  g_assert_cmpuint (px[20 * stride + 20 * 4 + 2], >, 230);
+
+  /* Blur & Pixelate brush modify pixels cleanly while keeping alpha lock */
+  settings->size = 10.0;
+  paint_document_begin_stroke (doc, 20.0, 20.0, blur, settings);
+  paint_document_continue_stroke (doc, 24.0, 20.0, blur, settings);
+  paint_document_end_stroke (doc, 24.0, 20.0, blur, settings);
+  cairo_surface_flush (top);
+  g_assert_cmpuint (px[5 * stride + 5 * 4 + 3], ==, 0);
+
+  paint_document_begin_stroke (doc, 15.0, 15.0, pix, settings);
+  paint_document_end_stroke (doc, 25.0, 15.0, pix, settings);
+  cairo_surface_flush (top);
+  g_assert_cmpuint (px[5 * stride + 5 * 4 + 3], ==, 0);
+
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
+static void
+test_color_settings_and_multiline_text (void)
+{
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 0.0f, 1.0f, 0.0f, 1.0f };
+  paint_tool_settings_swap_colors (settings);
+  g_assert_cmpfloat (settings->color.green, >, 0.9f);
+  g_assert_cmpfloat (settings->secondary_color.red, >, 0.9f);
+
+  paint_tool_settings_reset_colors (settings);
+  g_assert_cmpfloat (settings->color.red, <, 0.05f);
+  g_assert_cmpfloat (settings->secondary_color.red, >, 0.95f);
+
+  /* Custom palette dedup + cap + remove */
+  for (int i = 0; i < PAINT_MAX_CUSTOM_COLORS + 3; i++) {
+    GdkRGBA c = { (float) i / 20.0f, 0.2f, 0.8f, 1.0f };
+    paint_tool_settings_add_custom_color (settings, &c);
+  }
+  g_assert_cmpint (settings->n_custom_colors, ==, PAINT_MAX_CUSTOM_COLORS);
+  paint_tool_settings_remove_custom_color (settings, 0);
+  g_assert_cmpint (settings->n_custom_colors, ==, PAINT_MAX_CUSTOM_COLORS - 1);
+
+  /* Multiline text with outline & bg pill */
+  PaintDocument *doc = paint_document_new (200, 100);
+  settings->color = (GdkRGBA) { 1.0f, 1.0f, 1.0f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 0.0f, 0.0f, 0.0f, 1.0f };
+  settings->text_font_size = 18.0;
+  settings->text_align = PANGO_ALIGN_CENTER;
+  settings->text_outline = TRUE;
+  settings->text_bg_pill = TRUE;
+  paint_document_draw_text (doc, 20.0, 20.0, "Line 1\nSecond Line", settings);
+
+  g_assert_true (paint_document_get_modified (doc));
+  g_assert_true (paint_document_can_undo (doc));
+  guint8 r, g, b, a;
+  /* Inside pill area near (25, 25) should have been painted dark pill color (background was white) */
+  read_pixel_rgba (doc, 25, 25, &r, &g, &b, &a);
+  g_assert_cmpuint (r, <, 128);
+
+  paint_document_free (doc);
+  paint_tool_settings_free (settings);
+}
+
+static void
+test_filters_invert_and_grayscale (void)
+{
+  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 20, 10);
+  cairo_t *cr = cairo_create (surf);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.0);
+  cairo_paint (cr);
+  /* Left half pure green (0,255,0,255); right half partial orange (255,100,0, ~128) */
+  cairo_set_source_rgba (cr, 0.0, 1.0, 0.0, 1.0);
+  cairo_rectangle (cr, 0, 0, 8, 10);
+  cairo_fill (cr);
+  cairo_set_source_rgba (cr, 1.0, 0.4, 0.0, 0.5);
+  cairo_rectangle (cr, 8, 0, 8, 10);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  /* Mask covers x=[2..6), y=[2..8) inside rect (2,2,8,6) */
+  cairo_rectangle_int_t rect = { 2, 2, 8, 6 };
+  cairo_surface_t *mask = cairo_image_surface_create (CAIRO_FORMAT_A8, 8, 6);
+  cairo_t *mcr = cairo_create (mask);
+  cairo_set_operator (mcr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (mcr, 0, 0, 0, 1);
+  cairo_rectangle (mcr, 0, 0, 4, 6);
+  cairo_fill (mcr);
+  cairo_destroy (mcr);
+
+  paint_filter_invert (surf, &rect, mask, FALSE);
+  cairo_surface_flush (surf);
+  int stride = cairo_image_surface_get_stride (surf);
+  const guint8 *data = cairo_image_surface_get_data (surf);
+
+  /* Inside masked rect (4,4): green (0,255,0) inverted -> magenta (255,0,255) */
+  const guint8 *in_px = data + 4 * stride + 4 * 4;
+  g_assert_cmpuint (in_px[0], ==, 255);
+  g_assert_cmpuint (in_px[1], ==, 0);
+  g_assert_cmpuint (in_px[2], ==, 255);
+  g_assert_cmpuint (in_px[3], ==, 255);
+
+  /* Outside mask at (0,0): still green */
+  const guint8 *out_px = data + 0 * stride + 0 * 4;
+  g_assert_cmpuint (out_px[0], ==, 0);
+  g_assert_cmpuint (out_px[1], ==, 255);
+  g_assert_cmpuint (out_px[2], ==, 0);
+
+  /* Transparent area at (18,5): stays transparent */
+  const guint8 *tr_px = data + 5 * stride + 18 * 4;
+  g_assert_cmpuint (tr_px[3], ==, 0);
+
+  /* Grayscale on unmasked full surface turns (0,0) green (0,255,0) into neutral grey (R==G==B ~182) */
+  paint_filter_grayscale (surf, NULL, NULL, FALSE);
+  cairo_surface_flush (surf);
+  g_assert_cmpuint (out_px[0], ==, out_px[1]);
+  g_assert_cmpuint (out_px[1], ==, out_px[2]);
+  g_assert_cmpuint (out_px[2], >, 170);
+  g_assert_cmpuint (out_px[2], <, 195);
+  /* Transparent edge remains alpha==0 */
+  g_assert_cmpuint (tr_px[3], ==, 0);
+
+  cairo_surface_destroy (mask);
+  cairo_surface_destroy (surf);
+}
+
+static void
+test_filters_brightness_contrast_and_hsl (void)
+{
+  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 16, 8);
+  cairo_t *cr = cairo_create (surf);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  /* Pure green left (0,8), mid grey right (8,8) */
+  cairo_set_source_rgba (cr, 0.0, 1.0, 0.0, 1.0);
+  cairo_rectangle (cr, 0, 0, 8, 8);
+  cairo_fill (cr);
+  cairo_set_source_rgba (cr, 0.5, 0.5, 0.5, 1.0);
+  cairo_rectangle (cr, 8, 0, 8, 8);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  /* Rotate green hue by +120 deg -> pure blue (0,0,255); gray stays neutral gray! */
+  paint_filter_hsl (surf, NULL, NULL, FALSE, 120.0, 0.5, 0.0);
+  cairo_surface_flush (surf);
+  int stride = cairo_image_surface_get_stride (surf);
+  const guint8 *data = cairo_image_surface_get_data (surf);
+  const guint8 *left = data + 4 * stride + 4 * 4;
+  const guint8 *right = data + 4 * stride + 12 * 4;
+  g_assert_cmpuint (left[0], >, 240);
+  g_assert_cmpuint (left[1], <, 15);
+  g_assert_cmpuint (left[2], <, 15);
+  g_assert_cmpuint (right[0], ==, right[1]);
+  g_assert_cmpuint (right[1], ==, right[2]);
+
+  /* Increase brightness +0.25 raises mid-gray luminance above 170 */
+  paint_filter_brightness_contrast (surf, NULL, NULL, FALSE, 0.25, 0.0);
+  cairo_surface_flush (surf);
+  g_assert_cmpuint (right[2], >, 170);
+
+  /* Contrast -1.0 flattens channels to middle gray (~128) */
+  paint_filter_brightness_contrast (surf, NULL, NULL, FALSE, 0.0, -1.0);
+  cairo_surface_flush (surf);
+  g_assert_cmpuint (left[0], >, 120);
+  g_assert_cmpuint (left[0], <, 136);
+  g_assert_cmpuint (left[2], >, 120);
+  g_assert_cmpuint (left[2], <, 136);
+
+  cairo_surface_destroy (surf);
+}
+
+static void
+test_filters_gaussian_blur_and_sharpen (void)
+{
+  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 32, 16);
+  cairo_t *cr = cairo_create (surf);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.0);
+  cairo_paint (cr);
+  /* White square [4..16), black square [16..28), transparent margin outside */
+  cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 1.0);
+  cairo_rectangle (cr, 4, 2, 12, 12);
+  cairo_fill (cr);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 1.0);
+  cairo_rectangle (cr, 16, 2, 12, 12);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  /* Blur with alpha_lock=TRUE blurs white/black seam at x=15..16 while keeping (0,0) alpha==0 and interior alpha==255 */
+  paint_filter_gaussian_blur (surf, NULL, NULL, TRUE, 4.0);
+  cairo_surface_flush (surf);
+  int stride = cairo_image_surface_get_stride (surf);
+  const guint8 *data = cairo_image_surface_get_data (surf);
+  g_assert_cmpuint (data[0 * stride + 0 * 4 + 3], ==, 0);
+  const guint8 *seam_l = data + 8 * stride + 15 * 4;
+  const guint8 *seam_r = data + 8 * stride + 16 * 4;
+  g_assert_cmpuint (seam_l[3], ==, 255);
+  g_assert_cmpuint (seam_r[3], ==, 255);
+  g_assert_cmpuint (seam_l[2], <, 240);
+  g_assert_cmpuint (seam_r[2], >, 15);
+
+  /* Sharpen widens contrast across blurred seam */
+  guint8 diff_before = (guint8) ABS ((int) seam_l[2] - (int) seam_r[2]);
+  paint_filter_sharpen (surf, NULL, NULL, FALSE, 1.5);
+  cairo_surface_flush (surf);
+  guint8 diff_after = (guint8) ABS ((int) seam_l[2] - (int) seam_r[2]);
+  g_assert_cmpuint (diff_after, >, diff_before);
+
+  cairo_surface_destroy (surf);
+}
+
+static void
+apply_test_invert_cb (cairo_surface_t *surf,
+                      const cairo_rectangle_int_t *rect,
+                      cairo_surface_t *mask,
+                      gboolean alpha_lock,
+                      gpointer user_data G_GNUC_UNUSED)
+{
+  paint_filter_invert (surf, rect, mask, alpha_lock);
+}
+
+static void
+test_filter_preview_cancel_and_commit_undo (void)
+{
+  PaintDocument *doc = paint_document_new (24, 24);
+  cairo_surface_t *patch = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 24, 24);
+  cairo_t *cr = cairo_create (patch);
+  cairo_set_source_rgb (cr, 1.0, 0.0, 0.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  paint_document_blit_surface (doc, patch, 0, 0);
+  cairo_surface_destroy (patch);
+
+  /* Test document-level backup/restore/commit unconditionally */
+  cairo_surface_t *backup = paint_document_dup_active_layer_surface (doc);
+  g_assert_nonnull (backup);
+  paint_filter_invert (paint_document_layer_get_surface (doc, 0), NULL, NULL, FALSE);
+  paint_document_notify_active_layer_rect_modified (doc, NULL);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (r, <, 15);
+  g_assert_cmpuint (b, >, 240);
+
+  /* Restore (cancel) restores red without touching undo depth */
+  guint depth_before = paint_document_get_undo_depth (doc);
+  paint_document_restore_active_layer_rect (doc, backup, NULL);
+  read_pixel_rgba (doc, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (r, >, 240);
+  g_assert_cmpuint (paint_document_get_undo_depth (doc), ==, depth_before);
+
+  /* Commit pushes exactly one undo step */
+  paint_filter_invert (paint_document_layer_get_surface (doc, 0), NULL, NULL, FALSE);
+  paint_document_commit_active_layer_from_backup (doc, backup, NULL);
+  cairo_surface_destroy (backup);
+  g_assert_cmpuint (paint_document_get_undo_depth (doc), ==, depth_before + 1);
+  g_assert_true (paint_document_undo (doc));
+  read_pixel_rgba (doc, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (r, >, 240);
+
+  /* Also test PaintCanvas live-preview API when display is available */
+  if (gtk_init_check ()) {
+    PaintToolSettings *settings = paint_tool_settings_new ();
+    PaintCanvas *canvas = paint_canvas_new (doc, settings);
+    g_object_ref_sink (canvas);
+    doc = NULL; /* canvas owns doc */
+
+    g_assert_true (paint_canvas_begin_filter_preview (canvas));
+    paint_canvas_update_filter_preview (canvas, apply_test_invert_cb, NULL);
+    read_pixel_rgba (paint_canvas_get_document (canvas), 10, 10, &r, &g, &b, &a);
+    g_assert_cmpuint (b, >, 240);
+
+    paint_canvas_cancel_filter_preview (canvas);
+    read_pixel_rgba (paint_canvas_get_document (canvas), 10, 10, &r, &g, &b, &a);
+    g_assert_cmpuint (r, >, 240);
+
+    g_assert_true (paint_canvas_apply_filter (canvas, apply_test_invert_cb, NULL));
+    read_pixel_rgba (paint_canvas_get_document (canvas), 10, 10, &r, &g, &b, &a);
+    g_assert_cmpuint (b, >, 240);
+    g_assert_true (paint_canvas_undo (canvas));
+    read_pixel_rgba (paint_canvas_get_document (canvas), 10, 10, &r, &g, &b, &a);
+    g_assert_cmpuint (r, >, 240);
+
+    g_object_unref (canvas);
+    paint_tool_settings_free (settings);
+  }
+  if (doc)
+    paint_document_free (doc);
+}
+
+static void
+test_document_trim_transparent (void)
+{
+  PaintDocument *doc = paint_document_new_transparent (50, 40);
+  /* Fully transparent document cannot be trimmed */
+  g_assert_false (paint_document_trim_transparent (doc));
+
+  /* Draw 12x10 opaque patch at (15, 12) */
+  cairo_surface_t *patch = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 12, 10);
+  cairo_t *cr = cairo_create (patch);
+  cairo_set_source_rgba (cr, 0.2, 0.6, 0.9, 1.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  paint_document_blit_surface (doc, patch, 15, 12);
+  cairo_surface_destroy (patch);
+
+  g_assert_true (paint_document_trim_transparent (doc));
+  g_assert_cmpint (paint_document_get_width (doc), ==, 12);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 10);
+  /* Trimming an already tight document returns FALSE */
+  g_assert_false (paint_document_trim_transparent (doc));
+
+  /* Undo restores original 50x40 dimensions */
+  g_assert_true (paint_document_undo (doc));
+  g_assert_cmpint (paint_document_get_width (doc), ==, 50);
+  g_assert_cmpint (paint_document_get_height (doc), ==, 40);
+
+  paint_document_free (doc);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1595,5 +2634,30 @@ main (int argc, char **argv)
   g_test_add_func ("/canvas/layers_reorder_duplicate_remove_merge_and_flatten", test_layers_reorder_duplicate_remove_merge_and_flatten);
   g_test_add_func ("/canvas/layers_transforms_affect_all_layers", test_layers_transforms_affect_all_layers);
   g_test_add_func ("/canvas/layers_per_layer_tiled_undo_and_names", test_layers_per_layer_tiled_undo_and_names);
+  g_test_add_func ("/canvas/ora_multilayer_roundtrip", test_ora_multilayer_roundtrip);
+  g_test_add_func ("/canvas/ora_deflate_external_compat", test_ora_deflate_external_compat);
+  g_test_add_func ("/canvas/export_jpeg_quality_and_matte", test_export_jpeg_quality_and_matte);
+  g_test_add_func ("/canvas/export_webp_and_bmp", test_export_webp_and_bmp);
+  g_test_add_func ("/canvas/undo_memory_budget_eviction", test_undo_memory_budget_eviction);
+  g_test_add_func ("/canvas/layers_alpha_lock_preserves_alpha", test_layers_alpha_lock_preserves_alpha);
+  g_test_add_func ("/canvas/layers_lock_flag_and_undo", test_layers_lock_flag_and_undo);
+  g_test_add_func ("/canvas/layers_add_from_surface_and_copy_merged", test_layers_add_from_surface_and_copy_merged);
+  g_test_add_func ("/canvas/ora_layer_locks_roundtrip", test_ora_layer_locks_roundtrip);
+  g_test_add_func ("/canvas/fill_tolerance_and_sample_all_layers",
+                   test_fill_tolerance_and_sample_all_layers);
+  g_test_add_func ("/canvas/wand_mask_and_masked_selection_ops",
+                   test_wand_mask_and_masked_selection_ops);
+  g_test_add_func ("/canvas/gradient_and_retouch_tools",
+                   test_gradient_and_retouch_tools);
+  g_test_add_func ("/canvas/color_settings_and_multiline_text",
+                   test_color_settings_and_multiline_text);
+  g_test_add_func ("/filters/invert_and_grayscale", test_filters_invert_and_grayscale);
+  g_test_add_func ("/filters/brightness_contrast_and_hsl",
+                   test_filters_brightness_contrast_and_hsl);
+  g_test_add_func ("/filters/gaussian_blur_and_sharpen",
+                   test_filters_gaussian_blur_and_sharpen);
+  g_test_add_func ("/canvas/filter_preview_cancel_and_commit_undo",
+                   test_filter_preview_cancel_and_commit_undo);
+  g_test_add_func ("/document/trim_transparent", test_document_trim_transparent);
   return g_test_run ();
 }

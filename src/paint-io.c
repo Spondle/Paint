@@ -6,6 +6,7 @@
 #include <string.h>
 
 #ifdef HAVE_LIBWEBP
+#include <webp/decode.h>
 #include <webp/encode.h>
 #endif
 
@@ -820,6 +821,57 @@ paint_io_is_ora_file (GFile *file)
  * Public Document Load / Save / Export
  * ============================================================================ */
 
+#ifdef HAVE_LIBWEBP
+static cairo_surface_t *
+decode_webp_surface_from_bytes (const guint8 *data, gsize len, GError **error)
+{
+  int w = 0, h = 0;
+  if (!data || len < 12 || !WebPGetInfo (data, (size_t) len, &w, &h) ||
+      w <= 0 || h <= 0 || w > 16384 || h > 16384) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                 _("Failed to decode WebP image"));
+    return NULL;
+  }
+
+  uint8_t *rgba = WebPDecodeRGBA (data, (size_t) len, &w, &h);
+  if (!rgba) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                 _("Failed to decode WebP image"));
+    return NULL;
+  }
+
+  cairo_surface_t *surf = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
+  if (cairo_surface_status (surf) != CAIRO_STATUS_SUCCESS) {
+    WebPFree (rgba);
+    cairo_surface_destroy (surf);
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                 _("Out of memory allocating image surface"));
+    return NULL;
+  }
+
+  cairo_surface_flush (surf);
+  unsigned char *dst = cairo_image_surface_get_data (surf);
+  int dst_stride = cairo_image_surface_get_stride (surf);
+  for (int y = 0; y < h; y++) {
+    const uint8_t *src_row = rgba + (size_t) y * (size_t) w * 4;
+    uint32_t *dst_row = (uint32_t *) (dst + (size_t) y * (size_t) dst_stride);
+    for (int x = 0; x < w; x++) {
+      uint8_t r = src_row[x * 4 + 0];
+      uint8_t g = src_row[x * 4 + 1];
+      uint8_t b = src_row[x * 4 + 2];
+      uint8_t a = src_row[x * 4 + 3];
+      uint32_t pr = (a == 255) ? r : (uint32_t) ((r * a + 127) / 255);
+      uint32_t pg = (a == 255) ? g : (uint32_t) ((g * a + 127) / 255);
+      uint32_t pb = (a == 255) ? b : (uint32_t) ((b * a + 127) / 255);
+      dst_row[x] = ((uint32_t) a << 24) | (pr << 16) | (pg << 8) | pb;
+    }
+  }
+  cairo_surface_mark_dirty (surf);
+  WebPFree (rgba);
+  return surf;
+}
+#endif
+
 PaintDocument *
 paint_document_new_from_file (GFile *file, GError **error)
 {
@@ -842,6 +894,12 @@ paint_document_new_from_file (GFile *file, GError **error)
     loaded = decode_png_surface_from_bytes (bytes, error);
     if (!loaded)
       return NULL;
+#ifdef HAVE_LIBWEBP
+  } else if (len >= 12 && memcmp (ptr, "RIFF", 4) == 0 && memcmp (ptr + 8, "WEBP", 4) == 0) {
+    loaded = decode_webp_surface_from_bytes (ptr, len, error);
+    if (!loaded)
+      return NULL;
+#endif
   } else {
     g_autoptr (GdkTexture) texture = gdk_texture_new_from_bytes (bytes, error);
     if (!texture)

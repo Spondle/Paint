@@ -67,7 +67,7 @@ sudo apt install ../paint_*.deb
 - [`meson.build`](meson.build) — Meson build configuration, `GResource` bundling, `gettext` (`po/`), unit tests, and install targets
 - [`src/main.c`](src/main.c) & [`src/paint-application.c`](src/paint-application.c) — `AdwApplication`, resources, preferences/tool settings sync, shortcuts, About dialog
 - [`src/paint-window.c`](src/paint-window.c) — `AdwApplicationWindow`, `AdwHeaderBar`, `AdwTabView` tear-off, `AdwTabOverview`, printing, menus, actions, and drag-and-drop
-- [`src/paint-canvas-page.c`](src/paint-canvas-page.c) — Scrollable/zoomable workspace, canvas edge resize handles, bottom-left coords HUD, Spacebar pan, context menu, and floating Adwaita OSD bars
+- [`src/paint-canvas-page.c`](src/paint-canvas-page.c) — Scrollable/zoomable workspace, canvas edge resize handles, top-left coords HUD, Spacebar pan, context menu, and floating Adwaita OSD bars
 - [`src/paint-canvas.c`](src/paint-canvas.c) — `PaintCanvas` widget: 2-tier viewport/overview cache, stylus pressure input, selection handles/masks, text overlay, and live filter preview sessions
 - [`src/paint-document.c`](src/paint-document.c) — `PaintDocument` multi-layer model, masked compositing, layer locks, memory-budgeted tiled undo/redo, and canvas transforms
 - [`src/paint-io.c`](src/paint-io.c) — GIO stream image codecs (`PNG`, `JPEG`, `WebP`, `BMP`) and pure-C `.ora` (OpenRaster) reader/writer

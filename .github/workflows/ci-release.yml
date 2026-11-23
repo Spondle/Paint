@@ -18,7 +18,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y gcc meson ninja-build gtk4-devel libadwaita-devel \
-            pango-devel appstream desktop-file-utils
+            libwebp-devel pango-devel appstream desktop-file-utils
 
       - name: Configure, build, and test
         run: |
@@ -58,7 +58,7 @@ jobs:
       - name: Install RPM build dependencies
         run: |
           dnf install -y rpm-build tar gcc meson ninja-build gtk4-devel \
-            libadwaita-devel cairo-devel pango-devel appstream \
+            libadwaita-devel cairo-devel pango-devel libwebp-devel appstream \
             desktop-file-utils
 
       - name: Build RPM packages
@@ -91,7 +91,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential debhelper \
             dpkg-dev meson ninja-build pkgconf libgtk-4-dev libadwaita-1-dev \
-            libcairo2-dev libpango1.0-dev appstream desktop-file-utils
+            libcairo2-dev libpango1.0-dev libwebp-dev appstream desktop-file-utils
 
       - name: Build Debian packages
         run: |

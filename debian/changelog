@@ -1,3 +1,15 @@
+paint (0.4.0-1) unstable; urgency=medium
+
+  * New upstream release:
+    - Add native OpenRaster (.ora) multi-layer import/export and Export dialog
+    - Add Alpha Lock, Layer Lock, drag reorder, Solo Layer, Copy Merged, and Import as Layer
+    - Add Ellipse/Lasso/Wand selections, Invert Selection, Tolerance Fill, Gradient, and Blur/Pixelate
+    - Add stylus pressure/eraser routing, direct multiline Text, and dual swatches with Custom Palette
+    - Add live-preview filters, Trim Transparent, top-left coords HUD, edge resize preview, and Print
+    - Modularize codebase with 256 MB memory-budgeted undo and atomic 30s autosave
+
+ -- spondle <noreply@example.invalid>  Mon, 23 Nov 2026 14:45:00 -0500
+
 paint (0.3.0-1) unstable; urgency=medium
 
   * New upstream release:

@@ -1,5 +1,5 @@
 Name:           paint
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Clean GNOME Paint application built with GTK 4 and Libadwaita
 
@@ -14,6 +14,7 @@ BuildRequires:  meson
 BuildRequires:  pkgconfig(cairo)
 BuildRequires:  pkgconfig(gtk4) >= 4.12
 BuildRequires:  pkgconfig(libadwaita-1) >= 1.6
+BuildRequires:  pkgconfig(libwebp)
 BuildRequires:  pkgconfig(pangocairo)
 
 Requires:       hicolor-icon-theme
@@ -48,6 +49,14 @@ appstreamcli validate --no-net %{buildroot}%{_datadir}/metainfo/io.github.spondl
 %{_datadir}/icons/hicolor/symbolic/apps/io.github.spondle.Paint-symbolic.svg
 
 %changelog
+* Mon Nov 23 2026 spondle <noreply@example.invalid> - 0.4.0-1
+- Add native OpenRaster (.ora) project support, Export Image dialog, and printing
+- Add Alpha Lock, Layer Lock, drag reorder, Solo Layer, Copy Merged, and Import as Layer
+- Add Ellipse/Lasso/Wand selections, Tolerance Fill, Gradient, and Blur/Pixelate brushes
+- Add stylus pressure/eraser routing, direct multiline Text, and dual swatches with Custom Palette
+- Add live-preview filters, Trim Transparent, top-left coords HUD, and edge resize preview
+- Modularize codebase with 256 MB memory-budgeted undo and atomic 30s autosave
+
 * Sat Nov 21 2026 spondle <noreply@example.invalid> - 0.3.0-1
 - Add multi-layer editing, blend modes, and collapsible Layers sidebar
 - Add Selection, Text, Eyedropper, Resize/Scale, Rotate/Flip, Fit to Window, and Pixel Grid tools

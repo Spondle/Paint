@@ -10,6 +10,7 @@ Build-Depends:
  libcairo2-dev,
  libgtk-4-dev (>= 4.12),
  libpango1.0-dev,
+ libwebp-dev,
  meson,
  pkgconf
 Standards-Version: 4.7.0

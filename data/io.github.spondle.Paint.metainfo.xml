@@ -43,6 +43,20 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.0" date="2026-11-23">
+      <description>
+        <p>OpenRaster layers, advanced tools, live filters, stylus input, and canvas UX upgrades:</p>
+        <ul>
+          <li>Native OpenRaster (.ora) project support, Export Image dialog (PNG, JPEG, WebP, BMP), and printing</li>
+          <li>Layer Alpha Lock, Layer Lock, drag-and-drop reordering, Solo Layer, Copy Merged, Paste as New Layer, and Import Image as Layer</li>
+          <li>Ellipse, Freehand Lasso, and Magic Wand selections, Invert Selection, and 8 interactive resize handles</li>
+          <li>Tolerance-aware Flood Fill with Sample All Layers, Linear/Radial Gradient (Transparent, Alpha Lock, and selection clipping), and Blur/Pixelate retouch brushes</li>
+          <li>Stylus pressure sensitivity and hardware eraser routing, dual Primary/Secondary swatches, Custom Palette, and direct on-canvas multiline Text editing</li>
+          <li>Live-preview Brightness &amp; Contrast, Hue &amp; Saturation, and Gaussian Blur filters plus Sharpen, Invert Colors, Grayscale, and Trim Transparent</li>
+          <li>Top-left coordinates HUD, Spacebar panning, right-click context menu, live edge resize preview, and memory-budgeted atomic autosave</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-11-21">
       <description>
         <p>Layers, customizable shortcuts, selection and text tools, and startup sizing controls:</p>

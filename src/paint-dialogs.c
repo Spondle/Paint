@@ -243,6 +243,14 @@ static void
 sync_export_rows_visibility (ExportDialogCtx *ctx)
 {
   guint fmt_idx = adw_combo_row_get_selected (ctx->format_row);
+  static const char *const fmt_subtitles[] = {
+    N_("Lossless compression with full alpha transparency"),
+    N_("Compact lossy format; transparent areas use matte color"),
+    N_("Modern web format with lossless or lossy transparency"),
+    N_("Uncompressed 24-bit bitmap image"),
+  };
+  if (fmt_idx < G_N_ELEMENTS (fmt_subtitles))
+    adw_action_row_set_subtitle (ADW_ACTION_ROW (ctx->format_row), _(fmt_subtitles[fmt_idx]));
   gboolean has_quality = (fmt_idx == 1 || fmt_idx == 2); /* JPEG / WebP */
   gboolean is_jpeg = (fmt_idx == 1);
   gtk_widget_set_visible (GTK_WIDGET (ctx->quality_row), has_quality);
@@ -375,7 +383,7 @@ paint_dialog_show_export (GtkWidget *parent,
 
   AdwDialog *dialog = adw_dialog_new ();
   adw_dialog_set_title (dialog, _("Export Image"));
-  adw_dialog_set_content_width (dialog, 360);
+  adw_dialog_set_content_width (dialog, 440);
 
   GtkWidget *toolbar = adw_toolbar_view_new ();
   GtkWidget *header = adw_header_bar_new ();
@@ -400,9 +408,9 @@ paint_dialog_show_export (GtkWidget *parent,
   GtkWidget *group = adw_preferences_group_new ();
 
   const char *fmt_labels[] = {
-    _("PNG (Lossless, Transparency)"),
-    _("JPEG (Compact Photo)"),
-    _("WebP (Modern, Transparency)"),
+    _("PNG (Lossless)"),
+    _("JPEG (Photo)"),
+    _("WebP (Modern)"),
     _("BMP (Uncompressed)"),
     NULL,
   };

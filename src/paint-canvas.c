@@ -139,6 +139,7 @@ struct _PaintCanvas {
   double text_x;
   double text_y;
   char *text_content;
+  int text_cursor_offset;
   int text_box_x;
   int text_box_y;
   int text_box_w;
@@ -1259,6 +1260,37 @@ update_canvas_cursor (PaintCanvas *self)
 }
 
 static void
+sync_gradient_clip_for_stroke (PaintCanvas *self, const PaintTool *tool)
+{
+  if (!self->settings)
+    return;
+  if (tool && g_strcmp0 (tool->id, "gradient") == 0 &&
+      self->has_selection && !self->floating_surface &&
+      self->sel_rect.width > 0 && self->sel_rect.height > 0) {
+    self->settings->stroke_has_clip = TRUE;
+    self->settings->stroke_clip_rect = self->sel_rect;
+    self->settings->stroke_clip_mask = self->sel_mask;
+  } else {
+    self->settings->stroke_has_clip = FALSE;
+    self->settings->stroke_clip_mask = NULL;
+  }
+}
+
+void
+paint_canvas_commit_overlays_for_tool (PaintCanvas *self, const char *tool_id)
+{
+  if (!self)
+    return;
+  if (g_strcmp0 (tool_id, "gradient") == 0 &&
+      self->has_selection && !self->floating_surface) {
+    if (self->text_active)
+      paint_canvas_commit_text (self);
+    return;
+  }
+  paint_canvas_commit_active_overlays (self);
+}
+
+static void
 paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
 {
   PaintCanvas *self = PAINT_CANVAS (widget);
@@ -1384,6 +1416,8 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     double x1 = self->preview_end_x;
     double y1 = self->preview_end_y;
 
+    sync_gradient_clip_for_stroke (self, active_tool);
+
     int rx, ry, rw, rh;
     paint_document_compute_tool_stroke_bounds (active_tool, self->settings,
                                                x0, y0, x1, y1,
@@ -1415,7 +1449,22 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       if (div > 1)
         cairo_scale (cr, 1.0 / (double) div, 1.0 / (double) div);
       cairo_translate (cr, -(double) ax0, -(double) ay0);
+
+      gboolean prev_alock = self->settings->target_alpha_lock;
+      self->settings->target_alpha_lock = FALSE;
       active_tool->draw_preview (active_tool, cr, x0, y0, x1, y1, self->settings);
+      self->settings->target_alpha_lock = prev_alock;
+
+      int active_idx = paint_document_get_active_layer (self->document);
+      if (paint_document_layer_get_alpha_lock (self->document, active_idx)) {
+        cairo_surface_t *active_surf =
+            paint_document_layer_get_surface (self->document, active_idx);
+        if (active_surf) {
+          cairo_set_operator (cr, CAIRO_OPERATOR_DEST_IN);
+          cairo_set_source_surface (cr, active_surf, 0.0, 0.0);
+          cairo_paint (cr);
+        }
+      }
       cairo_destroy (cr);
 
       cairo_surface_flush (psurf);
@@ -1441,11 +1490,52 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       if (div > 1)
         gtk_snapshot_pop (snapshot);
     }
+    self->settings->stroke_has_clip = FALSE;
+    self->settings->stroke_clip_mask = NULL;
+
+    if (g_strcmp0 (active_tool->id, "gradient") == 0) {
+      double gx0 = x0 * self->zoom;
+      double gy0 = y0 * self->zoom;
+      double gx1 = x1 * self->zoom;
+      double gy1 = y1 * self->zoom;
+      float bx0 = (float) MIN (gx0, gx1) - 10.0f;
+      float by0 = (float) MIN (gy0, gy1) - 10.0f;
+      float bw = (float) fabs (gx1 - gx0) + 20.0f;
+      float bh = (float) fabs (gy1 - gy0) + 20.0f;
+      cairo_t *gcr = gtk_snapshot_append_cairo (snapshot, &GRAPHENE_RECT_INIT (bx0, by0, bw, bh));
+      cairo_set_line_width (gcr, 2.5);
+      cairo_set_source_rgba (gcr, 1.0, 1.0, 1.0, 0.85);
+      cairo_move_to (gcr, gx0, gy0);
+      cairo_line_to (gcr, gx1, gy1);
+      cairo_stroke (gcr);
+
+      static const double gd[] = { 4.0, 4.0 };
+      cairo_set_line_width (gcr, 1.25);
+      cairo_set_dash (gcr, gd, 2, 0.0);
+      cairo_set_source_rgba (gcr, 0.05, 0.05, 0.05, 0.9);
+      cairo_move_to (gcr, gx0, gy0);
+      cairo_line_to (gcr, gx1, gy1);
+      cairo_stroke (gcr);
+      cairo_set_dash (gcr, NULL, 0, 0.0);
+
+      cairo_arc (gcr, gx0, gy0, 4.0, 0.0, 2.0 * G_PI);
+      cairo_set_source_rgba (gcr, 1.0, 1.0, 1.0, 0.95);
+      cairo_fill_preserve (gcr);
+      cairo_set_source_rgba (gcr, 0.11, 0.44, 0.96, 0.95);
+      cairo_stroke (gcr);
+
+      cairo_arc (gcr, gx1, gy1, 4.0, 0.0, 2.0 * G_PI);
+      cairo_set_source_rgba (gcr, 1.0, 1.0, 1.0, 0.95);
+      cairo_fill_preserve (gcr);
+      cairo_set_source_rgba (gcr, 0.11, 0.44, 0.96, 0.95);
+      cairo_stroke (gcr);
+      cairo_destroy (gcr);
+    }
   }
 
   if (self->text_active && self->settings) {
     update_text_bounds (self);
-    float pad = 8.0f;
+    float pad = 12.0f;
     float bx0 = (float) (self->text_box_x * self->zoom) - pad;
     float by0 = (float) (self->text_box_y * self->zoom) - pad;
     float bw = (float) (self->text_box_w * self->zoom) + pad * 2.0f;
@@ -1458,6 +1548,47 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     paint_document_render_text_layout (cr, self->text_x, self->text_y, self->text_content,
                                        self->settings, TRUE, NULL, NULL, NULL, NULL);
     cairo_restore (cr);
+
+    PangoLayout *clayout = pango_cairo_create_layout (cr);
+    PangoContext *cpctx = pango_layout_get_context (clayout);
+    pango_cairo_context_set_resolution (cpctx, 96.0);
+    cairo_font_options_t *cfopt = cairo_font_options_create ();
+    cairo_font_options_set_hint_metrics (cfopt, CAIRO_HINT_METRICS_OFF);
+    pango_cairo_context_set_font_options (cpctx, cfopt);
+    cairo_font_options_destroy (cfopt);
+
+    const char *txt = self->text_content ? self->text_content : "";
+    int byte_len = (int) strlen (txt);
+    int cur = CLAMP (self->text_cursor_offset, 0, byte_len);
+    pango_layout_set_text (clayout, txt, -1);
+    pango_layout_set_alignment (clayout, self->settings->text_align);
+
+    PangoFontDescription *desc = pango_font_description_new ();
+    const char *fam = (self->settings->text_font_family && *self->settings->text_font_family)
+                        ? self->settings->text_font_family
+                        : "Sans";
+    pango_font_description_set_family (desc, fam);
+    pango_font_description_set_weight (desc, self->settings->text_bold ? PANGO_WEIGHT_BOLD
+                                                                       : PANGO_WEIGHT_NORMAL);
+    pango_font_description_set_style (desc, self->settings->text_italic ? PANGO_STYLE_ITALIC
+                                                                        : PANGO_STYLE_NORMAL);
+    double px_size = MAX (6.0, self->settings->text_font_size);
+    pango_font_description_set_absolute_size (desc, px_size * PANGO_SCALE);
+    pango_layout_set_font_description (clayout, desc);
+    pango_font_description_free (desc);
+
+    PangoRectangle strong_pos = { 0 };
+    pango_layout_get_cursor_pos (clayout, cur, &strong_pos, NULL);
+    g_object_unref (clayout);
+
+    double cx = (self->text_x + (double) strong_pos.x / PANGO_SCALE) * self->zoom;
+    double cy = (self->text_y + (double) strong_pos.y / PANGO_SCALE) * self->zoom;
+    double ch = (strong_pos.height > 0 ? (double) strong_pos.height / PANGO_SCALE : px_size) * self->zoom;
+    cairo_set_line_width (cr, 1.5);
+    cairo_set_source_rgba (cr, 0.11, 0.44, 0.96, 0.95);
+    cairo_move_to (cr, floor (cx) + 0.5, cy);
+    cairo_line_to (cr, floor (cx) + 0.5, cy + ch);
+    cairo_stroke (cr);
 
     double gx = floor (self->text_box_x * self->zoom) - 2.5;
     double gy = floor (self->text_box_y * self->zoom) - 2.5;
@@ -1613,7 +1744,7 @@ paint_canvas_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     cairo_destroy (cr);
   }
 
-  if (self->has_hover) {
+  if (self->has_hover && !self->pan_override_active) {
     double px = self->hover_x * self->zoom;
     double py = self->hover_y * self->zoom;
     if (eyedropper_active_mode) {
@@ -1812,7 +1943,6 @@ on_drag_begin (GtkGestureDrag *gesture,
   if (!is_touch)
     gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 
-  gtk_widget_grab_focus (GTK_WIDGET (self));
   self->drawing_active = TRUE;
   self->touch_stroke_pending = is_touch;
   self->drag_start_x = start_x;
@@ -1835,7 +1965,18 @@ on_drag_begin (GtkGestureDrag *gesture,
 
   const PaintTool *tool = resolve_stroke_tool (self, GTK_GESTURE (gesture), TRUE);
   GdkModifierType state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
-  if (g_strcmp0 (tool->id, "eyedropper") == 0 || (state & GDK_ALT_MASK) || self->alt_held) {
+  gboolean eyedropper_override =
+      (g_strcmp0 (tool->id, "eyedropper") == 0 || (state & GDK_ALT_MASK) || self->alt_held);
+  gboolean hit_active_text =
+      !eyedropper_override &&
+      g_strcmp0 (tool->id, "text") == 0 &&
+      self->text_active &&
+      cx >= self->text_box_x - 10 && cx <= self->text_box_x + self->text_box_w + 10 &&
+      cy >= self->text_box_y - 10 && cy <= self->text_box_y + self->text_box_h + 10;
+  if (!hit_active_text)
+    gtk_widget_grab_focus (GTK_WIDGET (self));
+
+  if (eyedropper_override) {
     self->eyedropper_active = TRUE;
     self->touch_stroke_pending = FALSE;
     sample_color_at (self, cx, cy);
@@ -1950,14 +2091,13 @@ on_drag_begin (GtkGestureDrag *gesture,
     self->touch_stroke_pending = FALSE;
     if (self->has_selection)
       paint_canvas_commit_selection (self);
-    if (self->text_active &&
-        cx >= self->text_box_x - 10 && cx <= self->text_box_x + self->text_box_w + 10 &&
-        cy >= self->text_box_y - 10 && cy <= self->text_box_y + self->text_box_h + 10) {
+    if (hit_active_text) {
       self->text_dragging = TRUE;
       self->text_drag_anchor_x = cx;
       self->text_drag_anchor_y = cy;
       self->text_drag_orig_x = self->text_x;
       self->text_drag_orig_y = self->text_y;
+      g_signal_emit (self, signals[SIGNAL_TEXT_STATE_CHANGED], 0);
     } else {
       if (self->text_active)
         paint_canvas_commit_text (self);
@@ -1966,6 +2106,7 @@ on_drag_begin (GtkGestureDrag *gesture,
       self->text_y = CLAMP (cy, 0.0, (double) self->document->height);
       g_free (self->text_content);
       self->text_content = g_strdup ("");
+      self->text_cursor_offset = 0;
       update_text_bounds (self);
       g_signal_emit (self, signals[SIGNAL_TEXT_STATE_CHANGED], 0);
       gtk_widget_queue_draw (GTK_WIDGET (self));
@@ -1974,7 +2115,7 @@ on_drag_begin (GtkGestureDrag *gesture,
   }
 
   if (!is_touch) {
-    paint_canvas_commit_active_overlays (self);
+    paint_canvas_commit_overlays_for_tool (self, tool ? tool->id : NULL);
     paint_document_begin_stroke (self->document, cx, cy, tool, self->settings);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     if (!tool->draw_preview)
@@ -2087,7 +2228,7 @@ on_drag_update (GtkGestureDrag *gesture,
     if (hypot (offset_x, offset_y) < 6.0)
       return;
     self->touch_stroke_pending = FALSE;
-    paint_canvas_commit_active_overlays (self);
+    paint_canvas_commit_overlays_for_tool (self, tool ? tool->id : NULL);
     paint_document_begin_stroke (self->document,
                                  self->drag_start_x / self->zoom,
                                  self->drag_start_y / self->zoom,
@@ -2273,7 +2414,7 @@ on_drag_end (GtkGestureDrag *gesture,
 
   if (self->touch_stroke_pending) {
     self->touch_stroke_pending = FALSE;
-    paint_canvas_commit_active_overlays (self);
+    paint_canvas_commit_overlays_for_tool (self, tool ? tool->id : NULL);
     paint_document_begin_stroke (self->document,
                                  self->drag_start_x / self->zoom,
                                  self->drag_start_y / self->zoom,
@@ -2309,9 +2450,13 @@ on_drag_end (GtkGestureDrag *gesture,
   self->shape_shift_x = 0.0;
   self->shape_shift_y = 0.0;
 
+  sync_gradient_clip_for_stroke (self, tool);
   paint_document_end_stroke (self->document, cx, cy, tool, self->settings);
-  if (self->settings)
+  if (self->settings) {
+    self->settings->stroke_has_clip = FALSE;
+    self->settings->stroke_clip_mask = NULL;
     self->settings->stroke_pressure = 1.0;
+  }
   self->stylus_override_tool = NULL;
   if (g_strcmp0 (tool->id, "eraser") != 0 && !tool->is_transparency && !tool->is_retouch)
     paint_tool_settings_add_recent_color (self->settings, &self->settings->color);
@@ -3202,6 +3347,18 @@ paint_canvas_set_active_text (PaintCanvas *self, const char *text)
 }
 
 void
+paint_canvas_set_active_text_cursor (PaintCanvas *self, int byte_offset)
+{
+  if (!self || !self->text_active)
+    return;
+  int clamped = MAX (0, byte_offset);
+  if (self->text_cursor_offset == clamped)
+    return;
+  self->text_cursor_offset = clamped;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+void
 paint_canvas_commit_text (PaintCanvas *self)
 {
   if (!self || !self->text_active)
@@ -3221,6 +3378,7 @@ paint_canvas_commit_text (PaintCanvas *self)
 
   self->text_active = FALSE;
   self->text_dragging = FALSE;
+  self->text_cursor_offset = 0;
   g_clear_pointer (&self->text_content, g_free);
   gtk_widget_queue_draw (GTK_WIDGET (self));
   g_signal_emit (self, signals[SIGNAL_TEXT_STATE_CHANGED], 0);
@@ -3235,6 +3393,7 @@ paint_canvas_cancel_text (PaintCanvas *self)
     return;
   self->text_active = FALSE;
   self->text_dragging = FALSE;
+  self->text_cursor_offset = 0;
   g_clear_pointer (&self->text_content, g_free);
   gtk_widget_queue_draw (GTK_WIDGET (self));
   g_signal_emit (self, signals[SIGNAL_TEXT_STATE_CHANGED], 0);

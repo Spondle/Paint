@@ -67,12 +67,14 @@ struct _PaintCanvasPage {
   GtkWidget *brush_style_btns[3];
   GtkWidget *selection_bar;
   GtkWidget *fill_options_bar;
+  GtkAdjustment *fill_tol_adj;
   GtkWidget *fill_tol_scale;
-  GtkWidget *fill_tol_label;
+  GtkWidget *fill_tol_spin;
   GtkWidget *fill_sample_all_btn;
   GtkWidget *gradient_bar;
   GtkWidget *gradient_linear_btn;
   GtkWidget *gradient_radial_btn;
+  GtkWidget *gradient_fade_btn;
   GtkWidget *text_bar;
   GtkWidget *text_view;
   GtkTextBuffer *text_buffer;
@@ -83,6 +85,7 @@ struct _PaintCanvasPage {
   GtkWidget *text_align_btns[3];
   GtkWidget *text_outline_btn;
   GtkWidget *text_bg_pill_btn;
+  GtkWidget *resize_preview_overlay;
   GtkWidget *coords_hud;
   GtkWidget *context_menu;
   GHashTable *tool_buttons; /* char* -> GtkToggleButton* */
@@ -406,7 +409,7 @@ on_tool_toggled (GtkToggleButton *btn, gpointer user_data)
   const char *tool_id = g_object_get_data (G_OBJECT (btn), "paint-tool-id");
   if (tool_id) {
     if (g_strcmp0 (self->settings->active_tool_id, tool_id) != 0)
-      paint_canvas_commit_active_overlays (self->canvas);
+      paint_canvas_commit_overlays_for_tool (self->canvas, tool_id);
     if (g_strcmp0 (tool_id, "eyedropper") == 0 &&
         self->settings->active_tool_id &&
         g_strcmp0 (self->settings->active_tool_id, "eyedropper") != 0) {
@@ -1050,12 +1053,14 @@ sync_overlay_bars (PaintCanvasPage *self)
                        (g_strcmp0 (tid, "fill") == 0 ||
                         g_strcmp0 (tid, "transparent-fill") == 0 ||
                         g_strcmp0 (tid, "select-wand") == 0);
-  gboolean show_grad = !has_text && !has_sel && (g_strcmp0 (tid, "gradient") == 0);
+  gboolean show_grad = !has_text && (g_strcmp0 (tid, "gradient") == 0);
 
+  if (self->text_view)
+    gtk_widget_set_visible (self->text_view, has_text);
   if (self->text_bar)
     gtk_widget_set_visible (self->text_bar, has_text);
   if (self->selection_bar)
-    gtk_widget_set_visible (self->selection_bar, !has_text && has_sel);
+    gtk_widget_set_visible (self->selection_bar, !has_text && has_sel && !show_grad);
   if (self->fill_options_bar)
     gtk_widget_set_visible (self->fill_options_bar, show_fill);
   if (self->gradient_bar)
@@ -1098,17 +1103,52 @@ on_canvas_selection_changed (PaintCanvas *canvas G_GNUC_UNUSED, gpointer user_da
 }
 
 static void
+sync_text_cursor_offset (PaintCanvasPage *self)
+{
+  if (!self || !self->text_buffer || !self->canvas)
+    return;
+  int char_off = 0;
+  g_object_get (self->text_buffer, "cursor-position", &char_off, NULL);
+  GtkTextIter start, cur;
+  gtk_text_buffer_get_start_iter (self->text_buffer, &start);
+  gtk_text_buffer_get_iter_at_offset (self->text_buffer, &cur, char_off);
+  g_autofree char *before = gtk_text_buffer_get_text (self->text_buffer, &start, &cur, TRUE);
+  paint_canvas_set_active_text_cursor (self->canvas, before ? (int) strlen (before) : 0);
+}
+
+static void
+on_text_cursor_position_changed (GObject *obj G_GNUC_UNUSED,
+                                 GParamSpec *pspec G_GNUC_UNUSED,
+                                 gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  sync_text_cursor_offset (self);
+}
+
+static void
 on_canvas_text_state_changed (PaintCanvas *canvas, gpointer user_data)
 {
   PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
   gboolean active = paint_canvas_has_active_text (canvas);
   sync_overlay_bars (self);
   if (active && self->text_buffer && self->text_view) {
-    self->syncing = TRUE;
-    gtk_text_buffer_set_text (self->text_buffer, paint_canvas_get_active_text (canvas), -1);
-    self->syncing = FALSE;
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds (self->text_buffer, &start, &end);
+    g_autofree char *cur_txt = gtk_text_buffer_get_text (self->text_buffer, &start, &end, FALSE);
+    const char *active_txt = paint_canvas_get_active_text (canvas);
+    if (g_strcmp0 (cur_txt, active_txt) != 0) {
+      self->syncing = TRUE;
+      gtk_text_buffer_set_text (self->text_buffer, active_txt ? active_txt : "", -1);
+      self->syncing = FALSE;
+    }
+    sync_text_cursor_offset (self);
+    gtk_widget_set_visible (self->text_view, TRUE);
     gtk_widget_grab_focus (self->text_view);
   } else if (!active && self->canvas) {
+    if (self->text_view)
+      gtk_widget_set_visible (self->text_view, FALSE);
     gtk_widget_grab_focus (GTK_WIDGET (self->canvas));
   }
 }
@@ -1123,6 +1163,7 @@ on_text_buffer_changed (GtkTextBuffer *buffer, gpointer user_data)
   gtk_text_buffer_get_bounds (buffer, &start, &end);
   g_autofree char *txt = gtk_text_buffer_get_text (buffer, &start, &end, FALSE);
   paint_canvas_set_active_text (self->canvas, txt);
+  sync_text_cursor_offset (self);
 }
 
 static gboolean
@@ -1146,6 +1187,13 @@ on_text_view_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
 }
 
 static void
+refocus_text_view_if_active (PaintCanvasPage *self)
+{
+  if (self->canvas && self->text_view && paint_canvas_has_active_text (self->canvas))
+    gtk_widget_grab_focus (self->text_view);
+}
+
+static void
 on_text_font_desc_changed (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpointer user_data)
 {
   PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
@@ -1155,6 +1203,7 @@ on_text_font_desc_changed (GObject *obj, GParamSpec *pspec G_GNUC_UNUSED, gpoint
   const char *family = desc ? pango_font_description_get_family (desc) : "Sans";
   paint_tool_settings_set_text_font_family (self->settings, family);
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+  refocus_text_view_if_active (self);
 }
 
 static void
@@ -1175,6 +1224,7 @@ on_text_bold_toggled (GtkToggleButton *btn, gpointer user_data)
     return;
   self->settings->text_bold = gtk_toggle_button_get_active (btn);
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+  refocus_text_view_if_active (self);
 }
 
 static void
@@ -1185,6 +1235,7 @@ on_text_italic_toggled (GtkToggleButton *btn, gpointer user_data)
     return;
   self->settings->text_italic = gtk_toggle_button_get_active (btn);
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+  refocus_text_view_if_active (self);
 }
 
 static void
@@ -1196,6 +1247,7 @@ on_text_align_toggled (GtkToggleButton *btn, gpointer user_data)
   int al = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (btn), "paint-text-align"));
   self->settings->text_align = (PangoAlignment) CLAMP (al, 0, 2);
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+  refocus_text_view_if_active (self);
 }
 
 static void
@@ -1206,6 +1258,7 @@ on_text_outline_toggled (GtkToggleButton *btn, gpointer user_data)
     return;
   self->settings->text_outline = gtk_toggle_button_get_active (btn);
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+  refocus_text_view_if_active (self);
 }
 
 static void
@@ -1216,19 +1269,17 @@ on_text_bg_pill_toggled (GtkToggleButton *btn, gpointer user_data)
     return;
   self->settings->text_bg_pill = gtk_toggle_button_get_active (btn);
   gtk_widget_queue_draw (GTK_WIDGET (self->canvas));
+  refocus_text_view_if_active (self);
 }
 
 static void
-on_fill_tol_changed (GtkRange *range, gpointer user_data)
+on_fill_tol_changed (GtkAdjustment *adj, gpointer user_data)
 {
   PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
   if (self->syncing)
     return;
-  int val = (int) lround (gtk_range_get_value (range));
+  int val = (int) lround (gtk_adjustment_get_value (adj));
   self->settings->fill_tolerance = CLAMP (val, 0, 255);
-  g_autofree char *lbl = g_strdup_printf ("%d", self->settings->fill_tolerance);
-  if (self->fill_tol_label)
-    gtk_label_set_text (GTK_LABEL (self->fill_tol_label), lbl);
 }
 
 static void
@@ -1248,6 +1299,15 @@ on_gradient_mode_toggled (GtkToggleButton *btn, gpointer user_data)
     return;
   self->settings->gradient_radial = (GTK_WIDGET (btn) == self->gradient_radial_btn);
   sync_gradient_icon (self);
+}
+
+static void
+on_gradient_fade_toggled (GtkToggleButton *btn, gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (self->syncing)
+    return;
+  self->settings->gradient_fade_transparent = gtk_toggle_button_get_active (btn);
 }
 
 static GtkWidget *
@@ -1315,18 +1375,22 @@ build_fill_options_bar (PaintCanvasPage *self)
   gtk_widget_add_css_class (tol_lbl, "paint-dim-label");
   gtk_box_append (GTK_BOX (bar), tol_lbl);
 
-  self->fill_tol_scale = gtk_scale_new_with_range (GTK_ORIENTATION_HORIZONTAL, 0.0, 255.0, 1.0);
-  gtk_widget_set_size_request (self->fill_tol_scale, 130, -1);
+  self->fill_tol_adj = gtk_adjustment_new ((double) self->settings->fill_tolerance,
+                                           0.0, 255.0, 1.0, 10.0, 0.0);
+  g_signal_connect (self->fill_tol_adj, "value-changed", G_CALLBACK (on_fill_tol_changed), self);
+
+  self->fill_tol_scale = gtk_scale_new (GTK_ORIENTATION_HORIZONTAL, self->fill_tol_adj);
+  gtk_widget_set_size_request (self->fill_tol_scale, 180, -1);
   gtk_scale_set_draw_value (GTK_SCALE (self->fill_tol_scale), FALSE);
-  gtk_range_set_value (GTK_RANGE (self->fill_tol_scale), (double) self->settings->fill_tolerance);
-  g_signal_connect (self->fill_tol_scale, "value-changed", G_CALLBACK (on_fill_tol_changed), self);
+  gtk_range_set_round_digits (GTK_RANGE (self->fill_tol_scale), 0);
   gtk_box_append (GTK_BOX (bar), self->fill_tol_scale);
 
-  g_autofree char *val_str = g_strdup_printf ("%d", self->settings->fill_tolerance);
-  self->fill_tol_label = gtk_label_new (val_str);
-  gtk_widget_add_css_class (self->fill_tol_label, "paint-color-alpha-label");
-  gtk_label_set_xalign (GTK_LABEL (self->fill_tol_label), 1.0f);
-  gtk_box_append (GTK_BOX (bar), self->fill_tol_label);
+  self->fill_tol_spin = gtk_spin_button_new (self->fill_tol_adj, 1.0, 0);
+  gtk_spin_button_set_numeric (GTK_SPIN_BUTTON (self->fill_tol_spin), TRUE);
+  gtk_editable_set_width_chars (GTK_EDITABLE (self->fill_tol_spin), 3);
+  gtk_editable_set_max_width_chars (GTK_EDITABLE (self->fill_tol_spin), 3);
+  gtk_widget_set_tooltip_text (self->fill_tol_spin, _("Fill Color Tolerance (0–255)"));
+  gtk_box_append (GTK_BOX (bar), self->fill_tol_spin);
 
   gtk_box_append (GTK_BOX (bar), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
 
@@ -1379,6 +1443,18 @@ build_gradient_bar (PaintCanvasPage *self)
 
   gtk_box_append (GTK_BOX (bar), self->gradient_linear_btn);
   gtk_box_append (GTK_BOX (bar), self->gradient_radial_btn);
+
+  gtk_box_append (GTK_BOX (bar), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
+
+  self->gradient_fade_btn = gtk_toggle_button_new_with_label (_("Transparent"));
+  gtk_widget_add_css_class (self->gradient_fade_btn, "flat");
+  gtk_widget_set_tooltip_text (self->gradient_fade_btn,
+                               _("Fade from Primary Color to Transparent"));
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (self->gradient_fade_btn),
+                                self->settings->gradient_fade_transparent);
+  g_signal_connect (self->gradient_fade_btn, "toggled",
+                    G_CALLBACK (on_gradient_fade_toggled), self);
+  gtk_box_append (GTK_BOX (bar), self->gradient_fade_btn);
   return bar;
 }
 
@@ -1392,29 +1468,6 @@ build_text_bar (PaintCanvasPage *self)
   gtk_widget_set_valign (bar, GTK_ALIGN_END);
   gtk_widget_set_margin_bottom (bar, 68);
   gtk_widget_set_visible (bar, FALSE);
-
-  GtkWidget *tscroll = gtk_scrolled_window_new ();
-  gtk_widget_add_css_class (tscroll, "paint-text-view-scroll");
-  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (tscroll),
-                                  GTK_POLICY_NEVER,
-                                  GTK_POLICY_AUTOMATIC);
-  gtk_scrolled_window_set_min_content_width (GTK_SCROLLED_WINDOW (tscroll), 170);
-  gtk_scrolled_window_set_min_content_height (GTK_SCROLLED_WINDOW (tscroll), 28);
-  gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (tscroll), 64);
-  gtk_scrolled_window_set_propagate_natural_height (GTK_SCROLLED_WINDOW (tscroll), TRUE);
-
-  self->text_view = gtk_text_view_new ();
-  gtk_text_view_set_wrap_mode (GTK_TEXT_VIEW (self->text_view), GTK_WRAP_WORD_CHAR);
-  gtk_text_view_set_accepts_tab (GTK_TEXT_VIEW (self->text_view), FALSE);
-  self->text_buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (self->text_view));
-  g_signal_connect (self->text_buffer, "changed", G_CALLBACK (on_text_buffer_changed), self);
-
-  GtkEventController *tkey = gtk_event_controller_key_new ();
-  g_signal_connect (tkey, "key-pressed", G_CALLBACK (on_text_view_key_pressed), self);
-  gtk_widget_add_controller (self->text_view, tkey);
-
-  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (tscroll), self->text_view);
-  gtk_box_append (GTK_BOX (bar), tscroll);
 
   GtkFontDialog *fd = gtk_font_dialog_new ();
   self->text_font_btn = gtk_font_dialog_button_new (fd);
@@ -1535,6 +1588,110 @@ typedef enum {
 } ResizeHandleAxis;
 
 static void
+on_resize_preview_draw (GtkDrawingArea *area,
+                        cairo_t *cr,
+                        int width,
+                        int height,
+                        gpointer user_data)
+{
+  PaintCanvasPage *self = PAINT_CANVAS_PAGE (user_data);
+  if (!self->edge_resizing || !self->canvas)
+    return;
+
+  PaintDocument *doc = paint_canvas_get_document (self->canvas);
+  if (!doc)
+    return;
+
+  graphene_point_t origin;
+  if (!gtk_widget_compute_point (GTK_WIDGET (self->canvas),
+                                 GTK_WIDGET (area),
+                                 &GRAPHENE_POINT_INIT (0.0f, 0.0f),
+                                 &origin)) {
+    return;
+  }
+
+  double zoom = MAX (0.01, paint_canvas_get_zoom (self->canvas));
+  double ox = (double) origin.x;
+  double oy = (double) origin.y;
+  double ow = (double) paint_document_get_width (doc) * zoom;
+  double oh = (double) paint_document_get_height (doc) * zoom;
+  double pw = (double) self->edge_preview_w * zoom;
+  double ph = (double) self->edge_preview_h * zoom;
+
+  if (pw < ow || ph < oh) {
+    cairo_save (cr);
+    cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.34);
+    cairo_set_fill_rule (cr, CAIRO_FILL_RULE_EVEN_ODD);
+    cairo_rectangle (cr, ox, oy, ow, oh);
+    cairo_rectangle (cr, ox, oy, MIN (ow, pw), MIN (oh, ph));
+    cairo_fill (cr);
+    cairo_restore (cr);
+  }
+
+  if (pw > ow || ph > oh) {
+    cairo_save (cr);
+    cairo_set_source_rgba (cr, 0.11, 0.44, 0.96, 0.14);
+    cairo_set_fill_rule (cr, CAIRO_FILL_RULE_EVEN_ODD);
+    cairo_rectangle (cr, ox, oy, pw, ph);
+    cairo_rectangle (cr, ox, oy, MIN (ow, pw), MIN (oh, ph));
+    cairo_fill (cr);
+    cairo_restore (cr);
+  }
+
+  double rx = floor (ox) + 0.5;
+  double ry = floor (oy) + 0.5;
+  double rw = MAX (1.0, round (pw) - 1.0);
+  double rh = MAX (1.0, round (ph) - 1.0);
+
+  cairo_set_line_width (cr, 1.5);
+  cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.95);
+  cairo_rectangle (cr, rx, ry, rw, rh);
+  cairo_stroke (cr);
+
+  static const double dash[] = { 6.0, 4.0 };
+  cairo_set_dash (cr, dash, 2, 0.0);
+  cairo_set_source_rgba (cr, 0.11, 0.44, 0.96, 0.98);
+  cairo_rectangle (cr, rx, ry, rw, rh);
+  cairo_stroke (cr);
+  cairo_set_dash (cr, NULL, 0, 0.0);
+
+  g_autofree char *label = g_strdup_printf ("%d × %d px",
+                                            self->edge_preview_w,
+                                            self->edge_preview_h);
+  PangoLayout *layout = pango_cairo_create_layout (cr);
+  pango_layout_set_text (layout, label, -1);
+  PangoFontDescription *desc = pango_font_description_new ();
+  pango_font_description_set_family (desc, "Sans");
+  pango_font_description_set_weight (desc, PANGO_WEIGHT_BOLD);
+  pango_font_description_set_absolute_size (desc, 11.0 * PANGO_SCALE);
+  pango_layout_set_font_description (layout, desc);
+  pango_font_description_free (desc);
+
+  int lw = 0, lh = 0;
+  pango_layout_get_pixel_size (layout, &lw, &lh);
+  double pad_x = 8.0, pad_y = 4.0;
+  double bw = (double) lw + pad_x * 2.0;
+  double bh = (double) lh + pad_y * 2.0;
+  double bx = CLAMP (ox + pw + 10.0, 8.0, MAX (8.0, (double) width - bw - 8.0));
+  double by = CLAMP (oy + ph + 10.0, 8.0, MAX (8.0, (double) height - bh - 72.0));
+  double r = bh * 0.5;
+
+  cairo_new_sub_path (cr);
+  cairo_arc (cr, bx + bw - r, by + r, r, -G_PI_2, 0.0);
+  cairo_arc (cr, bx + bw - r, by + bh - r, r, 0.0, G_PI_2);
+  cairo_arc (cr, bx + r, by + bh - r, r, G_PI_2, G_PI);
+  cairo_arc (cr, bx + r, by + r, r, G_PI, 3.0 * G_PI_2);
+  cairo_close_path (cr);
+  cairo_set_source_rgba (cr, 0.12, 0.12, 0.14, 0.88);
+  cairo_fill (cr);
+
+  cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.96);
+  cairo_move_to (cr, bx + pad_x, by + pad_y);
+  pango_cairo_show_layout (cr, layout);
+  g_object_unref (layout);
+}
+
+static void
 on_resize_handle_begin (GtkGestureDrag *gesture,
                         double start_x G_GNUC_UNUSED,
                         double start_y G_GNUC_UNUSED,
@@ -1551,6 +1708,10 @@ on_resize_handle_begin (GtkGestureDrag *gesture,
   self->edge_preview_h = self->edge_drag_orig_h;
   gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
   update_coords_hud (self);
+  if (self->resize_preview_overlay) {
+    gtk_widget_set_visible (self->resize_preview_overlay, TRUE);
+    gtk_widget_queue_draw (self->resize_preview_overlay);
+  }
 }
 
 static void
@@ -1570,6 +1731,8 @@ on_resize_handle_update (GtkGestureDrag *gesture,
   self->edge_preview_w = CLAMP (self->edge_drag_orig_w + dx, 1, 8192);
   self->edge_preview_h = CLAMP (self->edge_drag_orig_h + dy, 1, 8192);
   update_coords_hud (self);
+  if (self->resize_preview_overlay)
+    gtk_widget_queue_draw (self->resize_preview_overlay);
 }
 
 static void
@@ -1582,6 +1745,8 @@ on_resize_handle_end (GtkGestureDrag *gesture G_GNUC_UNUSED,
   if (!self->edge_resizing)
     return;
   self->edge_resizing = FALSE;
+  if (self->resize_preview_overlay)
+    gtk_widget_set_visible (self->resize_preview_overlay, FALSE);
   if (self->edge_preview_w != self->edge_drag_orig_w ||
       self->edge_preview_h != self->edge_drag_orig_h) {
     paint_canvas_resize (self->canvas, self->edge_preview_w, self->edge_preview_h);
@@ -1599,6 +1764,8 @@ on_resize_handle_cancel (GtkGesture *gesture G_GNUC_UNUSED,
   if (!self->edge_resizing)
     return;
   self->edge_resizing = FALSE;
+  if (self->resize_preview_overlay)
+    gtk_widget_set_visible (self->resize_preview_overlay, FALSE);
   update_coords_hud (self);
 }
 
@@ -1744,6 +1911,32 @@ build_ui (PaintCanvasPage *self)
   if (GTK_IS_VIEWPORT (viewport))
     gtk_viewport_set_scroll_to_focus (GTK_VIEWPORT (viewport), FALSE);
   gtk_overlay_set_child (self->overlay, GTK_WIDGET (self->scrolled));
+
+  self->resize_preview_overlay = gtk_drawing_area_new ();
+  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (self->resize_preview_overlay),
+                                  on_resize_preview_draw, self, NULL);
+  gtk_widget_set_can_target (self->resize_preview_overlay, FALSE);
+  gtk_widget_set_visible (self->resize_preview_overlay, FALSE);
+  gtk_overlay_add_overlay (self->overlay, self->resize_preview_overlay);
+
+  /* Hidden input catcher for direct on-canvas multiline typing */
+  self->text_view = gtk_text_view_new ();
+  gtk_text_view_set_wrap_mode (GTK_TEXT_VIEW (self->text_view), GTK_WRAP_NONE);
+  gtk_text_view_set_accepts_tab (GTK_TEXT_VIEW (self->text_view), FALSE);
+  gtk_widget_set_size_request (self->text_view, 1, 1);
+  gtk_widget_set_opacity (self->text_view, 0.0);
+  gtk_widget_set_can_target (self->text_view, FALSE);
+  gtk_widget_set_halign (self->text_view, GTK_ALIGN_START);
+  gtk_widget_set_valign (self->text_view, GTK_ALIGN_START);
+  gtk_widget_set_visible (self->text_view, FALSE);
+  self->text_buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (self->text_view));
+  g_signal_connect (self->text_buffer, "changed", G_CALLBACK (on_text_buffer_changed), self);
+  g_signal_connect (self->text_buffer, "notify::cursor-position",
+                    G_CALLBACK (on_text_cursor_position_changed), self);
+  GtkEventController *tkey = gtk_event_controller_key_new ();
+  g_signal_connect (tkey, "key-pressed", G_CALLBACK (on_text_view_key_pressed), self);
+  gtk_widget_add_controller (self->text_view, tkey);
+  gtk_overlay_add_overlay (self->overlay, self->text_view);
 
   GtkGesture *space_pan = gtk_gesture_drag_new ();
   gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (space_pan), GTK_PHASE_CAPTURE);
@@ -1956,9 +2149,9 @@ build_ui (PaintCanvasPage *self)
   self->coords_hud = gtk_label_new ("");
   gtk_widget_add_css_class (self->coords_hud, "paint-coords-hud");
   gtk_widget_set_halign (self->coords_hud, GTK_ALIGN_START);
-  gtk_widget_set_valign (self->coords_hud, GTK_ALIGN_END);
-  gtk_widget_set_margin_start (self->coords_hud, 16);
-  gtk_widget_set_margin_bottom (self->coords_hud, 16);
+  gtk_widget_set_valign (self->coords_hud, GTK_ALIGN_START);
+  gtk_widget_set_margin_start (self->coords_hud, 12);
+  gtk_widget_set_margin_top (self->coords_hud, 12);
   gtk_widget_set_can_target (self->coords_hud, FALSE);
   gtk_overlay_add_overlay (self->overlay, self->coords_hud);
 
@@ -2235,12 +2428,8 @@ paint_canvas_page_sync_controls (PaintCanvasPage *self)
       pango_font_description_free (nd);
     }
   }
-  if (self->fill_tol_scale)
-    gtk_range_set_value (GTK_RANGE (self->fill_tol_scale), (double) self->settings->fill_tolerance);
-  if (self->fill_tol_label) {
-    g_autofree char *tlbl = g_strdup_printf ("%d", self->settings->fill_tolerance);
-    gtk_label_set_text (GTK_LABEL (self->fill_tol_label), tlbl);
-  }
+  if (self->fill_tol_adj)
+    gtk_adjustment_set_value (self->fill_tol_adj, (double) self->settings->fill_tolerance);
   if (self->fill_sample_all_btn)
     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (self->fill_sample_all_btn),
                                   self->settings->fill_sample_all_layers);
@@ -2249,6 +2438,10 @@ paint_canvas_page_sync_controls (PaintCanvasPage *self)
                                   !self->settings->gradient_radial);
     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (self->gradient_radial_btn),
                                   self->settings->gradient_radial);
+  }
+  if (self->gradient_fade_btn) {
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (self->gradient_fade_btn),
+                                  self->settings->gradient_fade_transparent);
   }
   self->syncing = FALSE;
   paint_color_picker_sync (self->color_picker);

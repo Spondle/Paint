@@ -1332,6 +1332,31 @@ block_arrow_get_bounds (const PaintTool *tool G_GNUC_UNUSED,
 }
 
 static void
+paint_gradient_source (cairo_t *cr, const PaintToolSettings *settings)
+{
+  if (settings->stroke_has_clip) {
+    cairo_save (cr);
+    cairo_rectangle (cr,
+                     (double) settings->stroke_clip_rect.x,
+                     (double) settings->stroke_clip_rect.y,
+                     (double) settings->stroke_clip_rect.width,
+                     (double) settings->stroke_clip_rect.height);
+    cairo_clip (cr);
+    if (settings->stroke_clip_mask) {
+      cairo_mask_surface (cr,
+                          settings->stroke_clip_mask,
+                          (double) settings->stroke_clip_rect.x,
+                          (double) settings->stroke_clip_rect.y);
+    } else {
+      cairo_paint (cr);
+    }
+    cairo_restore (cr);
+  } else {
+    cairo_paint (cr);
+  }
+}
+
+static void
 gradient_draw_preview (const PaintTool *tool G_GNUC_UNUSED,
                        cairo_t *cr,
                        double x0,
@@ -1349,7 +1374,7 @@ gradient_draw_preview (const PaintTool *tool G_GNUC_UNUSED,
                            settings->color.green,
                            settings->color.blue,
                            settings->color.alpha);
-    cairo_paint (cr);
+    paint_gradient_source (cr, settings);
     return;
   }
 
@@ -1361,13 +1386,21 @@ gradient_draw_preview (const PaintTool *tool G_GNUC_UNUSED,
                                      settings->color.green,
                                      settings->color.blue,
                                      settings->color.alpha);
-  cairo_pattern_add_color_stop_rgba (pat, 1.0,
-                                     settings->secondary_color.red,
-                                     settings->secondary_color.green,
-                                     settings->secondary_color.blue,
-                                     settings->secondary_color.alpha);
+  if (settings->gradient_fade_transparent) {
+    cairo_pattern_add_color_stop_rgba (pat, 1.0,
+                                       settings->color.red,
+                                       settings->color.green,
+                                       settings->color.blue,
+                                       0.0);
+  } else {
+    cairo_pattern_add_color_stop_rgba (pat, 1.0,
+                                       settings->secondary_color.red,
+                                       settings->secondary_color.green,
+                                       settings->secondary_color.blue,
+                                       settings->secondary_color.alpha);
+  }
   cairo_set_source (cr, pat);
-  cairo_paint (cr);
+  paint_gradient_source (cr, settings);
   cairo_pattern_destroy (pat);
 }
 
@@ -1377,12 +1410,19 @@ gradient_get_bounds (const PaintTool *tool G_GNUC_UNUSED,
                      double y0 G_GNUC_UNUSED,
                      double x1 G_GNUC_UNUSED,
                      double y1 G_GNUC_UNUSED,
-                     const PaintToolSettings *settings G_GNUC_UNUSED,
+                     const PaintToolSettings *settings,
                      double *out_x0,
                      double *out_y0,
                      double *out_x1,
                      double *out_y1)
 {
+  if (settings && settings->stroke_has_clip) {
+    *out_x0 = (double) settings->stroke_clip_rect.x;
+    *out_y0 = (double) settings->stroke_clip_rect.y;
+    *out_x1 = (double) (settings->stroke_clip_rect.x + settings->stroke_clip_rect.width);
+    *out_y1 = (double) (settings->stroke_clip_rect.y + settings->stroke_clip_rect.height);
+    return;
+  }
   *out_x0 = -65536.0;
   *out_y0 = -65536.0;
   *out_x1 = 65536.0;

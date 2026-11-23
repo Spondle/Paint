@@ -57,9 +57,11 @@ void paint_canvas_nudge_selection (PaintCanvas *self, int dx, int dy);
 gboolean paint_canvas_has_active_text (PaintCanvas *self);
 const char *paint_canvas_get_active_text (PaintCanvas *self);
 void paint_canvas_set_active_text (PaintCanvas *self, const char *text);
+void paint_canvas_set_active_text_cursor (PaintCanvas *self, int byte_offset);
 void paint_canvas_commit_text (PaintCanvas *self);
 void paint_canvas_cancel_text (PaintCanvas *self);
 void paint_canvas_commit_active_overlays (PaintCanvas *self);
+void paint_canvas_commit_overlays_for_tool (PaintCanvas *self, const char *tool_id);
 
 void paint_canvas_set_show_cursor_ring (PaintCanvas *self, gboolean show);
 void paint_canvas_set_show_pixel_grid (PaintCanvas *self, gboolean show);

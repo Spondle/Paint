@@ -32,6 +32,10 @@ typedef struct {
   gboolean fill_sample_all_layers;
   cairo_surface_t *fill_sample_surface; /* unowned */
   gboolean gradient_radial;
+  gboolean gradient_fade_transparent;
+  gboolean stroke_has_clip;
+  cairo_rectangle_int_t stroke_clip_rect;
+  cairo_surface_t *stroke_clip_mask; /* unowned */
   double stroke_pressure;
   gboolean pressure_size;
   gboolean pressure_opacity;

@@ -95,17 +95,6 @@
     background-color: color-mix(in srgb, currentColor 15%, transparent);
 }
 
-.paint-text-view-scroll {
-    background-color: var(--view-bg-color);
-    border: 1px solid color-mix(in srgb, var(--border-color) 85%, transparent);
-    border-radius: 8px;
-}
-
-.paint-text-view-scroll textview {
-    background-color: transparent;
-    padding: 4px 6px;
-}
-
 .paint-osd-pill .paint-transparency-tile {
     min-height: 36px;
     padding: 6px 12px;

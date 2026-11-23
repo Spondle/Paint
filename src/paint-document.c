@@ -1666,6 +1666,12 @@ paint_document_render_text_layout (cairo_t *cr,
                                    int *out_h)
 {
   PangoLayout *layout = pango_cairo_create_layout (cr);
+  PangoContext *pctx = pango_layout_get_context (layout);
+  pango_cairo_context_set_resolution (pctx, 96.0);
+  cairo_font_options_t *fopt = cairo_font_options_create ();
+  cairo_font_options_set_hint_metrics (fopt, CAIRO_HINT_METRICS_OFF);
+  pango_cairo_context_set_font_options (pctx, fopt);
+  cairo_font_options_destroy (fopt);
   pango_layout_set_text (layout, text ? text : "", -1);
   pango_layout_set_alignment (layout, settings ? settings->text_align : PANGO_ALIGN_LEFT);
 
@@ -1694,7 +1700,7 @@ paint_document_render_text_layout (cairo_t *cr,
   int by = MIN (ink.y, logical.y);
   int bx1 = MAX (ink.x + ink.width, logical.x + logical.width);
   int by1 = MAX (ink.y + ink.height, logical.y + logical.height);
-  int tw = MAX (24, bx1 - bx);
+  int tw = MAX (24, bx1 - bx) + 4;
   int th = MAX ((int) ceil (px_size * 1.2), by1 - by);
 
   double pad = 0.0;

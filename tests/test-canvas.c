@@ -2601,6 +2601,105 @@ test_document_trim_transparent (void)
   paint_document_free (doc);
 }
 
+static void
+test_gradient_alpha_lock_fade_and_clip (void)
+{
+  const PaintTool *gradient = paint_tools_find ("gradient");
+  g_assert_nonnull (gradient);
+
+  /* 1. Fade-to-transparent paints primary->alpha=0 instead of secondary */
+  PaintDocument *doc = paint_document_new_transparent (40, 20);
+  PaintToolSettings *settings = paint_tool_settings_new ();
+  settings->color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 1.0f, 0.0f, 0.0f, 1.0f };
+  settings->gradient_radial = FALSE;
+  settings->gradient_fade_transparent = TRUE;
+
+  paint_document_begin_stroke (doc, 4.0, 10.0, gradient, settings);
+  paint_document_end_stroke (doc, 36.0, 10.0, gradient, settings);
+
+  guint8 r, g, b, a;
+  read_pixel_rgba (doc, 2, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 255);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (b, >=, 245);
+
+  read_pixel_rgba (doc, 20, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (a, >, 80);
+  g_assert_cmpuint (a, <, 175);
+  g_assert_cmpuint (r, ==, 0);
+
+  read_pixel_rgba (doc, 38, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  paint_document_free (doc);
+
+  /* 2. Alpha Lock preserves layer transparency outside existing pixels */
+  doc = paint_document_new_transparent (40, 40);
+  cairo_surface_t *patch = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 16, 16);
+  cairo_t *cr = cairo_create (patch);
+  cairo_set_source_rgba (cr, 1.0, 0.0, 0.0, 1.0);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  paint_document_blit_surface (doc, patch, 12, 12);
+  cairo_surface_destroy (patch);
+
+  paint_document_layer_set_alpha_lock (doc, 0, TRUE);
+  settings->color = (GdkRGBA) { 0.0f, 1.0f, 0.0f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 0.0f, 0.0f, 1.0f, 1.0f };
+  settings->gradient_fade_transparent = FALSE;
+
+  paint_document_begin_stroke (doc, 0.0, 20.0, gradient, settings);
+  paint_document_end_stroke (doc, 40.0, 20.0, gradient, settings);
+
+  read_pixel_rgba (doc, 4, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  read_pixel_rgba (doc, 36, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  read_pixel_rgba (doc, 16, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 255);
+  g_assert_cmpuint (r, ==, 0);
+  g_assert_cmpuint (g, >, 100);
+  paint_document_free (doc);
+
+  /* 3. Clip rect + A8 selection mask (sized to clip_rect) confines gradient */
+  doc = paint_document_new_transparent (40, 40);
+  cairo_surface_t *mask = cairo_image_surface_create (CAIRO_FORMAT_A8, 24, 24);
+  cr = cairo_create (mask);
+  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  cairo_paint (cr);
+  cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 1.0);
+  cairo_rectangle (cr, 6, 6, 12, 12);
+  cairo_fill (cr);
+  cairo_destroy (cr);
+
+  settings->stroke_has_clip = TRUE;
+  settings->stroke_clip_rect = (cairo_rectangle_int_t) { 8, 8, 24, 24 };
+  settings->stroke_clip_mask = mask;
+  settings->color = (GdkRGBA) { 0.0f, 1.0f, 0.0f, 1.0f };
+  settings->secondary_color = (GdkRGBA) { 0.0f, 1.0f, 0.0f, 1.0f };
+
+  paint_document_begin_stroke (doc, 0.0, 20.0, gradient, settings);
+  paint_document_end_stroke (doc, 40.0, 20.0, gradient, settings);
+
+  /* Outside clip rect */
+  read_pixel_rgba (doc, 4, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  /* Inside clip rect but outside mask */
+  read_pixel_rgba (doc, 10, 10, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 0);
+  /* Inside both clip rect and mask */
+  read_pixel_rgba (doc, 16, 20, &r, &g, &b, &a);
+  g_assert_cmpuint (a, ==, 255);
+  g_assert_cmpuint (g, ==, 255);
+
+  settings->stroke_has_clip = FALSE;
+  settings->stroke_clip_mask = NULL;
+  cairo_surface_destroy (mask);
+  paint_tool_settings_free (settings);
+  paint_document_free (doc);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2659,5 +2758,7 @@ main (int argc, char **argv)
   g_test_add_func ("/canvas/filter_preview_cancel_and_commit_undo",
                    test_filter_preview_cancel_and_commit_undo);
   g_test_add_func ("/document/trim_transparent", test_document_trim_transparent);
+  g_test_add_func ("/canvas/gradient_alpha_lock_fade_and_clip",
+                   test_gradient_alpha_lock_fade_and_clip);
   return g_test_run ();
 }
